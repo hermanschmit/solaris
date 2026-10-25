@@ -20,6 +20,10 @@ export interface ReplayFrame {
     // Per player, flattened: stars, total ships, economy, industry, science,
     // defeated (0 or 1).
     players: number[];
+    // Per player, flattened: the level of each technology in
+    // Replay.technologies, then the index of the one being researched (-1
+    // when none). Missing from replays recorded before it was added.
+    research?: number[];
 }
 
 export interface Replay {
@@ -29,6 +33,8 @@ export interface Replay {
     productionTicks: number;
     players: { alias: string; colour: string }[];
     stars: { name: string; x: number; y: number }[];
+    // Technologies enabled in this game, in the order frames store them.
+    technologies?: string[];
     frames: ReplayFrame[];
     winner: number | null;
 }
@@ -60,6 +66,13 @@ export class ReplayRecorder {
                 x: Math.round(s.location.x),
                 y: Math.round(s.location.y),
             })),
+            technologies: Object.keys(
+                game.settings.technology.startingTechnologyLevel,
+            ).filter(
+                (k) =>
+                    /^[^_$]/.test(k) &&
+                    game.settings.technology.startingTechnologyLevel[k] > 0,
+            ),
             frames: [],
             winner: null,
         };
@@ -110,6 +123,8 @@ export class ReplayRecorder {
             if (totals[owner]) totals[owner][1] += c.ships ?? 0;
         }
 
+        const technologies = this.replay.technologies!;
+
         this.replay.frames.push({
             tick: game.state.tick,
             owners,
@@ -118,6 +133,10 @@ export class ReplayRecorder {
             players: game.galaxy.players.flatMap((p, i) => [
                 ...totals[i],
                 p.defeated ? 1 : 0,
+            ]),
+            research: game.galaxy.players.flatMap((p) => [
+                ...technologies.map((t) => p.research[t]?.level ?? 0),
+                technologies.indexOf(p.researchingNow),
             ]),
         });
 

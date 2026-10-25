@@ -121,6 +121,28 @@
         color: var(--quiet);
         text-decoration: line-through;
       }
+      #tech td,
+      #tech th {
+        text-align: center;
+        padding: 3px 2px;
+      }
+      #tech td:first-child,
+      #tech th:first-child {
+        text-align: left;
+      }
+      #tech td.best {
+        font-weight: 700;
+      }
+      #tech td.now {
+        outline: 1px solid var(--text);
+        outline-offset: -2px;
+        border-radius: 3px;
+      }
+      h2 {
+        font-size: 13px;
+        font-weight: 600;
+        margin: 20px 0 0;
+      }
       .swatch {
         display: inline-block;
         width: 10px;
@@ -192,6 +214,17 @@
       <div class="quiet" style="margin-top: 4px">
         Stars held over time. Click to jump.
       </div>
+      <div id="techSection" hidden>
+        <h2>Technology</h2>
+        <table id="tech">
+          <thead id="techHead"></thead>
+          <tbody id="techBody"></tbody>
+        </table>
+        <div class="quiet" style="margin-top: 4px">
+          Levels. Bold leads the column; the outlined cell is being researched
+          now.
+        </div>
+      </div>
     </aside>
 
     <footer>
@@ -247,6 +280,27 @@
           replay.frames.map((f) => f.players[p * PLAYER]),
         );
         maxStars = Math.max(1, ...starSeries.flat());
+
+        // Replays recorded before technology was added have no research.
+        const hasTech = Boolean(
+          replay.technologies && replay.frames[0].research,
+        );
+        $("techSection").hidden = !hasTech;
+        if (hasTech) {
+          const head = document.createElement("tr");
+          const first = document.createElement("th");
+          first.textContent = "Player";
+          head.append(first);
+          for (const t of replay.technologies) {
+            const th = document.createElement("th");
+            th.textContent = t
+              .slice(0, 3)
+              .replace(/^./, (c) => c.toUpperCase());
+            th.title = t;
+            head.append(th);
+          }
+          $("techHead").replaceChildren(head);
+        }
 
         const seed = replay.seed == null ? "" : `, seed ${replay.seed}`;
         $("title").textContent = `${replay.settings} game${seed}`;
@@ -395,6 +449,44 @@
               td.textContent = String(v);
               tr.append(td);
             }
+            return tr;
+          }),
+        );
+
+        if (replay.technologies && f.research) drawTech(f, rows);
+      }
+
+      // Tech levels per player, in the same order as the standings.
+      function drawTech(f, rows) {
+        const techs = replay.technologies;
+        const stride = techs.length + 1;
+        const level = (p, t) => f.research[p * stride + t];
+        const best = techs.map((_, t) =>
+          Math.max(...replay.players.map((_, p) => level(p, t))),
+        );
+
+        $("techBody").replaceChildren(
+          ...rows.map((r) => {
+            const p = replay.players.indexOf(r.p);
+            const tr = document.createElement("tr");
+            if (r.defeated) tr.className = "defeated";
+            const name = document.createElement("td");
+            const sw = document.createElement("span");
+            sw.className = "swatch";
+            sw.style.background = r.p.colour;
+            name.append(sw, r.p.alias);
+            tr.append(name);
+            const now = f.research[p * stride + techs.length];
+            techs.forEach((t, i) => {
+              const td = document.createElement("td");
+              td.textContent = String(level(p, i));
+              const classes = [];
+              if (level(p, i) === best[i] && best[i] > 1) classes.push("best");
+              if (i === now && !r.defeated) classes.push("now");
+              td.className = classes.join(" ");
+              td.title = `${t}${i === now ? " (researching)" : ""}`;
+              tr.append(td);
+            });
             return tr;
           }),
         );
