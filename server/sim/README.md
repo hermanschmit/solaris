@@ -43,6 +43,9 @@ SOLARIS_COOKIE='...' npx tsx sim/fetchGalaxy.ts <gameId> snapshot.json
 # Play an all-AI standard game to the end with seed 1
 npx tsx sim/cli.ts play standard 4000 1
 
+# Same, and record every tick to replay.json for the viewer
+npx tsx sim/cli.ts play standard 4000 1 replay.json
+
 # Fill in the fog and run it forward 20 ticks with seed 1
 npx tsx sim/cli.ts step snapshot.json 20 1
 
@@ -73,6 +76,17 @@ All-AI standard games end by conquest after roughly 400 to 600 ticks (20 to
 30 cycles) and take two to four minutes on one core. The built-in AI is
 about 85% of that time, so advisor rollouts and the arena will want a
 cheaper opponent model.
+
+## Watching a game
+
+`play` with a file name records a replay (`replay.ts`): star owners and
+ships, carrier positions and destinations, and each player's totals at every
+tick. A full standard game is about 2 to 3 MB. Open `sim/viewer.html`
+straight from disk in a browser and pick or drop the file. It shows the map
+(stars sized by garrison, carriers in flight with their routes), the
+standings at the current tick, and a chart of stars held over the game.
+Space plays and pauses, the arrow keys step a tick (a cycle with shift), the
+mouse wheel zooms and dragging pans.
 
 ## Tuning the built-in AI
 
