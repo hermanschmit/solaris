@@ -1,6 +1,6 @@
 import { Game } from "./types/Game";
 import { Player } from "./types/Player";
-import { KnownAttack } from "./types/Ai";
+import { AiConfig, DEFAULT_AI_CONFIG, KnownAttack } from "./types/Ai";
 import CarrierService from "./carrier";
 import {
     CombatService,
@@ -33,16 +33,6 @@ import { IEventService } from "./types/IEventService";
 import { IStatisticsService } from "./types/IStatisticsService";
 
 const Heap = require("qheap");
-
-const FIRST_TICK_BULK_UPGRADE_SCI_PERCENTAGE = 20;
-const FIRST_TICK_BULK_UPGRADE_IND_PERCENTAGE = 30;
-const LAST_TICK_BULK_UPGRADE_ECO_PERCENTAGE = 100;
-
-const INVASION_ATTACK_FACTOR = 1.5;
-
-const BORDER_STAR_ANGLE_THRESHOLD_DEGREES = 120;
-
-const LOGISTIC_STOCKPILE_CYCLES = 0.7;
 
 enum AiAction {
     DefendStar,
@@ -159,6 +149,7 @@ export default class AIService {
     starDataService: StarDataService;
     statisticsService: IStatisticsService;
     infrastructureCostService: InfrastructureCostService<DBObjectId>;
+    config: AiConfig = DEFAULT_AI_CONFIG;
 
     constructor(
         starUpgradeService: StarUpgradeService,
@@ -202,6 +193,12 @@ export default class AIService {
         this.starDataService = starDataService;
         this.statisticsService = statisticsService;
         this.infrastructureCostService = infrastructureCostService;
+    }
+
+    // The tuning used for a player. Every player shares the same config here;
+    // the simulator overrides this to give players different configs.
+    getConfig(game: Game, player: Player): AiConfig {
+        return this.config;
     }
 
     isAIControlled(player: Player) {
@@ -336,7 +333,8 @@ export default class AIService {
         // On the last tick of the cycle:
         // 1. Spend remaining credits upgrading economy.
         let creditsToSpendEco = Math.floor(
-            (player.credits / 100) * LAST_TICK_BULK_UPGRADE_ECO_PERCENTAGE,
+            (player.credits / 100) *
+                this.getConfig(game, player).lastTickEconomyPercentage,
         );
 
         if (
@@ -368,10 +366,12 @@ export default class AIService {
         // On the first tick after production:
         // 1. Bulk upgrade X% of credits to ind and sci.
         let creditsToSpendSci = Math.floor(
-            (player.credits / 100) * FIRST_TICK_BULK_UPGRADE_SCI_PERCENTAGE,
+            (player.credits / 100) *
+                this.getConfig(game, player).firstTickSciencePercentage,
         );
         let creditsToSpendInd = Math.floor(
-            (player.credits / 100) * FIRST_TICK_BULK_UPGRADE_IND_PERCENTAGE,
+            (player.credits / 100) *
+                this.getConfig(game, player).firstTickIndustryPercentage,
         );
 
         if (
@@ -797,7 +797,10 @@ export default class AIService {
                 }
             }
 
-            if (largestGap > BORDER_STAR_ANGLE_THRESHOLD_DEGREES) {
+            if (
+                largestGap >
+                this.getConfig(game, player).borderStarAngleThresholdDegrees
+            ) {
                 borderStars.set(
                     starId,
                     this._constructBorderStarData(
@@ -821,10 +824,11 @@ export default class AIService {
         orders: Order[],
         assignments: Map<string, Assignment>,
     ) {
+        const config = this.getConfig(game, player);
         const sorter = (o1, o2) => {
             const categoryPriority =
-                this.priorityFromOrderCategory(o1.type) -
-                this.priorityFromOrderCategory(o2.type);
+                this.priorityFromOrderCategory(o1.type, config) -
+                this.priorityFromOrderCategory(o2.type, config);
             if (categoryPriority !== 0) {
                 return categoryPriority;
             } else {
@@ -948,7 +952,9 @@ export default class AIService {
                 }
 
                 const starToInvade = context.starsById.get(order.star)!;
-                const ticksLimit = game.settings.galaxy.productionTicks * 2;
+                const ticksLimit =
+                    game.settings.galaxy.productionTicks *
+                    config.orderReachCycles;
                 const fittingAssignments = this._findAssignmentsWithTickLimit(
                     game,
                     player,
@@ -978,7 +984,7 @@ export default class AIService {
                             context,
                             starToInvade,
                             ticksUntilArrival,
-                        ) || 1) * INVASION_ATTACK_FACTOR,
+                        ) || 1) * config.invasionAttackFactor,
                     );
 
                     if (assignment.totalShips >= requiredShips) {
@@ -1019,7 +1025,10 @@ export default class AIService {
                     continue;
                 }
 
-                const ticksLimit = game.settings.galaxy.productionTicks * 2; // If star is not reachable in that time, try again next cycle
+                // If star is not reachable in that time, try again next cycle
+                const ticksLimit =
+                    game.settings.galaxy.productionTicks *
+                    config.orderReachCycles;
                 const fittingAssignments = this._findAssignmentsWithTickLimit(
                     game,
                     player,
@@ -1224,7 +1233,10 @@ export default class AIService {
         highPriority: boolean,
     ): boolean {
         // Keep 50% of budget for upgrades
-        const leaveOver = highPriority ? 0 : context.playerEconomy * 5;
+        const leaveOver = highPriority
+            ? 0
+            : context.playerEconomy *
+              this.getConfig(game, player).carrierReserveEconomyMultiplier;
         const availableFunds = player.credits - leaveOver;
         const carrierExpenseConfig =
             game.constants.star.infrastructureExpenseMultipliers[
@@ -1521,14 +1533,17 @@ export default class AIService {
         return 0;
     }
 
-    priorityFromOrderCategory(category: AiAction) {
+    priorityFromOrderCategory(
+        category: AiAction,
+        config: AiConfig = this.config,
+    ) {
         switch (category) {
             case AiAction.DefendStar:
-                return 4;
+                return config.orderPriorities.defend;
             case AiAction.InvadeStar:
-                return 3;
+                return config.orderPriorities.invade;
             case AiAction.ClaimStar:
-                return 2;
+                return config.orderPriorities.claim;
             default:
                 return 0;
         }
@@ -1625,11 +1640,13 @@ export default class AIService {
         return false;
     }
 
-    _getStarScore(star: Star): number {
+    _getStarScore(star: Star, config: AiConfig = this.config): number {
+        const weights = config.starValueWeights;
+
         return (
-            (star.infrastructure.economy || 0) +
-            2 * (star.infrastructure.industry || 0) +
-            3 * (star.infrastructure.science || 0)
+            weights.economy * (star.infrastructure.economy || 0) +
+            weights.industry * (star.infrastructure.industry || 0) +
+            weights.science * (star.infrastructure.science || 0)
         );
     }
 
@@ -1653,7 +1670,10 @@ export default class AIService {
                 if (this._isEnemyStar(game, player, context, star)) {
                     // We adjust the stores by distance, so closer stars end up with a higher score.
                     // This stops the AI from jumping behind the enemies frontlines too often and leaving closer stars uninvaded and open for counter attacks.
-                    const starScore = this._getStarScore(star);
+                    const starScore = this._getStarScore(
+                        star,
+                        this.getConfig(game, player),
+                    );
                     const distance =
                         this.distanceService.getDistanceBetweenLocations(
                             fromStar.location,
@@ -1756,7 +1776,10 @@ export default class AIService {
         for (const [attackedStarId, attacks] of context.attacksByStarId) {
             for (const [attackInTicks, incomingCarriers] of attacks) {
                 const attackedStar = context.starsById.get(attackedStarId)!;
-                const starScore = this._getStarScore(attackedStar);
+                const starScore = this._getStarScore(
+                    attackedStar,
+                    this.getConfig(game, player),
+                );
 
                 orders.push({
                     type: AiAction.DefendStar,
@@ -1912,7 +1935,8 @@ export default class AIService {
         }
 
         const ticksStockpileAllowed =
-            game.settings.galaxy.productionTicks * LOGISTIC_STOCKPILE_CYCLES;
+            game.settings.galaxy.productionTicks *
+            this.getConfig(game, player).logisticStockpileCycles;
         const productionCap = this.shipService.calculatePopulationCap(
             game,
             player._id,

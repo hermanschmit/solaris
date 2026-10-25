@@ -12,6 +12,7 @@ import { Game } from "../services/types/Game";
 import { DBObjectId } from "../services/types/DBObjectId";
 import { DependencyContainer } from "../services/types/DependencyContainer";
 import { seededRng } from "./random";
+import { AiConfig, DEFAULT_AI_CONFIG } from "../services/types/Ai";
 
 const nullService: any = new Proxy({}, { get: () => async () => {} });
 
@@ -23,9 +24,13 @@ const toLean = (doc: any): Game => {
 
 export class SimEngine {
     container: DependencyContainer;
+    // Built-in AI tuning per player id. Players not listed use the defaults.
+    aiConfigs = new Map<string, AiConfig>();
 
     constructor(container?: DependencyContainer) {
         this.container = container ?? createSimContainer();
+        this.container.aiService.getConfig = (game, player) =>
+            this.aiConfigs.get(player._id.toString()) ?? DEFAULT_AI_CONFIG;
     }
 
     // The server draws all of its randomness (combat ties, research
@@ -89,6 +94,27 @@ export class SimEngine {
             (p) => p._id.toString() === playerId.toString(),
         )!;
         player.userId = userId;
+    }
+
+    // Tune the built-in AI for one player. Fields left out keep their
+    // defaults.
+    setAiConfig(
+        game: Game,
+        playerId: DBObjectId,
+        overrides: Partial<AiConfig>,
+    ) {
+        this.aiConfigs.set(playerId.toString(), {
+            ...DEFAULT_AI_CONFIG,
+            ...overrides,
+            starValueWeights: {
+                ...DEFAULT_AI_CONFIG.starValueWeights,
+                ...overrides.starValueWeights,
+            },
+            orderPriorities: {
+                ...DEFAULT_AI_CONFIG.orderPriorities,
+                ...overrides.orderPriorities,
+            },
+        });
     }
 
     async tick(game: Game, ticks: number = 1) {
