@@ -40,6 +40,9 @@ npx tsx sim/cli.ts bench standard 100
 # Save your view of a live game (see the file for auth options)
 SOLARIS_COOKIE='...' npx tsx sim/fetchGalaxy.ts <gameId> snapshot.json
 
+# Play an all-AI standard game to the end with seed 1
+npx tsx sim/cli.ts play standard 4000 1
+
 # Fill in the fog and run it forward 20 ticks with seed 1
 npx tsx sim/cli.ts step snapshot.json 20 1
 
@@ -58,8 +61,33 @@ Standard game, 10 players, 200 stars, on one core:
 | Engine only (no AI players) | about 5 ms |
 | All 10 players on the built-in advanced AI | about 90 to 135 ms |
 
-The built-in AI dominates, so advisor rollouts will want a cheaper opponent
-model.
+Ticks get slower as carriers pile up. In a full all-AI game (seed 1,
+measured with four games sharing four cores):
+
+| Point in game | Carriers | With built-in AI | Engine only |
+| --- | --- | --- | --- |
+| Tick 100 | 194 | about 180 ms | about 27 ms |
+| Tick 300 | 456 | about 420 ms | about 49 ms |
+
+All-AI standard games end by conquest after roughly 400 to 600 ticks (20 to
+30 cycles) and take two to four minutes on one core. The built-in AI is
+about 85% of that time, so advisor rollouts and the arena will want a
+cheaper opponent model.
+
+## Tuning the built-in AI
+
+The advanced AI's constants live in `AiConfig` (`services/types/Ai.ts`),
+with `DEFAULT_AI_CONFIG` holding the values it has always used. The server
+uses the defaults for everyone. In the sim, `engine.setAiConfig(game,
+playerId, overrides)` gives one player its own tuning, for example a more
+aggressive opponent:
+
+```ts
+engine.setAiConfig(game, player._id, {
+    invasionAttackFactor: 1.2,
+    orderPriorities: { defend: 3, invade: 4, claim: 2 },
+});
+```
 
 ## Known gaps
 

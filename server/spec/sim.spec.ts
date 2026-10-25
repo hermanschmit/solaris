@@ -112,4 +112,46 @@ describe("sim engine", () => {
         await engine.tick(sim, 5);
         expect(sim.state.tick).toBe(15);
     });
+    describe("built-in AI config", () => {
+        afterEach(() => engine.aiConfigs.clear());
+
+        it("plays the same with the defaults set explicitly", async () => {
+            const plain = await newGame(3);
+            await engine.tick(plain, 45);
+
+            const configured = await newGame(3);
+            for (const p of configured.galaxy.players) {
+                engine.setAiConfig(configured, p._id, {});
+            }
+            await engine.tick(configured, 45);
+
+            expect(fingerprint(engine, configured)).toEqual(
+                fingerprint(engine, plain),
+            );
+        });
+
+        it("tunes one player without affecting the defaults", async () => {
+            const game = await newGame(3);
+            const saver = game.galaxy.players[0];
+
+            engine.setAiConfig(game, saver._id, {
+                firstTickSciencePercentage: 0,
+                firstTickIndustryPercentage: 0,
+                lastTickEconomyPercentage: 0,
+                carrierReserveEconomyMultiplier: 1000,
+            });
+            expect(
+                engine.aiConfigs.get(saver._id.toString())!.orderPriorities,
+            ).toEqual({ defend: 4, invade: 3, claim: 2 });
+
+            await engine.tick(game, 45);
+
+            // With every spending rule turned off, the first player keeps
+            // its credits while the others spend theirs.
+            const others = game.galaxy.players.slice(1);
+            for (const p of others) {
+                expect(saver.credits).toBeGreaterThan(p.credits);
+            }
+        });
+    });
 });

@@ -4,6 +4,10 @@
 //       Create an all-AI game from an official settings file
 //       (default "standard") and time how fast it ticks.
 //
+//   npx tsx sim/cli.ts play [settings] [maxTicks] [seed]
+//       Play an all-AI game until someone wins or maxTicks (default 3000)
+//       is reached, printing standings every 5 cycles.
+//
 //   npx tsx sim/cli.ts step <snapshot.json> [ticks] [seed]
 //       Fill in the hidden parts of a saved galaxy view, run it forward with
 //       the built-in AI playing every opponent, and print each player's
@@ -55,6 +59,34 @@ const bench = async (settingsName = "standard", ticks = 100) => {
     report(game);
 };
 
+const play = async (settingsName = "standard", maxTicks = 3000, seed = 1) => {
+    const engine = new SimEngine();
+    engine.seed(seed);
+
+    const game = await engine.createGame(engine.loadSettings(settingsName));
+    const cycleTicks = game.settings.galaxy.productionTicks;
+    const t = Date.now();
+
+    while (!game.state.endDate && game.state.tick < maxTicks) {
+        await engine.tick(game, cycleTicks * 5);
+        console.log(
+            `\nTick ${game.state.tick} (cycle ${Math.floor(game.state.tick / cycleTicks)}), ` +
+                `${((Date.now() - t) / 1000).toFixed(1)}s elapsed`,
+        );
+        report(game);
+    }
+
+    const winner = game.state.winner
+        ? game.galaxy.players.find(
+              (p) => p._id.toString() === game.state.winner!.toString(),
+          )?.alias
+        : null;
+    console.log(
+        `\n${winner ? `${winner} won` : "No winner"} at tick ${game.state.tick} ` +
+            `in ${((Date.now() - t) / 1000).toFixed(1)}s (seed ${seed})`,
+    );
+};
+
 const step = async (file: string, ticks = 20, seed = 1) => {
     const engine = new SimEngine();
     engine.seed(seed);
@@ -78,6 +110,12 @@ const run = async () => {
     switch (command) {
         case "bench":
             return bench(args[0], args[1] ? Number(args[1]) : undefined);
+        case "play":
+            return play(
+                args[0],
+                args[1] ? Number(args[1]) : undefined,
+                args[2] ? Number(args[2]) : undefined,
+            );
         case "step":
             return step(
                 args[0],
@@ -86,7 +124,7 @@ const run = async () => {
             );
         default:
             console.log(
-                "Usage: cli.ts bench [settings] [ticks] | step <snapshot.json> [ticks] [seed]",
+                "Usage: cli.ts bench [settings] [ticks] | play [settings] [maxTicks] [seed] | step <snapshot.json> [ticks] [seed]",
             );
     }
 };
