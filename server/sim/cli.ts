@@ -4,9 +4,10 @@
 //       Create an all-AI game from an official settings file
 //       (default "standard") and time how fast it ticks.
 //
-//   npx tsx sim/cli.ts play [settings] [maxTicks] [seed]
+//   npx tsx sim/cli.ts play [settings] [maxTicks] [seed] [replay.json]
 //       Play an all-AI game until someone wins or maxTicks (default 3000)
-//       is reached, printing standings every 5 cycles.
+//       is reached, printing standings every 5 cycles. With a file name,
+//       also record every tick for sim/viewer.html.
 //
 //   npx tsx sim/cli.ts step <snapshot.json> [ticks] [seed]
 //       Fill in the hidden parts of a saved galaxy view, run it forward with
@@ -16,6 +17,7 @@ import "./env";
 import fs from "fs";
 import { SimEngine } from "./engine";
 import { determinize } from "./snapshot";
+import { ReplayRecorder } from "./replay";
 import { Game } from "../services/types/Game";
 
 const report = (game: Game) => {
@@ -59,16 +61,35 @@ const bench = async (settingsName = "standard", ticks = 100) => {
     report(game);
 };
 
-const play = async (settingsName = "standard", maxTicks = 3000, seed = 1) => {
+const play = async (
+    settingsName = "standard",
+    maxTicks = 3000,
+    seed = 1,
+    replayFile?: string,
+) => {
     const engine = new SimEngine();
     engine.seed(seed);
 
     const game = await engine.createGame(engine.loadSettings(settingsName));
     const cycleTicks = game.settings.galaxy.productionTicks;
+    const recorder = replayFile
+        ? new ReplayRecorder(game, settingsName, seed)
+        : null;
     const t = Date.now();
 
+    recorder?.capture(game);
+
     while (!game.state.endDate && game.state.tick < maxTicks) {
-        await engine.tick(game, cycleTicks * 5);
+        for (
+            let i = 0;
+            i < cycleTicks * 5 &&
+            !game.state.endDate &&
+            game.state.tick < maxTicks;
+            i++
+        ) {
+            await engine.tick(game, 1);
+            recorder?.capture(game);
+        }
         console.log(
             `\nTick ${game.state.tick} (cycle ${Math.floor(game.state.tick / cycleTicks)}), ` +
                 `${((Date.now() - t) / 1000).toFixed(1)}s elapsed`,
@@ -85,6 +106,11 @@ const play = async (settingsName = "standard", maxTicks = 3000, seed = 1) => {
         `\n${winner ? `${winner} won` : "No winner"} at tick ${game.state.tick} ` +
             `in ${((Date.now() - t) / 1000).toFixed(1)}s (seed ${seed})`,
     );
+
+    if (recorder && replayFile) {
+        recorder.save(replayFile);
+        console.log(`Saved replay to ${replayFile}`);
+    }
 };
 
 const step = async (file: string, ticks = 20, seed = 1) => {
@@ -115,6 +141,7 @@ const run = async () => {
                 args[0],
                 args[1] ? Number(args[1]) : undefined,
                 args[2] ? Number(args[2]) : undefined,
+                args[3],
             );
         case "step":
             return step(
@@ -124,7 +151,7 @@ const run = async () => {
             );
         default:
             console.log(
-                "Usage: cli.ts bench [settings] [ticks] | play [settings] [maxTicks] [seed] | step <snapshot.json> [ticks] [seed]",
+                "Usage: cli.ts bench [settings] [ticks] | play [settings] [maxTicks] [seed] [replay.json] | step <snapshot.json> [ticks] [seed]",
             );
     }
 };

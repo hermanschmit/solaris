@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Solaris replay</title>
+    <!--
+  Plays back a replay recorded by the simulator:
+
+    npx tsx sim/cli.ts play standard 4000 1 replay.json
+
+  Open this file in a browser, then pick or drop replay.json. No server or
+  network access is needed.
+
+  Keys: space plays and pauses, left and right step one tick, shift with an
+  arrow steps one cycle. Scroll to zoom the map and drag to pan it.
+-->
+    <style>
+      :root {
+        --bg: #0b0e14;
+        --panel: #131824;
+        --line: #252c3b;
+        --text: #e3e7ef;
+        --quiet: #8a93a6;
+        --unowned: #4a5163;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font:
+          13px/1.4 system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        display: grid;
+        grid-template-columns: 1fr 340px;
+        grid-template-rows: 1fr auto;
+        height: 100vh;
+      }
+      #map {
+        grid-row: 1;
+        grid-column: 1;
+        width: 100%;
+        height: 100%;
+        display: block;
+        cursor: grab;
+      }
+      #map.dragging {
+        cursor: grabbing;
+      }
+      aside {
+        grid-row: 1 / span 2;
+        grid-column: 2;
+        background: var(--panel);
+        border-left: 1px solid var(--line);
+        padding: 16px;
+        overflow-y: auto;
+      }
+      footer {
+        grid-row: 2;
+        grid-column: 1;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 16px;
+        background: var(--panel);
+        border-top: 1px solid var(--line);
+      }
+      button,
+      select {
+        background: #1d2433;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 4px 10px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #262f42;
+      }
+      #scrub {
+        flex: 1;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 4px;
+      }
+      .quiet {
+        color: var(--quiet);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+      }
+      th,
+      td {
+        text-align: right;
+        padding: 3px 4px;
+        white-space: nowrap;
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      th {
+        color: var(--quiet);
+        font-weight: 500;
+        border-bottom: 1px solid var(--line);
+      }
+      tr.defeated td {
+        color: var(--quiet);
+        text-decoration: line-through;
+      }
+      .swatch {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        margin-right: 6px;
+        vertical-align: -1px;
+      }
+      #chart {
+        width: 100%;
+        height: 160px;
+        display: block;
+        margin-top: 16px;
+        cursor: pointer;
+      }
+      #drop {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 12px;
+        background: var(--bg);
+        z-index: 2;
+      }
+      #drop.hover {
+        outline: 3px dashed var(--quiet);
+        outline-offset: -24px;
+      }
+      #tip {
+        position: fixed;
+        pointer-events: none;
+        background: #000c;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 4px 8px;
+        display: none;
+        z-index: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="drop">
+      <h1>Solaris replay</h1>
+      <div class="quiet">Drop a replay file here, or pick one.</div>
+      <input type="file" id="file" accept=".json,application/json" />
+    </div>
+
+    <canvas id="map"></canvas>
+
+    <aside>
+      <h1 id="title">Replay</h1>
+      <div id="status" class="quiet"></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Player</th>
+            <th>Stars</th>
+            <th>Ships</th>
+            <th>Eco</th>
+            <th>Ind</th>
+            <th>Sci</th>
+          </tr>
+        </thead>
+        <tbody id="standings"></tbody>
+      </table>
+      <canvas id="chart"></canvas>
+      <div class="quiet" style="margin-top: 4px">
+        Stars held over time. Click to jump.
+      </div>
+    </aside>
+
+    <footer>
+      <button id="play">Play</button>
+      <button id="back" title="Back one tick">&#9664;</button>
+      <button id="fwd" title="Forward one tick">&#9654;</button>
+      <input type="range" id="scrub" min="0" max="0" value="0" />
+      <select id="speed" title="Ticks per second">
+        <option value="2">2 ticks/s</option>
+        <option value="5">5 ticks/s</option>
+        <option value="10" selected>10 ticks/s</option>
+        <option value="20">20 ticks/s</option>
+        <option value="60">60 ticks/s</option>
+      </select>
+    </footer>
+
+    <div id="tip"></div>
+
+    <script>
+      "use strict";
+
+      const $ = (id) => document.getElementById(id);
+      const map = $("map"),
+        mctx = map.getContext("2d");
+      const chart = $("chart"),
+        cctx = chart.getContext("2d");
+
+      let replay = null;
+      let frame = 0;
+      let playing = false;
+      let lastStep = 0;
+      let view = { cx: 0, cy: 0, scale: 1 };
+      let hoverStar = -1;
+
+      // Precomputed per-player star counts for the chart.
+      let starSeries = [];
+      let maxStars = 1;
+
+      const CARRIER = 5; // numbers per carrier in a frame
+      const PLAYER = 6; // numbers per player in a frame
+
+      function load(text) {
+        const data = JSON.parse(text);
+        if (data.version !== 1 || !Array.isArray(data.frames)) {
+          throw new Error("This does not look like a simulator replay.");
+        }
+        replay = data;
+        frame = 0;
+        $("scrub").max = String(replay.frames.length - 1);
+        $("drop").style.display = "none";
+
+        starSeries = replay.players.map((_, p) =>
+          replay.frames.map((f) => f.players[p * PLAYER]),
+        );
+        maxStars = Math.max(1, ...starSeries.flat());
+
+        const seed = replay.seed == null ? "" : `, seed ${replay.seed}`;
+        $("title").textContent = `${replay.settings} game${seed}`;
+        fitView();
+        resize();
+      }
+
+      function fitView() {
+        const xs = replay.stars.map((s) => s.x),
+          ys = replay.stars.map((s) => s.y);
+        const minX = Math.min(...xs),
+          maxX = Math.max(...xs);
+        const minY = Math.min(...ys),
+          maxY = Math.max(...ys);
+        view.cx = (minX + maxX) / 2;
+        view.cy = (minY + maxY) / 2;
+        const w = map.clientWidth || 800,
+          h = map.clientHeight || 600;
+        view.scale =
+          0.92 * Math.min(w / (maxX - minX || 1), h / (maxY - minY || 1));
+      }
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        for (const c of [map, chart]) {
+          c.width = Math.round(c.clientWidth * dpr);
+          c.height = Math.round(c.clientHeight * dpr);
+          c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        draw();
+      }
+
+      const toScreen = (x, y) => [
+        map.clientWidth / 2 + (x - view.cx) * view.scale,
+        map.clientHeight / 2 + (y - view.cy) * view.scale,
+      ];
+
+      const UNOWNED = getComputedStyle(document.documentElement)
+        .getPropertyValue("--unowned")
+        .trim();
+      const colourOf = (owner) =>
+        owner >= 0 ? replay.players[owner].colour : UNOWNED;
+
+      function draw() {
+        if (!replay) return;
+        drawMap();
+        drawPanel();
+        drawChart();
+      }
+
+      function drawMap() {
+        const f = replay.frames[frame];
+        const w = map.clientWidth,
+          h = map.clientHeight;
+        mctx.clearRect(0, 0, w, h);
+
+        // Carrier routes first, so stars and carriers sit on top of them.
+        mctx.lineWidth = 1;
+        for (let i = 0; i < f.carriers.length; i += CARRIER) {
+          const dest = f.carriers[i + 4];
+          if (dest < 0) continue;
+          const [x1, y1] = toScreen(f.carriers[i + 1], f.carriers[i + 2]);
+          const s = replay.stars[dest];
+          const [x2, y2] = toScreen(s.x, s.y);
+          mctx.strokeStyle = colourOf(f.carriers[i]) + "66";
+          mctx.beginPath();
+          mctx.moveTo(x1, y1);
+          mctx.lineTo(x2, y2);
+          mctx.stroke();
+        }
+
+        const zoom = Math.max(0.6, Math.min(2.5, view.scale * 2));
+        replay.stars.forEach((s, i) => {
+          const [x, y] = toScreen(s.x, s.y);
+          const owner = f.owners[i];
+          const r =
+            (owner >= 0 ? 3 + Math.min(9, Math.sqrt(f.ships[i]) / 3) : 2.5) *
+            zoom;
+          mctx.fillStyle = colourOf(owner);
+          mctx.beginPath();
+          mctx.arc(x, y, r, 0, Math.PI * 2);
+          mctx.fill();
+          if (i === hoverStar) {
+            mctx.strokeStyle = "#fff";
+            mctx.lineWidth = 1.5;
+            mctx.stroke();
+          }
+        });
+
+        // Carriers in flight as small diamonds; orbiting ones are hidden in
+        // their star's dot.
+        for (let i = 0; i < f.carriers.length; i += CARRIER) {
+          if (f.carriers[i + 4] < 0) continue;
+          const [x, y] = toScreen(f.carriers[i + 1], f.carriers[i + 2]);
+          const r = 2 + Math.min(4, Math.sqrt(f.carriers[i + 3]) / 6);
+          mctx.fillStyle = colourOf(f.carriers[i]);
+          mctx.beginPath();
+          mctx.moveTo(x, y - r);
+          mctx.lineTo(x + r, y);
+          mctx.lineTo(x, y + r);
+          mctx.lineTo(x - r, y);
+          mctx.closePath();
+          mctx.fill();
+        }
+      }
+
+      function drawPanel() {
+        const f = replay.frames[frame];
+        const cycle = Math.floor(f.tick / replay.productionTicks);
+        const last = frame === replay.frames.length - 1;
+        let status = `Tick ${f.tick} · cycle ${cycle} · ${frame + 1} of ${replay.frames.length} frames`;
+        if (last && replay.winner != null) {
+          status += ` · ${replay.players[replay.winner].alias} won`;
+        }
+        $("status").textContent = status;
+        $("scrub").value = String(frame);
+
+        const rows = replay.players
+          .map((p, i) => {
+            const o = i * PLAYER;
+            return {
+              p,
+              stars: f.players[o],
+              ships: f.players[o + 1],
+              eco: f.players[o + 2],
+              ind: f.players[o + 3],
+              sci: f.players[o + 4],
+              defeated: f.players[o + 5] === 1,
+            };
+          })
+          .sort((a, b) => b.stars - a.stars || b.ships - a.ships);
+
+        const tbody = $("standings");
+        tbody.replaceChildren(
+          ...rows.map((r) => {
+            const tr = document.createElement("tr");
+            if (r.defeated) tr.className = "defeated";
+            const name = document.createElement("td");
+            const sw = document.createElement("span");
+            sw.className = "swatch";
+            sw.style.background = r.p.colour;
+            name.append(sw, r.p.alias);
+            tr.append(name);
+            for (const v of [r.stars, r.ships, r.eco, r.ind, r.sci]) {
+              const td = document.createElement("td");
+              td.textContent = String(v);
+              tr.append(td);
+            }
+            return tr;
+          }),
+        );
+      }
+
+      function drawChart() {
+        const w = chart.clientWidth,
+          h = chart.clientHeight;
+        const n = replay.frames.length;
+        cctx.clearRect(0, 0, w, h);
+        const X = (i) => (n > 1 ? (i / (n - 1)) * (w - 2) + 1 : 0);
+        const Y = (v) => h - 2 - (v / maxStars) * (h - 6);
+
+        cctx.lineWidth = 1.5;
+        starSeries.forEach((series, p) => {
+          cctx.strokeStyle = replay.players[p].colour;
+          cctx.beginPath();
+          series.forEach((v, i) =>
+            i ? cctx.lineTo(X(i), Y(v)) : cctx.moveTo(X(i), Y(v)),
+          );
+          cctx.stroke();
+        });
+
+        cctx.strokeStyle = "#ffffffaa";
+        cctx.lineWidth = 1;
+        cctx.beginPath();
+        cctx.moveTo(X(frame), 0);
+        cctx.lineTo(X(frame), h);
+        cctx.stroke();
+      }
+
+      function seek(i) {
+        frame = Math.max(0, Math.min(replay.frames.length - 1, i));
+        if (frame === replay.frames.length - 1) setPlaying(false);
+        draw();
+      }
+
+      function setPlaying(on) {
+        playing = on;
+        $("play").textContent = on ? "Pause" : "Play";
+        if (on && frame === replay.frames.length - 1) frame = 0;
+        lastStep = performance.now();
+        if (on) requestAnimationFrame(loop);
+      }
+
+      function loop(now) {
+        if (!playing) return;
+        const interval = 1000 / Number($("speed").value);
+        if (now - lastStep >= interval) {
+          const steps = Math.floor((now - lastStep) / interval);
+          lastStep += steps * interval;
+          seek(frame + steps);
+        }
+        if (playing) requestAnimationFrame(loop);
+      }
+
+      // Loading
+      $("file").addEventListener("change", (e) => readFile(e.target.files[0]));
+      const drop = $("drop");
+      window.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        drop.classList.add("hover");
+        drop.style.display = "flex";
+      });
+      window.addEventListener("dragleave", (e) => {
+        if (!e.relatedTarget) {
+          drop.classList.remove("hover");
+          if (replay) drop.style.display = "none";
+        }
+      });
+      window.addEventListener("drop", (e) => {
+        e.preventDefault();
+        drop.classList.remove("hover");
+        readFile(e.dataTransfer.files[0]);
+      });
+      function readFile(file) {
+        if (!file) return;
+        file
+          .text()
+          .then(load)
+          .catch((err) => alert(err.message));
+      }
+
+      // Controls
+      $("play").onclick = () => replay && setPlaying(!playing);
+      $("back").onclick = () => replay && seek(frame - 1);
+      $("fwd").onclick = () => replay && seek(frame + 1);
+      $("scrub").oninput = (e) => seek(Number(e.target.value));
+      window.addEventListener("keydown", (e) => {
+        if (!replay || e.target.tagName === "SELECT") return;
+        const step = e.shiftKey ? replay.productionTicks : 1;
+        if (e.key === " ") {
+          e.preventDefault();
+          setPlaying(!playing);
+        } else if (e.key === "ArrowLeft") seek(frame - step);
+        else if (e.key === "ArrowRight") seek(frame + step);
+      });
+      chart.addEventListener("click", (e) => {
+        if (!replay) return;
+        const rect = chart.getBoundingClientRect();
+        seek(
+          Math.round(
+            ((e.clientX - rect.left) / rect.width) * (replay.frames.length - 1),
+          ),
+        );
+      });
+
+      // Pan, zoom and hover on the map
+      let drag = null;
+      map.addEventListener("mousedown", (e) => {
+        drag = { x: e.clientX, y: e.clientY };
+        map.classList.add("dragging");
+      });
+      window.addEventListener("mouseup", () => {
+        drag = null;
+        map.classList.remove("dragging");
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (!replay) return;
+        if (drag) {
+          view.cx -= (e.clientX - drag.x) / view.scale;
+          view.cy -= (e.clientY - drag.y) / view.scale;
+          drag = { x: e.clientX, y: e.clientY };
+          draw();
+          return;
+        }
+        updateHover(e);
+      });
+      map.addEventListener(
+        "wheel",
+        (e) => {
+          if (!replay) return;
+          e.preventDefault();
+          const rect = map.getBoundingClientRect();
+          const mx = e.clientX - rect.left,
+            my = e.clientY - rect.top;
+          const wx = view.cx + (mx - map.clientWidth / 2) / view.scale;
+          const wy = view.cy + (my - map.clientHeight / 2) / view.scale;
+          view.scale *= Math.exp(-e.deltaY * 0.0015);
+          view.cx = wx - (mx - map.clientWidth / 2) / view.scale;
+          view.cy = wy - (my - map.clientHeight / 2) / view.scale;
+          draw();
+        },
+        { passive: false },
+      );
+      map.addEventListener("dblclick", () => {
+        if (replay) {
+          fitView();
+          draw();
+        }
+      });
+
+      function updateHover(e) {
+        const rect = map.getBoundingClientRect();
+        const inside =
+          e.clientX >= rect.left &&
+          e.clientX <= rect.right &&
+          e.clientY >= rect.top &&
+          e.clientY <= rect.bottom;
+        const tip = $("tip");
+        let best = -1,
+          bestD = 12 * 12;
+        if (inside) {
+          replay.stars.forEach((s, i) => {
+            const [x, y] = toScreen(s.x, s.y);
+            const d =
+              (x - (e.clientX - rect.left)) ** 2 +
+              (y - (e.clientY - rect.top)) ** 2;
+            if (d < bestD) {
+              bestD = d;
+              best = i;
+            }
+          });
+        }
+        if (best !== hoverStar) {
+          hoverStar = best;
+          draw();
+        }
+        if (best < 0) {
+          tip.style.display = "none";
+          return;
+        }
+        const f = replay.frames[frame];
+        const owner = f.owners[best];
+        tip.textContent = `${replay.stars[best].name} · ${owner >= 0 ? replay.players[owner].alias : "unowned"} · ${f.ships[best]} ships`;
+        tip.style.left = `${e.clientX + 14}px`;
+        tip.style.top = `${e.clientY + 10}px`;
+        tip.style.display = "block";
+      }
+
+      window.addEventListener("resize", resize);
+    </script>
+  </body>
+</html>
