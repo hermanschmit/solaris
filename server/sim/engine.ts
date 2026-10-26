@@ -19,6 +19,11 @@ const nullService: any = new Proxy({}, { get: () => async () => {} });
 const toLean = (doc: any): Game => {
     const game = doc.toObject();
     game.save = async () => game;
+    // The built-in AI ends each turn by flagging the player's AI state as
+    // changed, a mongoose method plain objects lack.
+    for (const player of game.galaxy.players) {
+        player.markModified = () => {};
+    }
     return game;
 };
 

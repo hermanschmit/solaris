@@ -132,6 +132,38 @@ python3 sim/python/example_agent.py 1 200   # seed 1, stop at tick 200
 The executor currently reads the full game state, so it knows true enemy
 ship counts when sizing an attack. A fog-of-war executor is future work.
 
+## Belief-model training data
+
+A belief model guesses what fog of war hides from a player. `beliefBatch.ts`
+plays all-AI games in parallel, one per core, and records each one with
+`beliefData.ts`: on every tick, the true state of every star, carrier and
+player, and which stars and carriers each player has in scanning range, by
+the same rules as the game's galaxy view. Each player gets a randomly tuned
+built-in AI so the games vary.
+
+```sh
+npx tsx sim/beliefBatch.ts data/belief 100 1   # 100 games, seeds 1-100
+python3 sim/python/belief_data.py data/belief belief.npz
+python3 sim/python/belief_check.py data/belief
+```
+
+A game takes 2 to 4 minutes per core and about 1 MB on disk. Recording adds
+about 6% to the run time.
+
+`python/belief_data.py` turns the recordings into samples: one player's view
+at one tick, as features per star and per player, with the hidden truth as
+targets. The player remembers what it saw: a star out of range keeps the
+ships and infrastructure it last had in range, with their age. Frontier
+features give each star's travel time to the player's own and to enemy
+stars, and the enemy ships the player knows of that could reach it within
+one or two cycles. Reach follows each enemy's own hyperspace range, hop by
+hop, since tech levels are public. Targets include the true ships and
+infrastructure everywhere, the true threat, the enemy ships that actually
+arrive within the next cycle, and each enemy's credits and research.
+Building features in Python keeps them easy to change without re-running
+games. `belief_check.py` prints how much fog hides and the scores of simple
+guesses, which a belief model has to beat.
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set

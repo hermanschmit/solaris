@@ -2,6 +2,11 @@ import mongoose from "mongoose";
 import { SimEngine } from "../sim/engine";
 import { determinize } from "../sim/snapshot";
 import { AgentEnv } from "../sim/agentEnv";
+import { BeliefRecorder, HIDDEN, VISIBLE } from "../sim/beliefData";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import zlib from "zlib";
 
 // Object ids embed a timestamp, so compare games by the order in which ids
 // first appear rather than by their values.
@@ -216,6 +221,74 @@ describe("sim engine", () => {
                 Math.max(...game.galaxy.players.slice(0, 9).map(owned)),
             );
             expect(owned(agent)).toBeLessThanOrEqual(6);
+        });
+    });
+    describe("belief data", () => {
+        it("records what each player sees as the galaxy view shows it", async () => {
+            const game = await newGame(4);
+            await engine.tick(game, 40);
+
+            const recorder = new BeliefRecorder(engine, game, { seed: 4 });
+            recorder.capture(game);
+
+            const seat = 3;
+            const player = game.galaxy.players[seat];
+            engine.setExternallyControlled(
+                game,
+                player._id,
+                new mongoose.Types.ObjectId(),
+            );
+            const view = await engine.viewAs(game, player.userId!);
+            const stars = game.galaxy.stars.length;
+            const visibility = recorder.visibility[0].slice(
+                seat * stars,
+                (seat + 1) * stars,
+            );
+
+            const inRange = new Set(
+                view.galaxy.stars
+                    .filter((s: any) => s.isInScanningRange)
+                    .map((s: any) => s._id.toString()),
+            );
+            game.galaxy.stars.forEach((s, i) =>
+                expect(visibility[i] !== HIDDEN).toBe(
+                    inRange.has(s._id.toString()),
+                ),
+            );
+            expect(
+                visibility.filter((v) => v === VISIBLE).length,
+            ).toBeGreaterThan(0);
+            expect(inRange.size).toBeLessThan(stars);
+
+            // Carriers the view shows are the ones marked visible to the seat.
+            const shown = new Set(
+                view.galaxy.carriers.map((c: any) => c._id.toString()),
+            );
+            const fields = recorder.header.carrierFields;
+            const rows = recorder.carriers[0];
+            game.galaxy.carriers.forEach((c, i) => {
+                const mask =
+                    rows[i * fields.length + fields.indexOf("visible")];
+                expect(Boolean(mask & (1 << seat))).toBe(
+                    shown.has(c._id.toString()),
+                );
+            });
+
+            const file = path.join(os.tmpdir(), `belief-${process.pid}.sbd`);
+            recorder.save(file);
+            const raw = zlib.gunzipSync(fs.readFileSync(file));
+            fs.unlinkSync(file);
+            const header = JSON.parse(
+                raw.subarray(8, 8 + raw.readUInt32LE(4)).toString(),
+            );
+
+            expect(raw.subarray(0, 4).toString()).toBe("SBD1");
+            expect(header.arrays.map((a: any) => a.name)).toContain(
+                "visibility",
+            );
+            expect(
+                header.arrays.find((a: any) => a.name === "stars").shape,
+            ).toEqual([1, stars, header.starFields.length]);
         });
     });
 });
