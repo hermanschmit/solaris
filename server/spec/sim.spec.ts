@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import { SimEngine } from "../sim/engine";
 import { determinize } from "../sim/snapshot";
+import { AgentEnv } from "../sim/agentEnv";
 
 // Object ids embed a timestamp, so compare games by the order in which ids
 // first appear rather than by their values.
@@ -152,6 +153,69 @@ describe("sim engine", () => {
             for (const p of others) {
                 expect(saver.credits).toBeGreaterThan(p.credits);
             }
+        });
+    });
+    describe("agent environment", () => {
+        const play = async (
+            env: AgentEnv,
+            ticks: number,
+            decide: (seat: number) => any,
+        ) => {
+            let result = await env.reset({
+                seed: 4,
+                agents: [9],
+                maxTicks: ticks,
+            });
+            while (!result.done) {
+                for (const seat of result.seats) {
+                    await env.observe(seat);
+                    env.act(seat, decide(seat));
+                }
+                result = await env.step();
+            }
+            return env.game;
+        };
+
+        it("plays exactly like the built-in AI when the agent keeps its choices", async () => {
+            const plain = await newGame(4);
+            await engine.tick(plain, 60);
+
+            const env = new AgentEnv();
+            const game = await play(env, 60, () => ({}));
+
+            expect(game.state.tick).toBe(60);
+            expect(fingerprint(env.engine, game)).toEqual(
+                fingerprint(engine, plain),
+            );
+        });
+
+        it("acts only on the orders the agent scores", async () => {
+            const env = new AgentEnv();
+            const result = await env.reset({ seed: 4, agents: [9] });
+            const observation = await env.observe(9);
+
+            expect(result.seats).toEqual([9]);
+            expect(observation.candidates.length).toBeGreaterThan(0);
+            expect(observation.candidates[0].key).toMatch(
+                /^(defend|invade|claim):/,
+            );
+
+            // Dropping every order means never claiming a star.
+            const game = await play(env, 60, () => ({
+                orders: {},
+                research: "weapons",
+            }));
+            const agent = game.galaxy.players[9];
+            const owned = (p: any) =>
+                game.galaxy.stars.filter(
+                    (s) => s.ownedByPlayerId?.toString() === p._id.toString(),
+                ).length;
+
+            expect(agent.researchingNow).toBe("weapons");
+            expect(owned(agent)).toBeLessThan(
+                Math.max(...game.galaxy.players.slice(0, 9).map(owned)),
+            );
+            expect(owned(agent)).toBeLessThanOrEqual(6);
         });
     });
 });

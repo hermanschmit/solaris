@@ -103,6 +103,35 @@ engine.setAiConfig(game, player._id, {
 });
 ```
 
+## Driving seats with an agent
+
+`agentEnv.ts` lets an agent play some seats while the built-in AI plays the
+rest. The agent is a commander: at each decision point it sees the orders
+the built-in AI is considering (defend, invade or claim a star, each with
+the AI's own score) and answers with
+
+- `orders`: a score per order key. Orders it leaves out are dropped, and
+  higher scores are served first. Leave it out to keep the AI's choices.
+- `config`: built-in AI tuning for that seat (`AiConfig`), for example the
+  spending split or the invasion margin.
+- `research`: the technology to research now and next.
+
+The built-in AI's executor then carries the orders out during the tick
+(ship assignment, carrier purchases, waypoints). A seat with no decision
+plays exactly like the built-in AI; the specs check this tick for tick.
+Decision points are the start of each cycle, a new attack on one of the
+seat's stars, and at least every 4 ticks (`maxGap`).
+
+`server.ts` serves the environment as JSON lines on stdin and stdout, and
+`python/solaris_env.py` is a standard-library Python client for it:
+
+```sh
+python3 sim/python/example_agent.py 1 200   # seed 1, stop at tick 200
+```
+
+The executor currently reads the full game state, so it knows true enemy
+ship counts when sizing an attack. A fog-of-war executor is future work.
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set
