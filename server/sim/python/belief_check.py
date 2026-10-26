@@ -26,7 +26,7 @@ def main():
     a = bd.build(files, every, per_tick)
     x, y, known = a["star_x"], a["star_y"], a["star_known"]
     ticks = a["meta"][:, 1]
-    cycle = 24  # standard productionTicks; only used to label phases
+    cycle = bd.load(files[0])[0]["productionTicks"]  # only labels phases
     print(f"{len(files)} games, {len(x)} samples (player views)\n")
 
     print("How much a player sees, by game phase")
