@@ -164,6 +164,20 @@ Building features in Python keeps them easy to change without re-running
 games. `belief_check.py` prints how much fog hides and the scores of simple
 guesses, which a belief model has to beat.
 
+`python/belief_train.py` trains a first belief model with PyTorch, on the
+GPU when there is one:
+
+```sh
+python3 sim/python/belief_train.py belief.npz 20 belief_model.pt
+```
+
+Stars attend to each other with a learned bias by distance, and each star's
+input includes its owner's public stats and tech. The model predicts
+corrections to what the player already knows, so it starts at the simple
+baselines. It reports, on games held out by seed, how well it predicts
+attacks on the player's stars in the next cycle, the threat to them, ships
+at hidden enemy stars and enemy research, each next to a baseline.
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set
