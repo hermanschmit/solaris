@@ -103,6 +103,81 @@ engine.setAiConfig(game, player._id, {
 });
 ```
 
+## Driving seats with an agent
+
+`agentEnv.ts` lets an agent play some seats while the built-in AI plays the
+rest. The agent is a commander: at each decision point it sees the orders
+the built-in AI is considering (defend, invade or claim a star, each with
+the AI's own score) and answers with
+
+- `orders`: a score per order key. Orders it leaves out are dropped, and
+  higher scores are served first. Leave it out to keep the AI's choices.
+- `config`: built-in AI tuning for that seat (`AiConfig`), for example the
+  spending split or the invasion margin.
+- `research`: the technology to research now and next.
+
+The built-in AI's executor then carries the orders out during the tick
+(ship assignment, carrier purchases, waypoints). A seat with no decision
+plays exactly like the built-in AI; the specs check this tick for tick.
+Decision points are the start of each cycle, a new attack on one of the
+seat's stars, and at least every 4 ticks (`maxGap`).
+
+`server.ts` serves the environment as JSON lines on stdin and stdout, and
+`python/solaris_env.py` is a standard-library Python client for it:
+
+```sh
+python3 sim/python/example_agent.py 1 200   # seed 1, stop at tick 200
+```
+
+The executor currently reads the full game state, so it knows true enemy
+ship counts when sizing an attack. A fog-of-war executor is future work.
+
+## Belief-model training data
+
+A belief model guesses what fog of war hides from a player. `beliefBatch.ts`
+plays all-AI games in parallel, one per core, and records each one with
+`beliefData.ts`: on every tick, the true state of every star, carrier and
+player, and which stars and carriers each player has in scanning range, by
+the same rules as the game's galaxy view. Each player gets a randomly tuned
+built-in AI so the games vary.
+
+```sh
+npx tsx sim/beliefBatch.ts data/belief 100 1   # 100 games, seeds 1-100
+python3 sim/python/belief_data.py data/belief belief.npz
+python3 sim/python/belief_check.py data/belief
+```
+
+A game takes 2 to 4 minutes per core and about 1 MB on disk. Recording adds
+about 6% to the run time.
+
+`python/belief_data.py` turns the recordings into samples: one player's view
+at one tick, as features per star and per player, with the hidden truth as
+targets. The player remembers what it saw: a star out of range keeps the
+ships and infrastructure it last had in range, with their age. Frontier
+features give each star's travel time to the player's own and to enemy
+stars, and the enemy ships the player knows of that could reach it within
+one or two cycles. Reach follows each enemy's own hyperspace range, hop by
+hop, since tech levels are public. Targets include the true ships and
+infrastructure everywhere, the true threat, the enemy ships that actually
+arrive within the next cycle, and each enemy's credits and research.
+Building features in Python keeps them easy to change without re-running
+games. `belief_check.py` prints how much fog hides and the scores of simple
+guesses, which a belief model has to beat.
+
+`python/belief_train.py` trains a first belief model with PyTorch, on the
+GPU when there is one:
+
+```sh
+python3 sim/python/belief_train.py belief.npz 20 belief_model.pt
+```
+
+Stars attend to each other with a learned bias by distance, and each star's
+input includes its owner's public stats and tech. The model predicts
+corrections to what the player already knows, so it starts at the simple
+baselines. It reports, on games held out by seed, how well it predicts
+attacks on the player's stars in the next cycle, the threat to them, ships
+at hidden enemy stars and enemy research, each next to a baseline.
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set

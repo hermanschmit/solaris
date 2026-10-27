@@ -79,6 +79,17 @@ interface BorderStarData {
 
 type Order = DefendStarOrder | ClaimStarOrder | InvadeStarOrder;
 
+// An order the advanced AI is considering, as shown to an outside agent.
+// Keys name an order across ticks: defend orders for the same star share a
+// key whatever their arrival tick.
+export interface AiOrderCandidate {
+    key: string;
+    kind: "defend" | "invade" | "claim";
+    star: string;
+    score: number;
+    ticksUntil?: number;
+}
+
 type StarGraph = Map<string, Set<string>>;
 
 interface Context {
@@ -201,6 +212,13 @@ export default class AIService {
         return this.config;
     }
 
+    // Lets the simulator replace the advanced AI's order scores for a player.
+    // Returns a score per order key; orders left out are dropped. Null keeps
+    // the built-in scores.
+    getOrderScores(game: Game, player: Player): Map<string, number> | null {
+        return null;
+    }
+
     isAIControlled(player: Player) {
         return player.defeated || !player.userId; // Note: Null user IDs is considered AI as there is not a user controlling it.
     }
@@ -210,6 +228,59 @@ export default class AIService {
             throw new Error("The player is not under AI control.");
         }
 
+        await this._play(eventService, game, player);
+    }
+
+    // Plays the advanced AI for a player that an outside agent controls, so
+    // it acts on the agent's order scores and config. Used by the simulator.
+    async playForAgent(
+        eventService: IEventService,
+        game: Game,
+        player: Player,
+    ) {
+        await this._play(eventService, game, player);
+    }
+
+    // The orders the advanced AI would consider for a player right now, with
+    // their built-in scores.
+    proposeOrders(game: Game, player: Player): AiOrderCandidate[] {
+        const context = this._createContext(game, player);
+
+        if (context == null) {
+            return [];
+        }
+
+        if (!player.aiState) {
+            this._setInitialState(game, player);
+        }
+
+        return this._gatherOrders(game, player, context).map((order) => ({
+            key: this._orderKey(order),
+            kind: this._orderKind(order),
+            star: order.star,
+            score: order.score,
+            ...(order.type === AiAction.DefendStar
+                ? { ticksUntil: order.ticksUntil }
+                : {}),
+        }));
+    }
+
+    _orderKind(order: Order): AiOrderCandidate["kind"] {
+        switch (order.type) {
+            case AiAction.DefendStar:
+                return "defend";
+            case AiAction.InvadeStar:
+                return "invade";
+            case AiAction.ClaimStar:
+                return "claim";
+        }
+    }
+
+    _orderKey(order: Order): string {
+        return `${this._orderKind(order)}:${order.star}`;
+    }
+
+    async _play(eventService: IEventService, game: Game, player: Player) {
         const isFirstTickOfCycle =
             game.state.tick % game.settings.galaxy.productionTicks === 1;
         const isLastTickOfCycle =
@@ -274,7 +345,19 @@ export default class AIService {
             await this._playLastTick(eventService, game, player);
         }
 
-        const orders = this._gatherOrders(game, player, context);
+        let orders = this._gatherOrders(game, player, context);
+        const scores = this.getOrderScores(game, player);
+
+        if (scores) {
+            orders = orders.filter((order) =>
+                scores.has(this._orderKey(order)),
+            );
+
+            for (const order of orders) {
+                order.score = scores.get(this._orderKey(order))!;
+            }
+        }
+
         const assignments = await this._gatherAssignments(
             game,
             player,

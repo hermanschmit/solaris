@@ -1,6 +1,12 @@
 import mongoose from "mongoose";
 import { SimEngine } from "../sim/engine";
 import { determinize } from "../sim/snapshot";
+import { AgentEnv } from "../sim/agentEnv";
+import { BeliefRecorder, HIDDEN, VISIBLE } from "../sim/beliefData";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import zlib from "zlib";
 
 // Object ids embed a timestamp, so compare games by the order in which ids
 // first appear rather than by their values.
@@ -152,6 +158,137 @@ describe("sim engine", () => {
             for (const p of others) {
                 expect(saver.credits).toBeGreaterThan(p.credits);
             }
+        });
+    });
+    describe("agent environment", () => {
+        const play = async (
+            env: AgentEnv,
+            ticks: number,
+            decide: (seat: number) => any,
+        ) => {
+            let result = await env.reset({
+                seed: 4,
+                agents: [9],
+                maxTicks: ticks,
+            });
+            while (!result.done) {
+                for (const seat of result.seats) {
+                    await env.observe(seat);
+                    env.act(seat, decide(seat));
+                }
+                result = await env.step();
+            }
+            return env.game;
+        };
+
+        it("plays exactly like the built-in AI when the agent keeps its choices", async () => {
+            const plain = await newGame(4);
+            await engine.tick(plain, 60);
+
+            const env = new AgentEnv();
+            const game = await play(env, 60, () => ({}));
+
+            expect(game.state.tick).toBe(60);
+            expect(fingerprint(env.engine, game)).toEqual(
+                fingerprint(engine, plain),
+            );
+        });
+
+        it("acts only on the orders the agent scores", async () => {
+            const env = new AgentEnv();
+            const result = await env.reset({ seed: 4, agents: [9] });
+            const observation = await env.observe(9);
+
+            expect(result.seats).toEqual([9]);
+            expect(observation.candidates.length).toBeGreaterThan(0);
+            expect(observation.candidates[0].key).toMatch(
+                /^(defend|invade|claim):/,
+            );
+
+            // Dropping every order means never claiming a star.
+            const game = await play(env, 60, () => ({
+                orders: {},
+                research: "weapons",
+            }));
+            const agent = game.galaxy.players[9];
+            const owned = (p: any) =>
+                game.galaxy.stars.filter(
+                    (s) => s.ownedByPlayerId?.toString() === p._id.toString(),
+                ).length;
+
+            expect(agent.researchingNow).toBe("weapons");
+            expect(owned(agent)).toBeLessThan(
+                Math.max(...game.galaxy.players.slice(0, 9).map(owned)),
+            );
+            expect(owned(agent)).toBeLessThanOrEqual(6);
+        });
+    });
+    describe("belief data", () => {
+        it("records what each player sees as the galaxy view shows it", async () => {
+            const game = await newGame(4);
+            await engine.tick(game, 40);
+
+            const recorder = new BeliefRecorder(engine, game, { seed: 4 });
+            recorder.capture(game);
+
+            const seat = 3;
+            const player = game.galaxy.players[seat];
+            engine.setExternallyControlled(
+                game,
+                player._id,
+                new mongoose.Types.ObjectId(),
+            );
+            const view = await engine.viewAs(game, player.userId!);
+            const stars = game.galaxy.stars.length;
+            const visibility = recorder.visibility[0].slice(
+                seat * stars,
+                (seat + 1) * stars,
+            );
+
+            const inRange = new Set(
+                view.galaxy.stars
+                    .filter((s: any) => s.isInScanningRange)
+                    .map((s: any) => s._id.toString()),
+            );
+            game.galaxy.stars.forEach((s, i) =>
+                expect(visibility[i] !== HIDDEN).toBe(
+                    inRange.has(s._id.toString()),
+                ),
+            );
+            expect(
+                visibility.filter((v) => v === VISIBLE).length,
+            ).toBeGreaterThan(0);
+            expect(inRange.size).toBeLessThan(stars);
+
+            // Carriers the view shows are the ones marked visible to the seat.
+            const shown = new Set(
+                view.galaxy.carriers.map((c: any) => c._id.toString()),
+            );
+            const fields = recorder.header.carrierFields;
+            const rows = recorder.carriers[0];
+            game.galaxy.carriers.forEach((c, i) => {
+                const mask =
+                    rows[i * fields.length + fields.indexOf("visible")];
+                expect(Boolean(mask & (1 << seat))).toBe(
+                    shown.has(c._id.toString()),
+                );
+            });
+
+            const file = path.join(os.tmpdir(), `belief-${process.pid}.sbd`);
+            recorder.save(file);
+            const raw = zlib.gunzipSync(fs.readFileSync(file));
+            fs.unlinkSync(file);
+            const header = JSON.parse(
+                raw.subarray(8, 8 + raw.readUInt32LE(4)).toString(),
+            );
+
+            expect(raw.subarray(0, 4).toString()).toBe("SBD1");
+            expect(header.arrays.map((a: any) => a.name)).toContain(
+                "visibility",
+            );
+            expect(
+                header.arrays.find((a: any) => a.name === "stars").shape,
+            ).toEqual([1, stars, header.starFields.length]);
         });
     });
 });
