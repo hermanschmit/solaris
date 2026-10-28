@@ -1,0 +1,155 @@
+"""Play games with the commander and record them for training.
+
+    python3 commander_rollout.py <out_dir> [games] [first_seed] [workers] [seats] [belief.pt] [commander.pt]
+
+Each game puts the commander in `seats` random seats (3 by default) under
+fog of war, against the built-in AI in the rest, and samples its decisions
+so training can learn from what it tried. Per decision it records the
+policy's inputs (the seat's view only), what it chose and how likely that
+was, and the critic's inputs (the true state). At the end it records each
+seat's placement and the reward:
+
+  reward = 1 for a win down to -1 for first out, by placement, plus a small
+  bonus each cycle for the share of stars the seat holds.
+
+Games run in parallel, one per worker process, and each writes
+<out_dir>/r<seed>.npz. A commander checkpoint, when given, is the policy
+being trained; otherwise it starts from scratch (which plays exactly like
+the built-in AI, give or take the sampling). The belief model, when given,
+initializes its star encoding.
+"""
+
+import os
+import sys
+from multiprocessing import Pool
+from pathlib import Path
+
+import numpy as np
+import torch
+
+import belief_data as bd
+import commander as cm
+from solaris_env import SolarisEnv
+
+STAR_SHARE_BONUS = 0.02  # per cycle, times the seat's share of all stars
+
+
+def placement_reward(place, players):
+    return 1.0 - 2.0 * (place - 1) / (players - 1)
+
+
+def placements(standings):
+    key = lambda p: (standings["winner"] != p["seat"], p["defeated"], -p["stars"])
+    order = sorted(standings["players"], key=key)
+    return {p["seat"]: i + 1 for i, p in enumerate(order)}
+
+
+def build_model(n_techs, belief=None, checkpoint=None):
+    model = cm.Commander(n_techs)
+    if belief:
+        model.load_belief(belief)
+    if checkpoint:
+        model.load_state_dict(torch.load(checkpoint, map_location="cpu")["model"])
+    return model
+
+
+def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000):
+    torch.set_num_threads(1)
+    rng = np.random.default_rng(seed)
+    with SolarisEnv() as env:
+        agents = sorted(int(s) for s in rng.choice(10, seats, replace=False))
+        result = env.reset(agents=agents, seed=seed, max_ticks=max_ticks, fog=True)
+        static = bd.Static(env.header())
+        model = build_model(len(static.techs), belief, checkpoint)
+        agent = cm.CommanderAgent(model, static, sample=True)
+        torch.manual_seed(seed)
+
+        steps = []
+        last_cycle = {}
+        while not result["done"]:
+            for seat in result["seats"]:
+                obs = env.observe(seat, frame=True, truth_frame=True)
+                decision, rec = agent.decide(obs, seat)
+                env.act(seat, decision)
+
+                truth = cm.batch_inputs(static, obs["truthFrame"], seat, obs["candidates"],
+                                        obs["tick"], False)
+                bonus = 0.0
+                if obs["cycle"] != last_cycle.get(seat):
+                    last_cycle[seat] = obs["cycle"]
+                    own = sum(1 for o in obs["frame"]["owner"] if o == seat)
+                    bonus = STAR_SHARE_BONUS * own / static.S
+                steps.append((seat, obs["tick"], rec, truth, bonus))
+            result = env.step()
+
+        standings = env.standings()
+
+    place = placements(standings)
+    return pack(steps, place, agents, seed, standings)
+
+
+def pack(steps, place, agents, seed, standings):
+    """Stack a game's decisions into arrays, padding candidate lists."""
+    C = max(r["inputs"]["cand_mask"].shape[1] for _, _, r, _, _ in steps)
+
+    def pad(x, value=0):
+        x = x[0].numpy()
+        if x.ndim and x.shape[0] < C and x.shape[0] != 0:
+            x = np.concatenate([x, np.full((C - x.shape[0],) + x.shape[1:], value, x.dtype)])
+        return x
+
+    out = {k: [] for k in ("seat", "tick", "logp", "bonus", "act_order", "act_config",
+                           "act_research")}
+    inputs, truths = {}, {}
+    for seat, tick, rec, truth, bonus in steps:
+        out["seat"].append(seat)
+        out["tick"].append(tick)
+        out["logp"].append(float(rec["logp"][0]))
+        out["bonus"].append(bonus)
+        out["act_order"].append(pad(rec["act"]["order"]))
+        out["act_config"].append(rec["act"]["config"][0].numpy())
+        out["act_research"].append(int(rec["act"]["research"][0]))
+        for k, v in rec["inputs"].items():
+            inputs.setdefault(k, []).append(pad(v, -1 if k == "cand_star" else 0) if k.startswith("cand_") else v[0].numpy())
+        for k in ("star_x", "player_x", "owner", "time"):
+            truths.setdefault(k, []).append(truth[k][0].numpy())
+
+    arrays = {k: np.asarray(v) for k, v in out.items()}
+    arrays.update({"in_" + k: np.stack(v) for k, v in inputs.items()})
+    arrays.update({"truth_" + k: np.stack(v) for k, v in truths.items()})
+    players = len(standings["players"])
+    arrays["agents"] = np.array(agents)
+    arrays["place"] = np.array([place[s] for s in agents])
+    arrays["final_reward"] = np.array([placement_reward(place[s], players) for s in agents],
+                                      np.float32)
+    arrays["seed"] = np.array(seed)
+    arrays["ticks"] = np.array(standings["tick"])
+    return arrays
+
+
+def _job(args):
+    out_dir, seed, seats, belief, checkpoint = args
+    path = Path(out_dir) / f"r{seed}.npz"
+    if path.exists():
+        return seed, None
+    arrays = play(seed, seats, belief, checkpoint)
+    np.savez_compressed(str(path) + ".tmp.npz", **arrays)
+    os.replace(str(path) + ".tmp.npz", path)
+    return seed, dict(zip(arrays["agents"].tolist(), arrays["place"].tolist()))
+
+
+if __name__ == "__main__":
+    out_dir = sys.argv[1]
+    games = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+    first = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    workers = int(sys.argv[4]) if len(sys.argv) > 4 else max(1, os.cpu_count() - 1)
+    seats = int(sys.argv[5]) if len(sys.argv) > 5 else 3
+    belief = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] != "-" else None
+    checkpoint = sys.argv[7] if len(sys.argv) > 7 else None
+    os.makedirs(out_dir, exist_ok=True)
+    jobs = [(out_dir, s, seats, belief, checkpoint) for s in range(first, first + games)]
+    with Pool(workers) as pool:
+        for seed, places in pool.imap_unordered(_job, jobs):
+            print(f"seed {seed}: " + ("already done" if places is None else
+                  "placements " + ", ".join(f"seat {s} -> {p}" for s, p in places.items())),
+                  flush=True)

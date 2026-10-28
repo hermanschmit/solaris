@@ -73,9 +73,16 @@ measured with four games sharing four cores):
 | Tick 300 | 456 | about 420 ms | about 49 ms |
 
 All-AI standard games end by conquest after roughly 400 to 600 ticks (20 to
-30 cycles) and take two to four minutes on one core. The built-in AI is
-about 85% of that time, so advisor rollouts and the arena will want a
-cheaper opponent model.
+30 cycles). The built-in AI is most of that time.
+
+The engine speeds the built-in AI up without changing a single result (the
+game state is identical tick for tick): bson caches object id strings, the
+AI's attack-sizing combat estimates are remembered, and star-to-star
+distances for its reachability graphs are measured once per game. The first
+500 ticks of seed 1 went from 103 s to 41 s, so a whole game now takes
+about one to two minutes on one core. About half of what remains is the
+combat estimates, which simulate a battle once for every candidate number
+of ships.
 
 ## Watching a game
 
@@ -198,6 +205,27 @@ corrections to what the player already knows, so it starts at the simple
 baselines. It reports, on games held out by seed, how well it predicts
 attacks on the player's stars in the next cycle, the threat to them, ships
 at hidden enemy stars and enemy research, each next to a baseline.
+
+## The commander
+
+`python/commander.py` is the policy network for agent seats. On top of a
+belief model's star encoding, it decides a weight for each candidate order
+(`orderWeights`, which multiply the built-in AI's own scores as the
+executor computes them), the seat's tuning (spending split, invasion margin,
+logistics stockpile) and, at the start of each cycle, whether to switch
+research. Every head starts at zero, so an untrained commander plays
+exactly like the built-in AI: weights of 1, default tuning, research left
+alone. A separate critic reads a truth frame (`observe(seat, { truthFrame:
+true })`), which the policy never sees.
+
+`python/commander_rollout.py` plays games with the commander in a few seats
+under fog, sampling its decisions, and records for each one the policy's
+inputs, its actions and their log-probabilities, the critic's inputs, and
+the rewards (placement, plus a small bonus per cycle for stars held):
+
+```sh
+python3 sim/python/commander_rollout.py data/rollouts 20 1 13 3 belief_model.pt
+```
 
 ## Known gaps
 

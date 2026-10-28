@@ -132,6 +132,11 @@ class BeliefModel(nn.Module):
             nn.Linear(d + player_features, d), nn.GELU(), nn.Linear(d, 1 + n_techs))
 
     def forward(self, b):
+        star_out, player_out, _ = self.encode(b)
+        return star_out, player_out
+
+    def encode(self, b):
+        """Predictions, plus each star's learned encoding [B, S, d]."""
         sx, px, owner = b["star_x"], b["player_x"], b["owner"]
         B, S, _ = sx.shape
         P = px.shape[1]
@@ -168,7 +173,7 @@ class BeliefModel(nn.Module):
         pooled = torch.einsum("bsp,bsd->bpd", one_hot, h) / one_hot.sum(1).clamp(min=1).unsqueeze(-1)
         player_out = self.player_head(torch.cat([pooled, px], -1))
 
-        return star_out, player_out
+        return star_out, player_out, h
 
 
 def losses(model, b):

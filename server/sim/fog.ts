@@ -33,8 +33,12 @@ export class SeatMemory {
         this.specialist = new Uint8Array(stars);
     }
 
-    update(engine: SimEngine, game: Game, player: Player) {
-        const view = seatView(engine, game, player);
+    update(
+        engine: SimEngine,
+        game: Game,
+        player: Player,
+        view: SeatView = seatView(engine, game, player),
+    ) {
         this.view = view;
 
         game.galaxy.stars.forEach((s, i) => {
@@ -58,6 +62,13 @@ export class SeatMemory {
         });
     }
 }
+
+// Everything, as if the seat could see the whole galaxy.
+export const fullView = (game: Game): SeatView => ({
+    stars: new Uint8Array(game.galaxy.stars.length).fill(VISIBLE),
+    carriers: new Set(game.galaxy.carriers),
+    carrierShips: new Set(game.galaxy.carriers),
+});
 
 // What a seat knows right now, in the form sim/python/belief_data.py's
 // Static.features takes. Star and player references are indexes.
