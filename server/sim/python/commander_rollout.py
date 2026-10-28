@@ -127,12 +127,40 @@ def pack(steps, place, agents, seed, standings):
     return arrays
 
 
+def eval_seats(seed, seats=3):
+    """The seats an evaluation game on this seed gives the commander."""
+    rng = np.random.default_rng(seed)
+    return sorted(int(s) for s in rng.choice(10, seats, replace=False))
+
+
+def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000):
+    """Play a seed's evaluation seats with the commander's most likely
+    decisions, under fog, and return their placements. Without a
+    checkpoint, the built-in AI plays every seat with the whole game in
+    view: the bar to beat."""
+    torch.set_num_threads(1)
+    agents = eval_seats(seed, seats)
+    with SolarisEnv() as env:
+        result = env.reset(agents=agents if checkpoint else [], seed=seed,
+                           max_ticks=max_ticks, fog=True)
+        if checkpoint:
+            static = bd.Static(env.header())
+            agent = cm.CommanderAgent(build_model(len(static.techs), None, checkpoint), static)
+        while not result["done"]:
+            for seat in result["seats"]:
+                obs = env.observe(seat, frame=True)
+                env.act(seat, agent.decide(obs, seat)[0])
+            result = env.step()
+        place = placements(env.standings())
+    return {s: place[s] for s in agents}
+
+
 def _job(args):
-    out_dir, seed, seats, belief, checkpoint = args
+    out_dir, seed, seats, belief, checkpoint, max_ticks = args
     path = Path(out_dir) / f"r{seed}.npz"
     if path.exists():
         return seed, None
-    arrays = play(seed, seats, belief, checkpoint)
+    arrays = play(seed, seats, belief, checkpoint, max_ticks)
     np.savez_compressed(str(path) + ".tmp.npz", **arrays)
     os.replace(str(path) + ".tmp.npz", path)
     return seed, dict(zip(arrays["agents"].tolist(), arrays["place"].tolist()))
@@ -147,7 +175,7 @@ if __name__ == "__main__":
     belief = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] != "-" else None
     checkpoint = sys.argv[7] if len(sys.argv) > 7 else None
     os.makedirs(out_dir, exist_ok=True)
-    jobs = [(out_dir, s, seats, belief, checkpoint) for s in range(first, first + games)]
+    jobs = [(out_dir, s, seats, belief, checkpoint, 3000) for s in range(first, first + games)]
     with Pool(workers) as pool:
         for seed, places in pool.imap_unordered(_job, jobs):
             print(f"seed {seed}: " + ("already done" if places is None else

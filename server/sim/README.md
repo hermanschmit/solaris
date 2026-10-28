@@ -227,6 +227,29 @@ the rewards (placement, plus a small bonus per cycle for stars held):
 python3 sim/python/commander_rollout.py data/rollouts 20 1 13 3 belief_model.pt
 ```
 
+### Training it
+
+`python/ppo_train.py` trains the commander with PPO against the built-in
+AI. Each iteration plays a batch of games with the current checkpoint,
+computes advantages from the critic (GAE), updates the policy and critic,
+and saves the next checkpoint. Every 5 iterations it evaluates: the
+commander plays a fixed set of seeds with its most likely decisions, and
+its seats' placements are compared with the built-in AI's in the same
+seats, where the built-in AI sees the whole game.
+
+```sh
+# 20 iterations of 52 games on 13 workers, starting from the belief
+# model, evaluating on 26 seeds
+python3 sim/python/ppo_train.py data/ppo1 20 52 13 belief_model.pt 26
+```
+
+`log.jsonl` has a line per iteration (mean placement of the commander's
+seats in training games, losses, how far the policy moved) and
+`eval.jsonl` a line per evaluation (`placement` against
+`builtin_placement`, lower is better, and how many seats did better or
+worse). Run it again with the same directory to continue. Set
+`PPO_MAX_TICKS` to cut games short when trying it out.
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set
