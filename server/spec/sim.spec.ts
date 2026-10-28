@@ -195,6 +195,60 @@ describe("sim engine", () => {
             );
         });
 
+        it("plays exactly like the built-in AI with every order weight at 1", async () => {
+            const plain = await newGame(4);
+            await engine.tick(plain, 60);
+
+            const env = new AgentEnv();
+            let weighted = 0;
+            let result = await env.reset({
+                seed: 4,
+                agents: [9],
+                maxTicks: 60,
+            });
+            while (!result.done) {
+                for (const seat of result.seats) {
+                    const { candidates } = await env.observe(seat);
+                    weighted += candidates.length;
+                    env.act(seat, {
+                        orderWeights: Object.fromEntries(
+                            candidates.map((c) => [c.key, 1]),
+                        ),
+                    });
+                }
+                result = await env.step();
+            }
+
+            expect(weighted).toBeGreaterThan(0);
+            expect(fingerprint(env.engine, env.game)).toEqual(
+                fingerprint(engine, plain),
+            );
+        });
+
+        it("reports a truth frame that sees everything", async () => {
+            const env = new AgentEnv();
+            await env.reset({ seed: 4, agents: [9], fog: true });
+            const { frame, truthFrame, candidates } = await env.observe(9, {
+                frame: true,
+                truthFrame: true,
+            });
+
+            expect(
+                truthFrame.visibility.every((v: number) => v === VISIBLE),
+            ).toBe(true);
+            expect(truthFrame.carriers.owner.length).toBe(
+                env.game.galaxy.carriers.length,
+            );
+            expect(frame.visibility.some((v: number) => v === HIDDEN)).toBe(
+                true,
+            );
+            for (const c of candidates) {
+                expect(env.game.galaxy.stars[c.starIndex]._id.toString()).toBe(
+                    c.star,
+                );
+            }
+        });
+
         it("acts only on the orders the agent scores", async () => {
             const env = new AgentEnv();
             const result = await env.reset({ seed: 4, agents: [9] });

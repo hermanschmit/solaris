@@ -219,6 +219,13 @@ export default class AIService {
         return null;
     }
 
+    // Lets the simulator scale the advanced AI's own order scores for a
+    // player, by order key; orders left out keep their score. Null changes
+    // nothing.
+    getOrderWeights(game: Game, player: Player): Map<string, number> | null {
+        return null;
+    }
+
     isAIControlled(player: Player) {
         return player.defeated || !player.userId; // Note: Null user IDs is considered AI as there is not a user controlling it.
     }
@@ -355,6 +362,14 @@ export default class AIService {
 
             for (const order of orders) {
                 order.score = scores.get(this._orderKey(order))!;
+            }
+        }
+
+        const weights = this.getOrderWeights(game, player);
+
+        if (weights) {
+            for (const order of orders) {
+                order.score *= weights.get(this._orderKey(order)) ?? 1;
             }
         }
 

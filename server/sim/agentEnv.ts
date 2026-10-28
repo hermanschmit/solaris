@@ -19,13 +19,17 @@ import { Game } from "../services/types/Game";
 import { Player } from "../services/types/Player";
 import { AiConfig } from "../services/types/Ai";
 import { AiOrderCandidate } from "../services/ai";
-import { SeatMemory, seatFrame, applyFog } from "./fog";
+import { SeatMemory, seatFrame, applyFog, fullView } from "./fog";
 import { BeliefRecorder } from "./beliefData";
 
 export interface AgentDecision {
     // Score per order key; orders left out are dropped. Omit to keep the
     // built-in AI's choice of orders and scores.
     orders?: Record<string, number>;
+    // Multiplies the built-in AI's own score for an order, by order key, as
+    // the executor computes it when it acts. Orders left out keep their
+    // score, so all weights of 1 play exactly like the built-in AI.
+    orderWeights?: Record<string, number>;
     // Built-in AI tuning for this seat. Fields left out keep their defaults.
     config?: Partial<AiConfig>;
     // Technology to research now and next.
@@ -58,13 +62,17 @@ export interface Observation {
     // Ticks until the next production (end of cycle).
     ticksToProduction: number;
     defeated: boolean;
-    candidates: AiOrderCandidate[];
+    // With starIndex, the star's index in the galaxy's star list.
+    candidates: (AiOrderCandidate & { starIndex: number })[];
     // The seat's fog-of-war view, as GET /api/game/:gameId/galaxy returns
     // it. Only when asked for, since it is slower to build.
     view?: any;
-    // Under fog, when asked for: what the seat sees and remembers, in the
+    // When asked for: what the seat sees and remembers, in the
     // form sim/python/belief_data.py builds belief-model features from.
     frame?: any;
+    // When asked for: the same, as if the seat saw the whole galaxy. For
+    // a privileged critic in training, never for the policy.
+    truthFrame?: any;
 }
 
 export interface StepResult {
@@ -80,7 +88,7 @@ interface Seat {
     decision: AgentDecision;
     lastDecisionTick: number;
     defendKeys: string;
-    memory: SeatMemory | null;
+    memory: SeatMemory;
 }
 
 export class AgentEnv {
@@ -123,6 +131,11 @@ export class AgentEnv {
             const seat = this._seatOf(player);
             const orders = seat?.decision.orders;
             return orders ? new Map(Object.entries(orders)) : null;
+        };
+
+        ai.getOrderWeights = (game, player) => {
+            const weights = this._seatOf(player)?.decision.orderWeights;
+            return weights ? new Map(Object.entries(weights)) : null;
         };
     }
 
@@ -168,9 +181,7 @@ export class AgentEnv {
                 decision: {},
                 lastDecisionTick: 0,
                 defendKeys: "",
-                memory: this.fog
-                    ? new SeatMemory(this.game.galaxy.stars.length)
-                    : null,
+                memory: new SeatMemory(this.game.galaxy.stars.length),
             });
         }
 
@@ -185,7 +196,7 @@ export class AgentEnv {
 
     _updateMemories() {
         for (const seat of this.seats.values()) {
-            if (seat.memory && !seat.player.defeated) {
+            if (!seat.player.defeated) {
                 seat.memory.update(this.engine, this.game, seat.player);
             }
         }
@@ -194,7 +205,7 @@ export class AgentEnv {
     // Under fog, make the game show only what the seat knows; returns the
     // function that puts it back. refresh first rescans, for use mid-tick.
     _fog(seat: Seat, refresh = false): () => void {
-        if (!seat.memory) return () => {};
+        if (!this.fog) return () => {};
         if (refresh) seat.memory.update(this.engine, this.game, seat.player);
 
         const ships = seat.decision.beliefs?.ships;
@@ -254,7 +265,7 @@ export class AgentEnv {
 
     async observe(
         index: number,
-        options: { view?: boolean; frame?: boolean } = {},
+        options: { view?: boolean; frame?: boolean; truthFrame?: boolean } = {},
     ) {
         const seat = this._seat(index);
         const ticks = this.game.settings.galaxy.productionTicks;
@@ -266,16 +277,33 @@ export class AgentEnv {
             cycle: Math.floor(tick / ticks),
             ticksToProduction: ticks - (tick % ticks),
             defeated: seat.player.defeated,
-            candidates: this._proposeOrders(seat),
+            candidates: this._proposeOrders(seat).map((c) => ({
+                ...c,
+                starIndex: this.game.galaxy.stars.findIndex(
+                    (s) => s._id.toString() === c.star,
+                ),
+            })),
         };
 
         if (options.frame) {
-            if (!seat.memory) {
-                throw new Error("Frames need a game reset with fog on.");
-            }
             observation.frame = seatFrame(
                 this.game,
                 seat.memory,
+                this.technologies,
+            );
+        }
+
+        if (options.truthFrame) {
+            const memory = new SeatMemory(this.game.galaxy.stars.length);
+            memory.update(
+                this.engine,
+                this.game,
+                seat.player,
+                fullView(this.game),
+            );
+            observation.truthFrame = seatFrame(
+                this.game,
+                memory,
                 this.technologies,
             );
         }

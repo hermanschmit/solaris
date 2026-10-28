@@ -5,6 +5,7 @@
 // The tick logic gives identical results either way and runs about five
 // times faster on plain objects.
 import fs from "fs";
+import mongoose from "mongoose";
 import path from "path";
 import { createSimContainer, SimGameModel } from "./container";
 import { GameTickContext } from "../services/gameProcessing/context";
@@ -13,6 +14,12 @@ import { DBObjectId } from "../services/types/DBObjectId";
 import { DependencyContainer } from "../services/types/DependencyContainer";
 import { seededRng } from "./random";
 import { AiConfig, DEFAULT_AI_CONFIG } from "../services/types/Ai";
+
+// The server turns object ids into strings constantly (every lookup by id
+// compares strings), and bson rebuilds the hex string each time. Ids never
+// change, so let bson cache it: in long simulations this was a fifth of
+// all the time spent.
+mongoose.mongo.BSON.ObjectId.cacheHexString = true;
 
 const nullService: any = new Proxy({}, { get: () => async () => {} });
 
@@ -36,6 +43,109 @@ export class SimEngine {
         this.container = container ?? createSimContainer();
         this.container.aiService.getConfig = (game, player) =>
             this.aiConfigs.get(player._id.toString()) ?? DEFAULT_AI_CONFIG;
+
+        // The built-in AI sizes each attack by simulating the combat, which
+        // is pure arithmetic on a few numbers and is asked the same question
+        // many times. Remember the answers.
+        const combat = this.container.combatService;
+        const calculateBasic = combat.calculateBasic.bind(combat);
+        const answers = new Map<string, any>();
+        combat.calculateBasic = (defender, attacker, toStar, bonus) => {
+            const key = `${defender.ships},${defender.weaponsLevel},${attacker.ships},${attacker.weaponsLevel},${toStar},${bonus}`;
+            let answer = answers.get(key);
+            if (answer === undefined) {
+                if (answers.size > 100_000) answers.clear();
+                answer = calculateBasic(defender, attacker, toStar, bonus);
+                answers.set(key, answer);
+            }
+            return answer;
+        };
+
+        // The built-in AI builds several reachability graphs for every
+        // player on every tick, each measuring the distance between every
+        // pair of stars. Stars only move in orbital games, so elsewhere
+        // measure each pair once per game and look it up.
+        const ai = this.container.aiService;
+        const computeStarGraph = ai._computeStarGraph.bind(ai);
+        const gameType = this.container.gameTypeService;
+        const tables = new WeakMap<
+            Game,
+            { index: Map<any, number>; distance: Float64Array }
+        >();
+        ai._computeStarGraph = (
+            starsById,
+            game,
+            player,
+            traverseStars,
+            reachStars,
+            hyperspaceRange,
+        ) => {
+            if (gameType.isOrbitalMode(game)) {
+                return computeStarGraph(
+                    starsById,
+                    game,
+                    player,
+                    traverseStars,
+                    reachStars,
+                    hyperspaceRange,
+                );
+            }
+
+            let table = tables.get(game);
+            if (!table) {
+                const stars = game.galaxy.stars;
+                const n = stars.length;
+                const distance = new Float64Array(n * n);
+                for (let i = 0; i < n; i++) {
+                    for (let j = 0; j < n; j++) {
+                        distance[i * n + j] = ai._calculateTravelDistance(
+                            stars[i],
+                            stars[j],
+                        );
+                    }
+                }
+                table = {
+                    index: new Map(stars.map((s, i) => [s, i])),
+                    distance,
+                };
+                tables.set(game, table);
+            }
+
+            const { index, distance } = table;
+            const n = game.galaxy.stars.length;
+            const reachIndex = reachStars.map((s) => index.get(s));
+            if (reachIndex.some((i) => i === undefined)) {
+                return computeStarGraph(
+                    starsById,
+                    game,
+                    player,
+                    traverseStars,
+                    reachStars,
+                    hyperspaceRange,
+                );
+            }
+            const reachIds = reachStars.map((s) => s._id.toString());
+
+            // Same graph, in the same order, as AIService._computeStarGraph.
+            const graph = new Map<string, Set<string>>();
+            for (const star of traverseStars) {
+                const i = index.get(star);
+                const id = star._id.toString();
+                const reachable = new Set<string>();
+
+                for (let k = 0; k < reachStars.length; k++) {
+                    const d =
+                        i === undefined
+                            ? ai._calculateTravelDistance(star, reachStars[k])
+                            : distance[i * n + reachIndex[k]!];
+                    if (reachIds[k] !== id && d <= hyperspaceRange) {
+                        reachable.add(reachIds[k]);
+                    }
+                }
+                graph.set(id, reachable);
+            }
+            return graph;
+        };
     }
 
     // The server draws all of its randomness (combat ties, research

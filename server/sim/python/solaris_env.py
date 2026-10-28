@@ -80,18 +80,22 @@ class SolarisEnv:
         belief_data.Static takes them."""
         return self._call("header")
 
-    def observe(self, seat, view=False, frame=False):
+    def observe(self, seat, view=False, frame=False, truth_frame=False):
         """The seat's candidate orders, with the built-in AI's scores. With
         view=True, also its fog-of-war galaxy view (slower). With
-        frame=True (fog games only), also what it sees and remembers, which
-        belief_data.Static.features turns into belief-model inputs."""
-        return self._call("observe", seat=seat, view=view, frame=frame)
+        frame=True, also what it sees and remembers, which
+        belief_data.Static.features turns into belief-model inputs. With
+        truth_frame=True, also the same as if the seat saw everything (for
+        a training critic, never the policy)."""
+        return self._call("observe", seat=seat, view=view, frame=frame, truthFrame=truth_frame)
 
     def act(self, seat, decision):
         """Set the seat's decision: {"orders": {key: score}, "config": {...},
-        "research": "weapons", "beliefs": {"ships": [...]}}. All fields are
-        optional. beliefs.ships (per star, fog games only) is what the
-        executor assumes at stars whose ships the seat cannot see."""
+        "research": "weapons", "orderWeights": {key: weight}, "beliefs":
+        {"ships": [...]}}. All fields are optional. orderWeights multiply the
+        built-in AI's own order scores. beliefs.ships (per star, fog games
+        only) is what the executor assumes at stars whose ships the seat
+        cannot see."""
         return self._call("act", seat=seat, decision=decision)
 
     def step(self):
