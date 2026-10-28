@@ -3,6 +3,7 @@ import { SimEngine } from "../sim/engine";
 import { determinize } from "../sim/snapshot";
 import { AgentEnv } from "../sim/agentEnv";
 import { BeliefRecorder, HIDDEN, VISIBLE } from "../sim/beliefData";
+import { SeatMemory, applyFog } from "../sim/fog";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -289,6 +290,75 @@ describe("sim engine", () => {
             expect(
                 header.arrays.find((a: any) => a.name === "stars").shape,
             ).toEqual([1, stars, header.starFields.length]);
+        });
+    });
+    describe("fog of war for agents", () => {
+        it("shows the executor only what the seat knows, then puts it back", async () => {
+            const game = await newGame(4);
+            await engine.tick(game, 60);
+
+            const player = game.galaxy.players[3];
+            const id = player._id.toString();
+            const memory = new SeatMemory(game.galaxy.stars.length);
+            memory.update(engine, game, player);
+            const before = fingerprint(engine, game);
+            const carriers = game.galaxy.carriers.length;
+
+            const restore = applyFog(game, player, memory, (i) =>
+                i === 0 ? 123 : undefined,
+            );
+
+            expect(game.galaxy.carriers.length).toBeLessThan(carriers);
+            for (const c of game.galaxy.carriers) {
+                const own = c.ownedByPlayerId!.toString() === id;
+                expect(own || memory.view!.carriers.has(c)).toBe(true);
+                if (!own) expect(c.waypoints.length).toBeLessThanOrEqual(1);
+            }
+            game.galaxy.stars.forEach((s, i) => {
+                if (s.ownedByPlayerId?.toString() === id) return;
+                if (memory.view!.stars[i] === VISIBLE) return;
+                expect(s.shipsActual).toBe(i === 0 ? 123 : memory.ships[i]);
+                if (
+                    memory.view!.stars[i] === HIDDEN &&
+                    memory.seenTick[i] < 0
+                ) {
+                    expect(s.infrastructure.industry).toBe(0);
+                }
+            });
+
+            restore();
+            expect(fingerprint(engine, game)).toEqual(before);
+            expect(game.galaxy.carriers.length).toBe(carriers);
+        });
+
+        it("plays agent seats under fog and reports what they see", async () => {
+            const env = new AgentEnv();
+            let result = await env.reset({
+                seed: 4,
+                agents: [9],
+                fog: true,
+                maxTicks: 60,
+            });
+            while (!result.done) {
+                for (const seat of result.seats) {
+                    await env.observe(seat);
+                    env.act(seat, {});
+                }
+                result = await env.step();
+            }
+
+            const { frame } = await env.observe(9, { frame: true });
+            const stars = env.game.galaxy.stars.length;
+            const owned = env.standings().players[9].stars;
+
+            expect(env.game.state.tick).toBe(60);
+            expect(owned).toBeGreaterThan(1);
+            expect(frame.visibility.length).toBe(stars);
+            expect(
+                frame.visibility.filter((v: number) => v !== HIDDEN).length,
+            ).toBeLessThan(stars);
+            expect(frame.carriers.owner.length).toBeGreaterThan(0);
+            expect(env.header().stars.length).toBe(stars);
         });
     });
 });

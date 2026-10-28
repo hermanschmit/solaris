@@ -18,6 +18,7 @@ import zlib from "zlib";
 import { SimEngine } from "./engine";
 import { Game } from "../services/types/Game";
 import { Player } from "../services/types/Player";
+import { Carrier } from "../services/types/Carrier";
 
 type TypedArray =
     | Int8Array
@@ -74,6 +75,53 @@ const PLAYER_FIELDS = [
     "researchingNext",
     "defeated",
 ];
+
+export interface SeatView {
+    // Per star: HIDDEN, VISIBLE or VISIBLE_NO_SHIPS.
+    stars: Uint8Array;
+    // Carriers in scanning range, the player's own included.
+    carriers: Set<Carrier>;
+    // Those of them whose ships the player can see.
+    carrierShips: Set<Carrier>;
+}
+
+// What a player sees right now, by the same rules as the game's galaxy view
+// (services/gameGalaxy.ts).
+export const seatView = (
+    engine: SimEngine,
+    game: Game,
+    player: Player,
+): SeatView => {
+    const c = engine.container;
+    const started = c.gameStateService.isStarted(game);
+    const scanned = c.scanningService.calculateViewpointScanning(game, [
+        player,
+    ]);
+    const stars = new Uint8Array(game.galaxy.stars.length);
+
+    game.galaxy.stars.forEach((s, i) => {
+        const inRange =
+            (scanned.stars.has(s) && !scanned.unscannedWormHoles.has(s)) ||
+            (c.scanningService.isStarAlwaysVisible(s) && started);
+
+        if (inRange) {
+            stars[i] = c.starService.canPlayersSeeStarShips(s, [player._id])
+                ? VISIBLE
+                : VISIBLE_NO_SHIPS;
+        }
+    });
+
+    const carrierShips = new Set<Carrier>();
+    for (const carrier of scanned.carriers) {
+        if (
+            c.carrierService.canPlayersSeeCarrierShips(game, [player], carrier)
+        ) {
+            carrierShips.add(carrier);
+        }
+    }
+
+    return { stars, carriers: scanned.carriers, carrierShips };
+};
 
 export class BeliefRecorder {
     playerIndex = new Map<string, number>();
@@ -176,7 +224,6 @@ export class BeliefRecorder {
         const c = this.engine.container;
         const stars = game.galaxy.stars;
         const players = game.galaxy.players;
-        const started = c.gameStateService.isStarted(game);
 
         this.ticks.push(game.state.tick);
 
@@ -206,42 +253,20 @@ export class BeliefRecorder {
         players.forEach((p: Player, pi) => {
             if (p.defeated) return;
 
-            const scanned = c.scanningService.calculateViewpointScanning(game, [
-                p,
-            ]);
+            const view = seatView(this.engine, game, p);
+            visibility.set(view.stars, pi * stars.length);
 
-            stars.forEach((s, si) => {
-                const inRange =
-                    (scanned.stars.has(s) &&
-                        !scanned.unscannedWormHoles.has(s)) ||
-                    (c.scanningService.isStarAlwaysVisible(s) && started);
-
-                if (inRange) {
-                    visibility[pi * stars.length + si] =
-                        c.starService.canPlayersSeeStarShips(s, [p._id])
-                            ? VISIBLE
-                            : VISIBLE_NO_SHIPS;
-                }
-            });
-
-            for (const carrier of scanned.carriers) {
+            for (const carrier of view.carriers) {
                 carrierVisible.set(
                     carrier,
                     (carrierVisible.get(carrier) ?? 0) | (1 << pi),
                 );
-
-                if (
-                    c.carrierService.canPlayersSeeCarrierShips(
-                        game,
-                        [p],
-                        carrier,
-                    )
-                ) {
-                    carrierShipsVisible.set(
-                        carrier,
-                        (carrierShipsVisible.get(carrier) ?? 0) | (1 << pi),
-                    );
-                }
+            }
+            for (const carrier of view.carrierShips) {
+                carrierShipsVisible.set(
+                    carrier,
+                    (carrierShipsVisible.get(carrier) ?? 0) | (1 << pi),
+                );
             }
         });
         this.visibility.push(visibility);

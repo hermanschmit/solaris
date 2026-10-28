@@ -41,6 +41,22 @@ BUCKET = 25.0
 N_BUCKETS = 48  # the last bucket is everything beyond 1175
 
 
+def prepare_star_x(star_x):
+    """"Never seen" is coded as age 1000; squash ages to a small range."""
+    star_x = star_x.clone()
+    star_x[..., SF["age"]] = star_x[..., SF["age"]].clamp(max=50) / 10
+    return star_x
+
+
+def load_model(path, device="cpu"):
+    """A model saved by this script, ready to run."""
+    saved = torch.load(path, map_location=device)
+    n_techs = saved["n_techs"]
+    model = BeliefModel(len(bd.STAR_FEATURES), N_STATS + n_techs, n_techs)
+    model.load_state_dict(saved["model"])
+    return model.to(device).eval()
+
+
 def log_ships(x):
     """Ship targets span 0 to thousands; train on log scale."""
     return torch.log1p(x * bd.SCALE_SHIPS)
@@ -52,10 +68,7 @@ class Data:
         self.n = len(z["meta"])
         self.seeds = z["meta"][:, 0]
         t = lambda k, dt=torch.float32: torch.as_tensor(z[k]).to(dt)
-        self.star_x = t("star_x")
-        # "Never seen" is coded as age 1000; squash ages to a small range.
-        age = self.star_x[..., SF["age"]]
-        self.star_x[..., SF["age"]] = age.clamp(max=50) / 10
+        self.star_x = prepare_star_x(t("star_x"))
         self.star_y = t("star_y")
         self.known = t("star_known", torch.bool)
         self.owner = t("star_owner_seat", torch.long)

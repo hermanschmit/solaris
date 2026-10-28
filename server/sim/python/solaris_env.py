@@ -58,9 +58,12 @@ class SolarisEnv:
             raise SolarisError(reply["error"])
         return reply["result"]
 
-    def reset(self, agents, settings="standard", seed=1, ai_configs=None, max_ticks=3000, max_gap=4):
+    def reset(self, agents, settings="standard", seed=1, ai_configs=None, max_ticks=3000, max_gap=4,
+              fog=False):
         """Start a new game. `agents` lists the seats (0 to 9) you control.
-        Returns {"tick", "done", "seats"}: the seats that must decide now."""
+        With fog=True, agent seats and their executor see only what their
+        scanners show. Returns {"tick", "done", "seats"}: the seats that
+        must decide now."""
         return self._call(
             "reset",
             agents=agents,
@@ -69,16 +72,26 @@ class SolarisEnv:
             aiConfigs=ai_configs or {},
             maxTicks=max_ticks,
             maxGap=max_gap,
+            fog=fog,
         )
 
-    def observe(self, seat, view=False):
+    def header(self):
+        """The game's constant facts (stars, ranges, technologies), as
+        belief_data.Static takes them."""
+        return self._call("header")
+
+    def observe(self, seat, view=False, frame=False):
         """The seat's candidate orders, with the built-in AI's scores. With
-        view=True, also its fog-of-war galaxy view (slower)."""
-        return self._call("observe", seat=seat, view=view)
+        view=True, also its fog-of-war galaxy view (slower). With
+        frame=True (fog games only), also what it sees and remembers, which
+        belief_data.Static.features turns into belief-model inputs."""
+        return self._call("observe", seat=seat, view=view, frame=frame)
 
     def act(self, seat, decision):
         """Set the seat's decision: {"orders": {key: score}, "config": {...},
-        "research": "weapons"}. All fields are optional."""
+        "research": "weapons", "beliefs": {"ships": [...]}}. All fields are
+        optional. beliefs.ships (per star, fog games only) is what the
+        executor assumes at stars whose ships the seat cannot see."""
         return self._call("act", seat=seat, decision=decision)
 
     def step(self):

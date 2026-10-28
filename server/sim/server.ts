@@ -7,9 +7,10 @@
 // {"id": 1, "ok": true, "result": ...} or {"id": 1, "ok": false, "error":
 // "..."}. Commands:
 //
-//   reset     {agents, settings?, seed?, aiConfigs?, maxTicks?, maxGap?}
+//   reset     {agents, settings?, seed?, aiConfigs?, maxTicks?, maxGap?, fog?}
 //             -> {tick, done, seats}
-//   observe   {seat, view?}            -> Observation
+//   header    {}                       -> the game's stars, ranges, techs
+//   observe   {seat, view?, frame?}    -> Observation
 //   act       {seat, decision}         -> null
 //   step      {}                       -> {tick, done, seats}
 //   standings {}                       -> each seat's stars and ships, winner
@@ -33,7 +34,9 @@ const main = async () => {
 
     const commands: Record<string, (args: any) => any> = {
         reset: (args) => env.reset(args),
-        observe: (args) => env.observe(args.seat, { view: args.view }),
+        observe: (args) =>
+            env.observe(args.seat, { view: args.view, frame: args.frame }),
+        header: () => env.header(),
         act: (args) => {
             env.act(args.seat, args.decision ?? {});
             return null;

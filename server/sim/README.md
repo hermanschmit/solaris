@@ -129,8 +129,29 @@ seat's stars, and at least every 4 ticks (`maxGap`).
 python3 sim/python/example_agent.py 1 200   # seed 1, stop at tick 200
 ```
 
-The executor currently reads the full game state, so it knows true enemy
-ship counts when sizing an attack. A fog-of-war executor is future work.
+By default the executor reads the full game state, as the built-in AI
+does. Reset with `fog: true` and agent seats play under fog of war instead
+(`fog.ts`). Each seat remembers what it has seen, tick by tick, and while
+its executor runs, and while it proposes orders, the game shows only that:
+
+- carriers out of scanning range are hidden, and visible enemy carriers
+  show only their next waypoint;
+- stars whose ships the seat cannot see show believed ships and the
+  infrastructure last seen there.
+
+Believed ships come from the agent (`beliefs.ships` in its decision, one
+per star), or else are the last ships the seat saw there. Everything is put
+back before the tick goes on, so the game itself is unchanged.
+
+`observe(seat, { frame: true })` returns what the seat sees and remembers,
+and `header()` the game's constant facts. `belief_data.Static.features`
+turns these into belief-model inputs with the same code that builds the
+training data. `python/belief_agent.py` runs a trained belief model this
+way and passes its estimates to the executor:
+
+```sh
+python3 sim/python/belief_agent.py belief_model.pt belief 1 9   # or memory, omniscient
+```
 
 ## Belief-model training data
 
