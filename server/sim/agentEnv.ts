@@ -19,6 +19,8 @@ import { Game } from "../services/types/Game";
 import { Player } from "../services/types/Player";
 import { AiConfig } from "../services/types/Ai";
 import { AiOrderCandidate } from "../services/ai";
+import { SeatMemory, seatFrame, applyFog } from "./fog";
+import { BeliefRecorder } from "./beliefData";
 
 export interface AgentDecision {
     // Score per order key; orders left out are dropped. Omit to keep the
@@ -28,6 +30,10 @@ export interface AgentDecision {
     config?: Partial<AiConfig>;
     // Technology to research now and next.
     research?: string;
+    // Under fog: what the agent believes, for the executor to act on. ships
+    // gives believed ships per star index, used where the seat cannot see
+    // a star's ships. Stars left out (or null) show the last ships seen.
+    beliefs?: { ships?: (number | null)[] };
 }
 
 export interface ResetOptions {
@@ -39,6 +45,10 @@ export interface ResetOptions {
     aiConfigs?: Record<number, Partial<AiConfig>>;
     maxTicks?: number;
     maxGap?: number;
+    // Agent seats see only what their scanners show: their observations
+    // and their executor (the built-in AI acting on their orders) both
+    // work from the seat's view and memory instead of the whole game.
+    fog?: boolean;
 }
 
 export interface Observation {
@@ -52,6 +62,9 @@ export interface Observation {
     // The seat's fog-of-war view, as GET /api/game/:gameId/galaxy returns
     // it. Only when asked for, since it is slower to build.
     view?: any;
+    // Under fog, when asked for: what the seat sees and remembers, in the
+    // form sim/python/belief_data.py builds belief-model features from.
+    frame?: any;
 }
 
 export interface StepResult {
@@ -67,6 +80,7 @@ interface Seat {
     decision: AgentDecision;
     lastDecisionTick: number;
     defendKeys: string;
+    memory: SeatMemory | null;
 }
 
 export class AgentEnv {
@@ -75,6 +89,8 @@ export class AgentEnv {
     seats = new Map<number, Seat>();
     maxTicks = 3000;
     maxGap = 4;
+    fog = false;
+    technologies: string[] = [];
 
     constructor() {
         const ai = this.engine.container.aiService;
@@ -93,7 +109,13 @@ export class AgentEnv {
                 if (seat.player.defeated) continue;
 
                 seat.player.lastSeen = new Date();
-                await ai.playForAgent(eventService, game, seat.player);
+
+                const restore = this._fog(seat, true);
+                try {
+                    await ai.playForAgent(eventService, game, seat.player);
+                } finally {
+                    restore();
+                }
             }
         };
 
@@ -116,6 +138,7 @@ export class AgentEnv {
         const seed = options.seed ?? 1;
         this.maxTicks = options.maxTicks ?? 3000;
         this.maxGap = options.maxGap ?? 4;
+        this.fog = options.fog ?? false;
         this.engine.aiConfigs.clear();
         this.seats.clear();
 
@@ -145,10 +168,77 @@ export class AgentEnv {
                 decision: {},
                 lastDecisionTick: 0,
                 defendKeys: "",
+                memory: this.fog
+                    ? new SeatMemory(this.game.galaxy.stars.length)
+                    : null,
             });
         }
 
+        this.technologies = new BeliefRecorder(
+            this.engine,
+            this.game,
+        ).technologies;
+        this._updateMemories();
+
         return this._result([...this.seats.keys()]);
+    }
+
+    _updateMemories() {
+        for (const seat of this.seats.values()) {
+            if (seat.memory && !seat.player.defeated) {
+                seat.memory.update(this.engine, this.game, seat.player);
+            }
+        }
+    }
+
+    // Under fog, make the game show only what the seat knows; returns the
+    // function that puts it back. refresh first rescans, for use mid-tick.
+    _fog(seat: Seat, refresh = false): () => void {
+        if (!seat.memory) return () => {};
+        if (refresh) seat.memory.update(this.engine, this.game, seat.player);
+
+        const ships = seat.decision.beliefs?.ships;
+        return applyFog(
+            this.game,
+            seat.player,
+            seat.memory,
+            (i) => ships?.[i] ?? undefined,
+        );
+    }
+
+    _proposeOrders(seat: Seat): AiOrderCandidate[] {
+        const restore = this._fog(seat);
+        try {
+            return this.engine.container.aiService.proposeOrders(
+                this.game,
+                seat.player,
+            );
+        } finally {
+            restore();
+        }
+    }
+
+    // The game's constant facts (star positions, ranges, technologies), as
+    // sim/python/belief_data.py's Static takes them.
+    header() {
+        const {
+            stars,
+            players,
+            productionTicks,
+            carrierSpeed,
+            technologies,
+            hyperspaceRange,
+            scanningRange,
+        } = new BeliefRecorder(this.engine, this.game).header;
+        return {
+            stars,
+            players,
+            productionTicks,
+            carrierSpeed,
+            technologies,
+            hyperspaceRange,
+            scanningRange,
+        };
     }
 
     _isDone() {
@@ -162,7 +252,10 @@ export class AgentEnv {
         return { tick: this.game.state.tick, done: this._isDone(), seats };
     }
 
-    async observe(index: number, options: { view?: boolean } = {}) {
+    async observe(
+        index: number,
+        options: { view?: boolean; frame?: boolean } = {},
+    ) {
         const seat = this._seat(index);
         const ticks = this.game.settings.galaxy.productionTicks;
         const tick = this.game.state.tick;
@@ -173,11 +266,19 @@ export class AgentEnv {
             cycle: Math.floor(tick / ticks),
             ticksToProduction: ticks - (tick % ticks),
             defeated: seat.player.defeated,
-            candidates: this.engine.container.aiService.proposeOrders(
-                this.game,
-                seat.player,
-            ),
+            candidates: this._proposeOrders(seat),
         };
+
+        if (options.frame) {
+            if (!seat.memory) {
+                throw new Error("Frames need a game reset with fog on.");
+            }
+            observation.frame = seatFrame(
+                this.game,
+                seat.memory,
+                this.technologies,
+            );
+        }
 
         if (options.view) {
             observation.view = await this.engine.viewAs(
@@ -217,6 +318,7 @@ export class AgentEnv {
     async step(): Promise<StepResult> {
         while (!this._isDone()) {
             await this.engine.tick(this.game, 1);
+            this._updateMemories();
 
             const deciding = [...this.seats.values()].filter(
                 (s) => !s.player.defeated && this._needsDecision(s),
@@ -234,8 +336,7 @@ export class AgentEnv {
         const tick = this.game.state.tick;
         const cycleStart =
             tick % this.game.settings.galaxy.productionTicks === 1;
-        const defendKeys = this.engine.container.aiService
-            .proposeOrders(this.game, seat.player)
+        const defendKeys = this._proposeOrders(seat)
             .filter((o) => o.kind === "defend")
             .map((o) => o.key)
             .sort()
