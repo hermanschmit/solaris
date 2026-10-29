@@ -13,6 +13,7 @@
 // The decision stays in force until the next one. An order that first
 // appears during a tick is only acted on once the agent has scored it, so
 // the agent reacts to it one tick later than the built-in AI would.
+import fs from "fs";
 import mongoose from "mongoose";
 import { SimEngine } from "./engine";
 import { Game } from "../services/types/Game";
@@ -53,6 +54,11 @@ export interface ResetOptions {
     // and their executor (the built-in AI acting on their orders) both
     // work from the seat's view and memory instead of the whole game.
     fog?: boolean;
+    // Record the game for belief-model training (see beliefData.ts) and
+    // save it to this file when the game ends.
+    record?: string;
+    // Stored in the recording's header.
+    recordInfo?: Record<string, any>;
 }
 
 export interface Observation {
@@ -98,6 +104,8 @@ export class AgentEnv {
     maxTicks = 3000;
     maxGap = 4;
     fog = false;
+    recorder: BeliefRecorder | null = null;
+    recordFile: string | null = null;
     technologies: string[] = [];
 
     constructor() {
@@ -185,10 +193,16 @@ export class AgentEnv {
             });
         }
 
-        this.technologies = new BeliefRecorder(
-            this.engine,
-            this.game,
-        ).technologies;
+        const recorder = new BeliefRecorder(this.engine, this.game, {
+            settings: options.settings ?? "standard",
+            seed,
+            agents: options.agents,
+            ...options.recordInfo,
+        });
+        this.technologies = recorder.technologies;
+        this.recorder = options.record ? recorder : null;
+        this.recordFile = options.record ?? null;
+        this.recorder?.capture(this.game);
         this._updateMemories();
 
         return this._result([...this.seats.keys()]);
@@ -346,6 +360,7 @@ export class AgentEnv {
     async step(): Promise<StepResult> {
         while (!this._isDone()) {
             await this.engine.tick(this.game, 1);
+            this.recorder?.capture(this.game);
             this._updateMemories();
 
             const deciding = [...this.seats.values()].filter(
@@ -353,11 +368,22 @@ export class AgentEnv {
             );
 
             if (deciding.length) {
+                this._saveRecording();
                 return this._result(deciding.map((s) => s.index));
             }
         }
 
+        this._saveRecording();
         return this._result([]);
+    }
+
+    // Once the game is over, save its recording, if it is being recorded.
+    _saveRecording() {
+        if (!this.recorder || !this._isDone()) return;
+
+        this.recorder.save(this.recordFile + ".tmp");
+        fs.renameSync(this.recordFile + ".tmp", this.recordFile!);
+        this.recorder = null;
     }
 
     _needsDecision(seat: Seat): boolean {

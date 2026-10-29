@@ -249,6 +249,40 @@ describe("sim engine", () => {
             }
         });
 
+        it("records the game for belief training when asked", async () => {
+            const file = path.join(
+                fs.mkdtempSync(path.join(os.tmpdir(), "sim-")),
+                "g4.sbd",
+            );
+            const env = new AgentEnv();
+            let result = await env.reset({
+                seed: 4,
+                agents: [9],
+                maxTicks: 30,
+                fog: true,
+                record: file,
+                recordInfo: { league: true },
+            });
+            while (!result.done) {
+                expect(fs.existsSync(file)).toBe(false);
+                for (const seat of result.seats) env.act(seat, {});
+                result = await env.step();
+            }
+
+            const data = zlib.gunzipSync(fs.readFileSync(file));
+            expect(data.subarray(0, 4).toString()).toBe("SBD1");
+            const length = data.readUInt32LE(4);
+            const header = JSON.parse(
+                data
+                    .subarray(8, 8 + length)
+                    .toString()
+                    .trim(),
+            );
+            expect(header.seed).toBe(4);
+            expect(header.agents).toEqual([9]);
+            expect(header.league).toBe(true);
+        });
+
         it("acts only on the orders the agent scores", async () => {
             const env = new AgentEnv();
             const result = await env.reset({ seed: 4, agents: [9] });

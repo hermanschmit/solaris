@@ -250,6 +250,48 @@ seats in training games, losses, how far the policy moved) and
 worse). Run it again with the same directory to continue. Set
 `PPO_MAX_TICKS` to cut games short when trying it out.
 
+### The league
+
+`python/league_train.py` continues training a commander in a league. Each
+game seats the learner in 3 seats, league members (frozen commanders) in 4
+and the built-in AI in the other 3. The league starts with the commander
+you give it, and the learner joins it as a new member every 10 iterations.
+Members the learner places below more often are picked more often.
+
+```sh
+# 50 iterations of 52 games on 13 workers, starting from a PPO checkpoint,
+# evaluating on 100 seeds against the built-in AI
+python3 sim/python/league_train.py data/league1 data/ppo1/ckpt_75.pt 50 52 13 100
+```
+
+`league.json` lists the members and, for each, how often the learner has
+recently placed above it (`rate`); `log.jsonl` has the same per iteration
+under `placed_above`. Evaluation against the built-in AI is as in
+`ppo_train.py`.
+
+One game in 4 is also recorded in `data/league1/belief/`, in the format
+`beliefBatch.ts` writes, so the belief model can be retrained on games
+where commanders play, not only the built-in AI:
+
+```sh
+python3 sim/python/belief_data.py data/league1/belief league_belief.npz
+python3 sim/python/belief_train.py league_belief.npz 20 belief_league.pt
+```
+
+To mix in the original all-AI games, put both sets of `.sbd` files in one
+directory first. A retrained belief model starts new commanders
+(`ppo_train.py`'s belief argument); a trained commander keeps its own copy.
+
+Two more tools:
+
+```sh
+# Average checkpoints trained from the same start ("model soup")
+python3 sim/python/average_commanders.py avg.pt data/ppo1/ckpt_60.pt data/ppo1/ckpt_75.pt
+
+# Evaluate any checkpoint against the built-in AI (reusing a run's baseline)
+python3 sim/python/commander_eval.py avg.pt 100 13 data/ppo1/eval_baseline.json
+```
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set

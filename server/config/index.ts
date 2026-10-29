@@ -7,7 +7,7 @@ const envFiles = process.env.ENV_FILE
     ? [process.env.ENV_FILE, ".env"]
     : [".env"];
 
-dotenv.config({ path: envFiles });
+dotenv.config({ path: envFiles, quiet: true });
 
 const nonOptional = (name: string, allowEmpty: boolean = false) => {
     const value = process.env[name];
