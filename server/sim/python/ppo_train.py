@@ -51,6 +51,8 @@ VALUE_COEF = 0.5
 ENTROPY_COEF = 1e-3
 MAX_GRAD = 0.5
 TARGET_KL = 0.03  # stop an iteration's epochs early past this
+MAX_LOG_RATIO = 20.0  # a decision's log-probability is a sum over many orders, so can move far
+DUAL_CLIP = 3.0  # bounds the loss of a bad action the policy now likes much more
 SEATS = 3
 EVAL_EVERY = 5
 EVAL_FIRST_SEED = 1  # evaluation seeds; training seeds start far above
@@ -243,8 +245,14 @@ def update(model, opt, steps, device):
 
             out = model(policy)
             logp, ent = model.log_prob(out, policy, act)
-            ratio = torch.exp(logp - old_logp)
-            pg = -torch.min(ratio * a, ratio.clamp(1 - CLIP, 1 + CLIP) * a).mean()
+            log_ratio = (logp - old_logp).clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO)
+            ratio = torch.exp(log_ratio)
+            objective = torch.min(ratio * a, ratio.clamp(1 - CLIP, 1 + CLIP) * a)
+            # Dual-clip PPO: otherwise, for an action with negative advantage
+            # whose probability has grown many times (as an older game's can
+            # have), the loss grows without bound.
+            objective = torch.where(a < 0, torch.max(objective, DUAL_CLIP * a), objective)
+            pg = -objective.mean()
             value_loss = ((model.value(truth) - r) ** 2).mean()
             loss = pg + VALUE_COEF * value_loss - ENTROPY_COEF * ent.mean()
 
@@ -254,7 +262,7 @@ def update(model, opt, steps, device):
             opt.step()
 
             with torch.no_grad():
-                kl = ((ratio - 1) - torch.log(ratio)).mean().item()
+                kl = ((ratio - 1) - log_ratio).mean().item()
                 clipped = ((ratio - 1).abs() > CLIP).float().mean().item()
             kls.append(kl)
             for k, x in (("policy_loss", pg.item()), ("value_loss", value_loss.item()),
