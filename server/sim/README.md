@@ -243,6 +243,12 @@ seats, where the built-in AI sees the whole game.
 python3 sim/python/ppo_train.py data/ppo1 20 52 13 belief_model.pt 26
 ```
 
+Workers never wait for each other: every worker keeps playing, and each
+iteration learns from the first games to finish. Games still playing count
+towards the next iteration, though they were played with the previous
+checkpoint; `lag` in `log.jsonl` is how many iterations old the games were,
+on average.
+
 `log.jsonl` has a line per iteration (mean placement of the commander's
 seats in training games, losses, how far the policy moved) and
 `eval.jsonl` a line per evaluation (`placement` against

@@ -77,22 +77,25 @@ def pick_weights(league):
     return w / w.sum()
 
 
-def game_jobs(run_dir, i, games, league, out):
-    """Who sits where in each of an iteration's games."""
-    rng = np.random.default_rng(i)
-    weights = pick_weights(league)
-    jobs = []
-    for seed in range(FIRST_SEED + i * games, FIRST_SEED + (i + 1) * games):
+def game_maker(run_dir, league):
+    """Who sits where in the k-th game started in iteration i, by the
+    league as it is when the game starts."""
+    def make_job(i, k):
+        seed = pt.train_seed(FIRST_SEED, i, k)
+        rng = np.random.default_rng(seed)
         seats = rng.permutation(10)
         learner = sorted(int(s) for s in seats[:LEARNER_SEATS])
-        members = rng.choice(len(league["members"]), OPPONENT_SEATS, p=weights)
+        members = rng.choice(len(league["members"]), OPPONENT_SEATS, p=pick_weights(league))
         opponents = {int(s): int(m) for s, m in
                      zip(seats[LEARNER_SEATS:LEARNER_SEATS + OPPONENT_SEATS], members)}
+        out = Path(run_dir) / f"iter_{i}"
+        out.mkdir(parents=True, exist_ok=True)
+        (Path(run_dir) / "belief").mkdir(exist_ok=True)
         record = (str(Path(run_dir) / "belief" / f"g{seed}.sbd")
                   if seed % RECORD_EVERY == 0 else None)
-        jobs.append((str(out), seed, str(pt.ckpt_path(run_dir, i)), learner, opponents,
-                     [m["path"] for m in league["members"]], record))
-    return jobs
+        return (str(out), seed, str(pt.ckpt_path(run_dir, i)), learner, opponents,
+                [m["path"] for m in league["members"]], record)
+    return make_job
 
 
 def _game_job(args):
@@ -102,23 +105,12 @@ def _game_job(args):
         arrays = cr.play(seed, belief=None, checkpoint=checkpoint, max_ticks=pt.MAX_TICKS,
                          agents=learner, opponents={s: paths[m] for s, m in opponents.items()},
                          record=record)
+        # Which league member sat where, for scoring the learner against it.
+        arrays["opponent_seats"] = np.array(list(opponents), int)
+        arrays["opponent_members"] = np.array(list(opponents.values()), int)
         np.savez_compressed(str(path) + ".tmp.npz", **arrays)
         os.replace(str(path) + ".tmp.npz", path)
-    return seed, opponents
-
-
-def collect(run_dir, i, games, workers, league):
-    out = Path(run_dir) / f"iter_{i}"
-    out.mkdir(parents=True, exist_ok=True)
-    (Path(run_dir) / "belief").mkdir(exist_ok=True)
-    jobs = game_jobs(run_dir, i, games, league, out)
-    seating = {}
-    with Pool(workers) as pool:
-        for n, (seed, opponents) in enumerate(pool.imap_unordered(_game_job, jobs), 1):
-            seating[seed] = opponents
-            print(f"  played {n}/{games}", end="\r", flush=True)
-    print()
-    return [(out / f"r{seed}.npz", seating[seed]) for seed in sorted(seating)]
+    return path
 
 
 def score(league, games):
@@ -126,12 +118,14 @@ def score(league, games):
     pairing of a learner seat with a member seat, 1 if the learner placed
     above, 0 if below."""
     results = {}
-    for path, opponents in games:
+    for path in games:
         z = np.load(path)
+        if "opponent_seats" not in z.files:  # recorded before seating was kept
+            continue
         place = z["place_all"]
         for s in z["agents"]:
-            for o, m in opponents.items():
-                results.setdefault(m, []).append(float(place[s] < place[o]))
+            for o, m in zip(z["opponent_seats"], z["opponent_members"]):
+                results.setdefault(int(m), []).append(float(place[s] < place[o]))
     for m, r in results.items():
         member = league["members"][m]
         member["rate"] = RATE_DECAY * member["rate"] + (1 - RATE_DECAY) * float(np.mean(r))
@@ -174,31 +168,36 @@ def main():
         print("  " + ", ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}"
                                for k, v in record.items()), flush=True)
 
-    for i in range(start, start + iterations):
-        if eval_games and i % pt.EVAL_EVERY == 0:
-            print(f"evaluating ckpt_{i} against the built-in AI", flush=True)
-            log("eval.jsonl", pt.evaluate(run_dir, i, eval_games, workers))
+    with Pool(workers) as pool:
+        collector = pt.Collector(pool, workers, _game_job, game_maker(run_dir, league))
+        for i in range(start, start + iterations):
+            if eval_games and i % pt.EVAL_EVERY == 0:
+                print(f"evaluating ckpt_{i} against the built-in AI", flush=True)
+                log("eval.jsonl", pt.evaluate(run_dir, i, eval_games, workers, pool))
 
-        t0 = time.time()
-        print(f"iteration {i}: playing {games} league games", flush=True)
-        played = collect(run_dir, i, games, workers, league)
-        against = score(league, played)
-        steps = pt.Steps([p for p, _ in played])
-        t1 = time.time()
-        model.eval()  # no dropout: the recorded log-probabilities must match
-        stats = pt.update(model, opt, steps, device)
-        torch.save({"model": model.state_dict(), "n_techs": techs,
-                    "optimizer": opt.state_dict()}, pt.ckpt_path(run_dir, i + 1))
-        if (i + 1) % SNAPSHOT_EVERY == 0:
-            add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
-        save_league(run_dir, league)
-        log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
-                          "placed_above": against, **stats,
-                          "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
+            t0 = time.time()
+            print(f"iteration {i}: playing {games} league games", flush=True)
+            collector.start(i)
+            played = collector.take(games)
+            paths = [path for _, path in played]
+            against = score(league, paths)
+            steps = pt.Steps(paths)
+            t1 = time.time()
+            model.eval()  # no dropout: the recorded log-probabilities must match
+            stats = pt.update(model, opt, steps, device)
+            torch.save({"model": model.state_dict(), "n_techs": techs,
+                        "optimizer": opt.state_dict()}, pt.ckpt_path(run_dir, i + 1))
+            if (i + 1) % SNAPSHOT_EVERY == 0:
+                add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
+            save_league(run_dir, league)
+            log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
+                              "placed_above": against,
+                              "lag": float(np.mean([i - j for j, _ in played])), **stats,
+                              "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
 
-    if eval_games:
-        print(f"evaluating ckpt_{start + iterations} against the built-in AI", flush=True)
-        log("eval.jsonl", pt.evaluate(run_dir, start + iterations, eval_games, workers))
+        if eval_games:
+            print(f"evaluating ckpt_{start + iterations} against the built-in AI", flush=True)
+            log("eval.jsonl", pt.evaluate(run_dir, start + iterations, eval_games, workers, pool))
 
 
 if __name__ == "__main__":
