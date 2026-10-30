@@ -213,9 +213,15 @@ belief model's star encoding, it decides a weight for each candidate order
 (`orderWeights`, which multiply the built-in AI's own scores as the
 executor computes them), the seat's tuning (spending split, invasion margin,
 logistics stockpile) and, at the start of each cycle, whether to switch
-research. Every head starts at zero, so an untrained commander plays
-exactly like the built-in AI: weights of 1, default tuning, research left
-alone. A separate critic reads a truth frame (`observe(seat, { truthFrame:
+research. At the start of each cycle it also picks a spending plan
+(balanced, economy, industry, science, or saving for carriers), holds its
+tuning for the cycle, and may hire a star specialist with its specialist
+tokens (`hire` in a decision), which the built-in AI never spends. Every
+head starts at zero, so an untrained commander plays exactly like the
+built-in AI: weights of 1, default tuning and plan, no specialists,
+research left alone. Older checkpoints load with the newer heads at their
+start, so they too play as they did; continue training one in a new run
+directory, since its old games lack the newer actions. A separate critic reads a truth frame (`observe(seat, { truthFrame:
 true })`), which the policy never sees.
 
 `python/commander_rollout.py` plays games with the commander in a few seats

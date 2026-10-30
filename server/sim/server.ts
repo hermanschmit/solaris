@@ -42,8 +42,8 @@ const main = async () => {
                 truthFrame: args.truthFrame,
             }),
         header: () => env.header(),
-        act: (args) => {
-            env.act(args.seat, args.decision ?? {});
+        act: async (args) => {
+            await env.act(args.seat, args.decision ?? {});
             return null;
         },
         step: () => env.step(),

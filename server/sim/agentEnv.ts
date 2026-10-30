@@ -14,6 +14,7 @@
 // appears during a tick is only acted on once the agent has scored it, so
 // the agent reacts to it one tick later than the built-in AI would.
 import fs from "fs";
+import { Specialist, ValidationError } from "@solaris/common";
 import mongoose from "mongoose";
 import { SimEngine } from "./engine";
 import { Game } from "../services/types/Game";
@@ -31,10 +32,16 @@ export interface AgentDecision {
     // the executor computes it when it acts. Orders left out keep their
     // score, so all weights of 1 play exactly like the built-in AI.
     orderWeights?: Record<string, number>;
-    // Built-in AI tuning for this seat. Fields left out keep their defaults.
+    // Built-in AI tuning for this seat. Fields left out keep their
+    // defaults. Without config, the seat keeps its current tuning.
     config?: Partial<AiConfig>;
     // Technology to research now and next.
     research?: string;
+    // Star specialists to hire now, with specialist tokens (or credits,
+    // as the game's settings say): specialist id at a star index the seat
+    // owns. A hire the game refuses (unaffordable, or not allowed there) is
+    // skipped.
+    hire?: { star: number; specialist: number }[];
     // Under fog: what the agent believes, for the executor to act on. ships
     // gives believed ships per star index, used where the seat cannot see
     // a star's ships. Stars left out (or null) show the last ships seen.
@@ -79,6 +86,10 @@ export interface Observation {
     // When asked for: the same, as if the seat saw the whole galaxy. For
     // a privileged critic in training, never for the policy.
     truthFrame?: any;
+    // What the seat can spend on specialists, and the star specialists it
+    // can afford now (ids, among the header's starSpecialists).
+    specialistBudget: number;
+    affordableStarSpecialists: number[];
 }
 
 export interface StepResult {
@@ -93,6 +104,9 @@ interface Seat {
     player: Player;
     decision: AgentDecision;
     lastDecisionTick: number;
+    // Specialists hired, and hires the game refused.
+    hired: number;
+    hiresRefused: number;
     defendKeys: string;
     memory: SeatMemory;
 }
@@ -188,6 +202,8 @@ export class AgentEnv {
                 player,
                 decision: {},
                 lastDecisionTick: 0,
+                hired: 0,
+                hiresRefused: 0,
                 defendKeys: "",
                 memory: new SeatMemory(this.game.galaxy.stars.length),
             });
@@ -263,7 +279,43 @@ export class AgentEnv {
             technologies,
             hyperspaceRange,
             scanningRange,
+            starSpecialists: this._starSpecialists().map((s) => ({
+                id: s.id,
+                name: s.name,
+            })),
         };
+    }
+
+    // Star specialists that can be hired in this game, by id.
+    _starSpecialists() {
+        const { specialistService, specialistBanService } =
+            this.engine.container;
+        if (this.game.settings.specialGalaxy.specialistCost === "none") {
+            return [];
+        }
+        return specialistService
+            .listStar(this.game)
+            .filter(
+                (s) =>
+                    !specialistBanService.isStarSpecialistBanned(
+                        this.game,
+                        s.id,
+                    ),
+            )
+            .sort((a, b) => a.id - b.id);
+    }
+
+    _specialistCost(specialist: Specialist) {
+        const currency = this.game.settings.specialGalaxy.specialistsCurrency;
+        return this.engine.container.specialistService.getSpecialistActualCost(
+            this.game,
+            specialist,
+        )[currency];
+    }
+
+    _specialistBudget(player: Player) {
+        const currency = this.game.settings.specialGalaxy.specialistsCurrency;
+        return (player as any)[currency] ?? 0;
     }
 
     _isDone() {
@@ -297,6 +349,14 @@ export class AgentEnv {
                     (s) => s._id.toString() === c.star,
                 ),
             })),
+            specialistBudget: this._specialistBudget(seat.player),
+            affordableStarSpecialists: this._starSpecialists()
+                .filter(
+                    (s) =>
+                        this._specialistCost(s) <=
+                        this._specialistBudget(seat.player),
+                )
+                .map((s) => s.id),
         };
 
         if (options.frame) {
@@ -332,16 +392,36 @@ export class AgentEnv {
         return observation;
     }
 
-    act(index: number, decision: AgentDecision) {
+    async act(index: number, decision: AgentDecision) {
         const seat = this._seat(index);
         seat.decision = decision;
         seat.lastDecisionTick = this.game.state.tick;
 
-        this.engine.setAiConfig(
-            this.game,
-            seat.player._id,
-            decision.config ?? {},
-        );
+        if (decision.config) {
+            this.engine.setAiConfig(
+                this.game,
+                seat.player._id,
+                decision.config,
+            );
+        }
+
+        for (const { star, specialist } of decision.hire ?? []) {
+            const target = this.game.galaxy.stars[star];
+            if (!target) continue;
+            try {
+                await this.engine.container.specialistHireService.hireStarSpecialist(
+                    this.game,
+                    seat.player,
+                    target._id,
+                    specialist,
+                    this.engine.container.statisticsService,
+                );
+                seat.hired += 1;
+            } catch (e: any) {
+                if (!(e instanceof ValidationError)) throw e;
+                seat.hiresRefused += 1;
+            }
+        }
 
         if (decision.research) {
             const tech = decision.research as any;
@@ -441,6 +521,8 @@ export class AgentEnv {
                     seat: index,
                     alias: p.alias,
                     agent: this.seats.has(index),
+                    hired: this.seats.get(index)?.hired ?? 0,
+                    hiresRefused: this.seats.get(index)?.hiresRefused ?? 0,
                     stars: stars.length,
                     ships:
                         stars.reduce((a, s) => a + (s.ships ?? 0), 0) +
