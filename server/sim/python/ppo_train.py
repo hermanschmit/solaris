@@ -28,6 +28,7 @@ and all heads, and, more slowly, in the star encoding.
 
 import json
 import os
+import queue
 import sys
 import time
 from multiprocessing import Pool
@@ -79,17 +80,70 @@ def n_techs():
         return len(bd.Static(env.header()).techs)
 
 
-def collect(run_dir, i, games, workers):
-    out = Path(run_dir) / f"iter_{i}"
-    out.mkdir(parents=True, exist_ok=True)
-    first = TRAIN_FIRST_SEED + i * games
-    jobs = [(str(out), s, SEATS, None, str(ckpt_path(run_dir, i)), MAX_TICKS)
-            for s in range(first, first + games)]
-    with Pool(workers) as pool:
-        for n, _ in enumerate(pool.imap_unordered(cr._job, jobs), 1):
-            print(f"  played {n}/{games}", end="\r", flush=True)
-    print()
-    return sorted(out.glob("r*.npz"))
+def train_seed(first, i, k):
+    """The seed of the k-th game started while training iteration i."""
+    return first + i * 1000 + k
+
+
+class Collector:
+    """Keeps every worker playing training games, so none waits for the
+    slowest game of an iteration. An iteration learns from the first games
+    to finish; games still playing then count towards the next one, though
+    they were played with an earlier checkpoint (their recorded
+    log-probabilities keep PPO correct). make_job(i, k) gives the arguments
+    for job, the k-th game started in iteration i, and job returns the
+    path of the game's record (and anything else, as a tuple)."""
+
+    def __init__(self, pool, workers, job, make_job):
+        self.pool, self.workers = pool, workers
+        self.job, self.make_job = job, make_job
+        self.finished = queue.Queue()
+        self.playing = 0
+        self.iteration, self.started = None, 0
+
+    def _start_one(self):
+        i, k = self.iteration, self.started
+        self.started += 1
+        self.playing += 1
+        self.pool.apply_async(self.job, (self.make_job(i, k),),
+                              callback=lambda r: self.finished.put((i, r)),
+                              error_callback=lambda e: self.finished.put((i, e)))
+
+    def start(self, i):
+        """New games from now on use iteration i's checkpoint."""
+        if i != self.iteration:
+            self.iteration, self.started = i, 0
+        while self.playing < self.workers:
+            self._start_one()
+
+    def take(self, n):
+        """The next n games to finish, as (iteration started, result)."""
+        out = []
+        while len(out) < n:
+            i, result = self.finished.get()
+            self.playing -= 1
+            if isinstance(result, BaseException):
+                raise result
+            out.append((i, result))
+            self._start_one()
+            print(f"  played {len(out)}/{n}", end="\r", flush=True)
+        print()
+        return out
+
+
+def _train_job(args):
+    out, seed = args[0], args[1]
+    cr._job(args)
+    return Path(out) / f"r{seed}.npz"
+
+
+def train_jobs(run_dir):
+    def make_job(i, k):
+        out = Path(run_dir) / f"iter_{i}"
+        out.mkdir(parents=True, exist_ok=True)
+        return (str(out), train_seed(TRAIN_FIRST_SEED, i, k), SEATS, None,
+                str(ckpt_path(run_dir, i)), MAX_TICKS)
+    return make_job
 
 
 class Steps:
@@ -221,27 +275,34 @@ def _eval_job(args):
     return seed, checkpoint, cr.play_eval(seed, SEATS, checkpoint, MAX_TICKS)
 
 
-def evaluate(run_dir, i, games, workers):
+def evaluate(run_dir, i, games, workers, pool=None):
     return {"iteration": i, **evaluate_checkpoint(
-        ckpt_path(run_dir, i), Path(run_dir) / "eval_baseline.json", games, workers)}
+        ckpt_path(run_dir, i), Path(run_dir) / "eval_baseline.json", games, workers, pool)}
 
 
-def evaluate_checkpoint(checkpoint, base_path, games, workers):
+def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None):
     """Placements of the commander's seats over the evaluation seeds,
     against the built-in AI (seeing everything) in the same seats. The
-    built-in AI's games are kept in base_path, to be played only once."""
+    built-in AI's games are kept in base_path, to be played only once.
+    With a pool, its workers play them, once they finish the games they
+    are playing."""
     seeds = list(range(EVAL_FIRST_SEED, EVAL_FIRST_SEED + games))
     base_path = Path(base_path)
     base = json.loads(base_path.read_text()) if base_path.exists() else {}
     jobs = [(s, str(checkpoint)) for s in seeds]
     jobs += [(s, None) for s in seeds if str(s) not in base]
     ours = {}
-    with Pool(workers) as pool:
+    own_pool = pool is None
+    pool = pool or Pool(workers)
+    try:
         for seed, checkpoint, places in pool.imap_unordered(_eval_job, jobs):
             if checkpoint:
                 ours[seed] = list(places.values())
             else:
                 base[str(seed)] = list(places.values())
+    finally:
+        if own_pool:
+            pool.terminate()
     base_path.write_text(json.dumps(base))
 
     pairs = [(a, b) for s in seeds for a, b in zip(ours[s], base[str(s)])]
@@ -283,25 +344,30 @@ def main():
         print("  " + ", ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}"
                                for k, v in record.items()), flush=True)
 
-    for i in range(start, start + iterations):
-        if eval_games and i % EVAL_EVERY == 0:
-            print(f"evaluating ckpt_{i}", flush=True)
-            log("eval.jsonl", evaluate(run_dir, i, eval_games, workers))
+    with Pool(workers) as pool:
+        collector = Collector(pool, workers, _train_job, train_jobs(run_dir))
+        for i in range(start, start + iterations):
+            if eval_games and i % EVAL_EVERY == 0:
+                print(f"evaluating ckpt_{i}", flush=True)
+                log("eval.jsonl", evaluate(run_dir, i, eval_games, workers, pool))
 
-        t0 = time.time()
-        print(f"iteration {i}: playing {games} games", flush=True)
-        steps = Steps(collect(run_dir, i, games, workers))
-        t1 = time.time()
-        model.eval()  # no dropout: the recorded log-probabilities must match
-        stats = update(model, opt, steps, device)
-        torch.save({"model": model.state_dict(), "n_techs": techs,
-                    "optimizer": opt.state_dict()}, ckpt_path(run_dir, i + 1))
-        log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
-                          **stats, "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
+            t0 = time.time()
+            print(f"iteration {i}: playing {games} games", flush=True)
+            collector.start(i)
+            played = collector.take(games)
+            steps = Steps([path for _, path in played])
+            t1 = time.time()
+            model.eval()  # no dropout: the recorded log-probabilities must match
+            stats = update(model, opt, steps, device)
+            torch.save({"model": model.state_dict(), "n_techs": techs,
+                        "optimizer": opt.state_dict()}, ckpt_path(run_dir, i + 1))
+            log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
+                              "lag": float(np.mean([i - j for j, _ in played])), **stats,
+                              "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
 
-    if eval_games:
-        print(f"evaluating ckpt_{start + iterations}", flush=True)
-        log("eval.jsonl", evaluate(run_dir, start + iterations, eval_games, workers))
+        if eval_games:
+            print(f"evaluating ckpt_{start + iterations}", flush=True)
+            log("eval.jsonl", evaluate(run_dir, start + iterations, eval_games, workers, pool))
 
 
 if __name__ == "__main__":
