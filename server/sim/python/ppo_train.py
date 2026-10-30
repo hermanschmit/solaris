@@ -222,12 +222,18 @@ def _eval_job(args):
 
 
 def evaluate(run_dir, i, games, workers):
+    return {"iteration": i, **evaluate_checkpoint(
+        ckpt_path(run_dir, i), Path(run_dir) / "eval_baseline.json", games, workers)}
+
+
+def evaluate_checkpoint(checkpoint, base_path, games, workers):
     """Placements of the commander's seats over the evaluation seeds,
-    against the built-in AI (seeing everything) in the same seats."""
+    against the built-in AI (seeing everything) in the same seats. The
+    built-in AI's games are kept in base_path, to be played only once."""
     seeds = list(range(EVAL_FIRST_SEED, EVAL_FIRST_SEED + games))
-    base_path = Path(run_dir) / "eval_baseline.json"
+    base_path = Path(base_path)
     base = json.loads(base_path.read_text()) if base_path.exists() else {}
-    jobs = [(s, str(ckpt_path(run_dir, i))) for s in seeds]
+    jobs = [(s, str(checkpoint)) for s in seeds]
     jobs += [(s, None) for s in seeds if str(s) not in base]
     ours = {}
     with Pool(workers) as pool:
@@ -240,7 +246,7 @@ def evaluate(run_dir, i, games, workers):
 
     pairs = [(a, b) for s in seeds for a, b in zip(ours[s], base[str(s)])]
     mine, theirs = [a for a, _ in pairs], [b for _, b in pairs]
-    return {"iteration": i, "games": games, "placement": float(np.mean(mine)),
+    return {"games": games, "placement": float(np.mean(mine)),
             "builtin_placement": float(np.mean(theirs)),
             "seats_better": sum(a < b for a, b in pairs),
             "seats_worse": sum(a > b for a, b in pairs),

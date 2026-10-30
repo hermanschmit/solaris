@@ -53,21 +53,38 @@ def build_model(n_techs, belief=None, checkpoint=None):
     return model
 
 
-def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000):
+def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=None,
+         opponents=None, record=None):
+    """Play a game with the commander being trained in `agents` (or
+    `seats` random seats), sampling its decisions, and record them.
+    `opponents` maps other seats to frozen commander checkpoints, which
+    play their most likely decisions under fog; the built-in AI plays the
+    rest. With `record`, the game is also saved there for belief-model
+    training."""
     torch.set_num_threads(1)
     rng = np.random.default_rng(seed)
-    with SolarisEnv() as env:
+    opponents = opponents or {}
+    if agents is None:
         agents = sorted(int(s) for s in rng.choice(10, seats, replace=False))
-        result = env.reset(agents=agents, seed=seed, max_ticks=max_ticks, fog=True)
+    with SolarisEnv() as env:
+        result = env.reset(agents=sorted(list(agents) + list(opponents)), seed=seed,
+                           max_ticks=max_ticks, fog=True, record=record)
         static = bd.Static(env.header())
         model = build_model(len(static.techs), belief, checkpoint)
         agent = cm.CommanderAgent(model, static, sample=True)
+        frozen = {path: cm.CommanderAgent(build_model(len(static.techs), None, path), static)
+                  for path in set(opponents.values())}
         torch.manual_seed(seed)
 
         steps = []
         last_cycle = {}
         while not result["done"]:
             for seat in result["seats"]:
+                if seat in opponents:
+                    obs = env.observe(seat, frame=True)
+                    env.act(seat, frozen[opponents[seat]].decide(obs, seat)[0])
+                    continue
+
                 obs = env.observe(seat, frame=True, truth_frame=True)
                 decision, rec = agent.decide(obs, seat)
                 env.act(seat, decision)
@@ -122,6 +139,7 @@ def pack(steps, place, agents, seed, standings):
     arrays["place"] = np.array([place[s] for s in agents])
     arrays["final_reward"] = np.array([placement_reward(place[s], players) for s in agents],
                                       np.float32)
+    arrays["place_all"] = np.array([place[p["seat"]] for p in standings["players"]])
     arrays["seed"] = np.array(seed)
     arrays["ticks"] = np.array(standings["tick"])
     return arrays
