@@ -6,16 +6,22 @@ seat's frame) and the orders the built-in AI is considering, and decides
 - a weight for each candidate order (defend, invade or claim a star), which
   multiplies the built-in AI's own score for it. Above 1 means "more
   urgent than the built-in AI thinks", below 1 "less";
-- the seat's tuning (CONFIG_KNOBS), such as the spending split and how big
-  a margin it wants before attacking;
-- at the start of each cycle, whether to switch research, and to what.
+and, at the start of each cycle,
+- whether to switch research, and to what;
+- a spending plan (SPENDING_PLANS): how the cycle's credits are split
+  between science, industry, economy and saving;
+- the seat's tuning (CONFIG_KNOBS), such as the split within the plan and
+  how big a margin it wants before attacking, held for the cycle;
+- whether to hire a star specialist with its specialist tokens, which, and
+  at which of its stars.
 
 The built-in executor carries the decision out.
 
 It is built so that, before any training, it plays exactly like the
 built-in AI: every head's last layer starts at zero, so order weights start
-at 1, the tuning at the defaults, and research at "keep" (the built-in AI
-picks research at random, which keeping leaves alone). Training then moves
+at 1, the tuning at the defaults, the spending plan at the built-in AI's,
+specialists at "none" and research at "keep" (the built-in AI picks
+research at random, which keeping leaves alone). Training then moves
 it away from there. Each decision can be sampled (for training, with
 log-probabilities) or taken at its most likely value (for play).
 
@@ -36,8 +42,23 @@ import belief_train as bt
 
 ORDER_KINDS = ["defend", "invade", "claim"]
 
+# Spending plans: the share of credits upgraded at the start of each cycle
+# (science, industry) and of what is left at its end (economy). The first
+# is the built-in AI's; "save" keeps credits for carriers.
+SPENDING_PLANS = [
+    ("balanced", 20, 30, 100),
+    ("economy", 10, 15, 100),
+    ("industry", 10, 55, 100),
+    ("science", 45, 20, 100),
+    ("save", 10, 20, 30),
+]
+
+# Star specialists are chosen by id; index 0 is "hire none".
+MAX_SPECIALIST_ID = 18
+
 # name, default, how the network's output moves it, scale, lowest, highest.
-# "add" adds scale * output; "mul" multiplies by exp(scale * output).
+# "add" adds scale * output; "mul" multiplies by exp(scale * output). The
+# spending split's defaults come from the spending plan.
 CONFIG_KNOBS = [
     ("firstTickSciencePercentage", 20, "add", 15.0, 0, 60),
     ("firstTickIndustryPercentage", 30, "add", 15.0, 0, 70),
@@ -45,14 +66,18 @@ CONFIG_KNOBS = [
     ("logisticStockpileCycles", 0.7, "mul", 0.3, 0.1, 3.0),
 ]
 
-KEEP_BIAS = 4.0  # "keep research" starts this far ahead of each switch
+KEEP_BIAS = 4.0  # "keep research", the built-in plan and "hire none" start this far ahead
 INITIAL_STD = 0.3
 
 
-def knob_values(outputs):
-    """AiConfig values for the network's knob outputs."""
-    config = {}
+def knob_values(outputs, plan=0):
+    """AiConfig values for the network's knob outputs, within a spending
+    plan."""
+    _, science, industry, economy = SPENDING_PLANS[plan]
+    defaults = {"firstTickSciencePercentage": science, "firstTickIndustryPercentage": industry}
+    config = {"lastTickEconomyPercentage": economy}
     for (name, default, how, scale, lo, hi), x in zip(CONFIG_KNOBS, outputs):
+        default = defaults.get(name, default)
         value = default + scale * x if how == "add" else default * math.exp(scale * x)
         value = min(max(value, lo), hi)
         config[name] = round(value) if how == "add" else value
@@ -92,8 +117,14 @@ class Commander(nn.Module):
         self.config_head = mlp(n_global, len(CONFIG_KNOBS))
         self.config_log_std = nn.Parameter(torch.full((len(CONFIG_KNOBS),), math.log(INITIAL_STD)))
         self.research_head = mlp(n_global, 1 + n_techs)
+        self.plan_head = mlp(n_global, len(SPENDING_PLANS))
+        # Which specialist (from the position and the tokens to spend), and
+        # for each, how good each star is for it.
+        self.specialist_head = mlp(n_global + 1, 1 + MAX_SPECIALIST_ID)
+        self.specialist_star_head = mlp(d, MAX_SPECIALIST_ID)
         with torch.no_grad():
-            self.research_head[-1].bias[0] = KEEP_BIAS
+            for head in (self.research_head, self.plan_head, self.specialist_head):
+                head[-1].bias[0] = KEEP_BIAS
 
         self.value_head = nn.Sequential(
             nn.Linear(n_global, 128), nn.GELU(), nn.Linear(128, 1))
@@ -132,31 +163,65 @@ class Commander(nn.Module):
         order_mu = self.order_head(cx).squeeze(-1)
         config_mu = self.config_head(g)
         research_logits = self.research_head(g)
-        return dict(order_mu=order_mu, config_mu=config_mu, research_logits=research_logits)
+        plan_logits = self.plan_head(g)
+
+        # Specialists: only those affordable now, at stars the seat owns.
+        budget = torch.log1p(b["spec_budget"]).unsqueeze(-1)
+        spec_logits = self.specialist_head(torch.cat([g, budget], -1))
+        spec_logits = spec_logits.masked_fill(~b["spec_mask"], -1e9)
+        own = b["star_x"][..., bt.SF["owner_self"]] > 0
+        star_logits = self.specialist_star_head(h)  # [B, S, specialist]
+        star_logits = star_logits.masked_fill(~own.unsqueeze(-1), -1e9)
+        return dict(order_mu=order_mu, config_mu=config_mu, research_logits=research_logits,
+                    plan_logits=plan_logits, spec_logits=spec_logits, star_logits=star_logits)
 
     def value(self, b):
         """The critic's estimate of the outcome, from the true state."""
         _, _, h = self.critic_trunk.encode(b)
         return self.value_head(self._global(h, b)).squeeze(-1)
 
+    def distributions(self, out, b, act=None):
+        """The decision's distributions. The star distribution is for the
+        specialist in act (or each decision's most likely one)."""
+        spec = torch.distributions.Categorical(logits=out["spec_logits"])
+        which = act["spec"] if act is not None else out["spec_logits"].argmax(-1)
+        idx = (which - 1).clamp(min=0)
+        star_logits = torch.gather(
+            out["star_logits"], 2,
+            idx.view(-1, 1, 1).expand(-1, out["star_logits"].shape[1], 1)).squeeze(-1)
+        return dict(
+            order=torch.distributions.Normal(out["order_mu"], self.order_log_std.exp()),
+            config=torch.distributions.Normal(out["config_mu"], self.config_log_std.exp()),
+            research=torch.distributions.Categorical(logits=out["research_logits"]),
+            plan=torch.distributions.Categorical(logits=out["plan_logits"]),
+            spec=spec,
+            spec_star=torch.distributions.Categorical(logits=star_logits),
+        )
+
     def log_prob(self, out, b, act):
-        """Log-probability of the recorded actions, and entropy, per decision."""
+        """Log-probability of the recorded actions, and entropy, per decision.
+        Research, the spending plan, tuning and specialists are decided only
+        at the start of a cycle, and count only then."""
+        d = self.distributions(out, b, act)
         mask = b["cand_mask"].float()
-        std = self.order_log_std.exp()
-        lp_orders = (torch.distributions.Normal(out["order_mu"], std)
-                     .log_prob(act["order"]) * mask).sum(-1)
-        cstd = self.config_log_std.exp()
-        lp_config = torch.distributions.Normal(out["config_mu"], cstd).log_prob(act["config"]).sum(-1)
-        research = torch.distributions.Categorical(logits=out["research_logits"])
-        lp_research = research.log_prob(act["research"]) * b["research_turn"]
-        lp = lp_orders + lp_config + lp_research
-        ent = (self.order_log_std * mask.sum(-1) + self.config_log_std.sum()
-               + research.entropy() * b["research_turn"])
+        turn = b["research_turn"]
+        hired = (act["spec"] > 0).float() * turn
+        lp = ((d["order"].log_prob(act["order"]) * mask).sum(-1)
+              + (d["config"].log_prob(act["config"]).sum(-1)
+                 + d["research"].log_prob(act["research"])
+                 + d["plan"].log_prob(act["plan"])
+                 + d["spec"].log_prob(act["spec"])) * turn
+              + d["spec_star"].log_prob(act["spec_star"]) * hired)
+        ent = (self.order_log_std * mask.sum(-1)
+               + (self.config_log_std.sum() + d["research"].entropy() + d["plan"].entropy()
+                  + d["spec"].entropy()) * turn)
         return lp, ent
 
 
-def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="cpu"):
-    """Model inputs for one decision, as a batch of one."""
+def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="cpu",
+                 affordable=(), budget=0):
+    """Model inputs for one decision, as a batch of one. affordable lists
+    the star specialists (ids) the seat can hire now, with budget tokens."""
     f = static.features(frame, seat)
     t = lambda x, dt=torch.float32: torch.as_tensor(np.asarray(x)[None]).to(device, dt)
     C = max(len(candidates), 1)
@@ -171,6 +236,10 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
         score[i] = c["score"]
         ticks[i] = c.get("ticksUntil") or 0
         mask[i] = True
+    spec_mask = np.zeros(1 + MAX_SPECIALIST_ID, bool)
+    spec_mask[0] = True
+    if research_turn:
+        spec_mask[[i for i in affordable if i <= MAX_SPECIALIST_ID]] = True
     cycle = static.cycle
     return dict(
         star_x=bt.prepare_star_x(t(f["star_x"])),
@@ -183,6 +252,8 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
         cand_ticks=t(ticks),
         cand_mask=t(mask, torch.bool),
         research_turn=t(float(research_turn)),
+        spec_mask=t(spec_mask, torch.bool),
+        spec_budget=t(float(budget)),
     )
 
 
@@ -201,26 +272,31 @@ class CommanderAgent:
         tick = observation["tick"]
         research_turn = observation["ticksToProduction"] == self.static.cycle - 1
         cands = observation["candidates"]
-        b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn)
+        b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn,
+                         affordable=observation.get("affordableStarSpecialists", ()),
+                         budget=observation.get("specialistBudget", 0))
         out = self.model(b)
 
         if self.sample:
-            order = torch.normal(out["order_mu"], self.model.order_log_std.exp())
-            config = torch.normal(out["config_mu"], self.model.config_log_std.exp())
-            research = torch.distributions.Categorical(logits=out["research_logits"]).sample()
+            d = self.model.distributions(out, b)
+            act = {k: d[k].sample() for k in ("order", "config", "research", "plan", "spec")}
+            act["spec_star"] = self.model.distributions(out, b, act)["spec_star"].sample()
         else:
-            order, config = out["order_mu"], out["config_mu"]
-            research = out["research_logits"].argmax(-1)
-
-        act = dict(order=order, config=config, research=research)
+            act = dict(order=out["order_mu"], config=out["config_mu"],
+                       research=out["research_logits"].argmax(-1),
+                       plan=out["plan_logits"].argmax(-1), spec=out["spec_logits"].argmax(-1))
+            act["spec_star"] = self.model.distributions(out, b, act)["spec_star"].logits.argmax(-1)
         logp, _ = self.model.log_prob(out, b, act)
 
-        weights = torch.exp(order[0]).tolist()
-        decision = {
-            "orderWeights": {c["key"]: w for c, w in zip(cands, weights)},
-            "config": knob_values(config[0].tolist()),
-        }
-        r = int(research[0])
-        if research_turn and r > 0:
-            decision["research"] = self.static.techs[r - 1]
+        weights = torch.exp(act["order"][0]).tolist()
+        decision = {"orderWeights": {c["key"]: w for c, w in zip(cands, weights)}}
+        if research_turn:
+            # Decided once a cycle and kept until the next.
+            decision["config"] = knob_values(act["config"][0].tolist(), int(act["plan"][0]))
+            r = int(act["research"][0])
+            if r > 0:
+                decision["research"] = self.static.techs[r - 1]
+            spec = int(act["spec"][0])
+            if spec > 0:
+                decision["hire"] = [{"star": int(act["spec_star"][0]), "specialist": spec}]
         return decision, dict(inputs=b, act=act, logp=logp)

@@ -60,7 +60,8 @@ TRAIN_FIRST_SEED = 1_000_000
 MAX_TICKS = int(os.environ.get("PPO_MAX_TICKS", 3000))  # shorter games, for trying it out
 
 POLICY_KEYS = ["star_x", "player_x", "owner", "time", "cand_star", "cand_kind",
-               "cand_score", "cand_ticks", "cand_mask", "research_turn"]
+               "cand_score", "cand_ticks", "cand_mask", "research_turn", "spec_mask",
+               "spec_budget"]
 TRUTH_KEYS = ["star_x", "player_x", "owner", "time"]
 
 
@@ -184,6 +185,8 @@ class Steps:
         self.reward = np.concatenate(rewards)
         self.done = np.concatenate(done)
         self.places = places
+        self.hired = float(np.mean(np.concatenate([z["hired"] for z in parts]))) \
+            if all("hired" in z.files for z in parts) else 0.0
         self.n = len(self.reward)
 
     def batch(self, idx, device):
@@ -192,9 +195,9 @@ class Steps:
         policy = {k: get("in_" + k) for k in POLICY_KEYS}
         policy["star_x"] = policy["star_x"].float()
         policy["cand_mask"] = policy["cand_mask"].bool()
+        policy["spec_mask"] = policy["spec_mask"].bool()
         truth = {k: get("truth_" + k) for k in TRUTH_KEYS}
-        act = dict(order=get("act_order"), config=get("act_config"),
-                   research=get("act_research"))
+        act = {k[4:]: get(k) for k in self.cols if k.startswith("act_")}
         return policy, truth, act, get("logp").float()
 
 
@@ -339,11 +342,14 @@ def main():
     start = latest(run_dir)
     saved = torch.load(ckpt_path(run_dir, start), map_location="cpu")
     model = cr.build_model(techs)
-    model.load_state_dict(saved["model"])
+    cr.load_commander(model, saved["model"])
     model.to(device)
     opt = optimizer(model)
     if "optimizer" in saved:
-        opt.load_state_dict(saved["optimizer"])
+        try:
+            opt.load_state_dict(saved["optimizer"])
+        except ValueError:
+            print("The checkpoint has fewer heads than the commander now: new optimizer state.")
     print(f"run {run_dir}: from iteration {start}, on {device}", flush=True)
 
     def log(name, record):
@@ -370,6 +376,7 @@ def main():
             torch.save({"model": model.state_dict(), "n_techs": techs,
                         "optimizer": opt.state_dict()}, ckpt_path(run_dir, i + 1))
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
+                              "hired": steps.hired,
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
 

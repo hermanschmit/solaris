@@ -78,6 +78,29 @@ export const createSimContainer = (): DependencyContainer => {
     c.gameTickService._emitEvents = async () => {};
     c.userService.getGameUsers = async () => [];
 
+    // Hiring a specialist writes to the database, and takes its cost from
+    // the player twice in memory: once directly and once through
+    // playerCreditsService, whose database update is the one the server
+    // keeps. In the sim, memory is the game, so take it once.
+    const hire = c.specialistHireService;
+    hire.gameRepo = { bulkWrite: async () => {} };
+    hire._deductSpecialistCost = async (game: any, player: any, spec: any) => {
+        const cost = hire.specialistService.getSpecialistActualCost(game, spec);
+        return game.settings.specialGalaxy.specialistsCurrency === "credits"
+            ? c.playerCreditsService.addCredits(
+                  game,
+                  player,
+                  -cost.credits,
+                  false,
+              )
+            : c.playerCreditsService.addCreditsSpecialists(
+                  game,
+                  player,
+                  -cost.creditsSpecialists,
+                  false,
+              );
+    };
+
     // Used when rendering a player's view of the galaxy.
     c.historyService.getHistoryMinimumTick = async () => 0;
     c.historyService.getHistoryByTick = async () => null;

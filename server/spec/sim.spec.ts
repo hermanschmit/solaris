@@ -283,6 +283,37 @@ describe("sim engine", () => {
             expect(header.league).toBe(true);
         });
 
+        it("hires a star specialist with the seat's tokens", async () => {
+            const env = new AgentEnv();
+            await env.reset({ seed: 3, agents: [9], fog: true });
+            const player = env.game.galaxy.players[9];
+            const home = env.game.galaxy.stars.findIndex(
+                (s) => s._id.toString() === player.homeStarId!.toString(),
+            );
+            const observation = await env.observe(9);
+            const budget = observation.specialistBudget;
+            const id = observation.affordableStarSpecialists[0];
+            const cost =
+                env.engine.container.specialistService.getSpecialistActualCost(
+                    env.game,
+                    env.engine.container.specialistService.getByIdStar(id)!,
+                ).creditsSpecialists;
+
+            expect(budget).toBeGreaterThan(0);
+            await env.act(9, { hire: [{ star: home, specialist: id }] });
+
+            expect(env.game.galaxy.stars[home].specialistId).toBe(id);
+            expect(player.creditsSpecialists).toBe(budget - cost);
+            expect(env.standings().players[9].hired).toBe(1);
+
+            // A star the seat does not own is refused and skipped.
+            const other = env.game.galaxy.stars.findIndex(
+                (s) => s.ownedByPlayerId?.toString() !== player._id.toString(),
+            );
+            await env.act(9, { hire: [{ star: other, specialist: id }] });
+            expect(env.standings().players[9].hiresRefused).toBe(1);
+        });
+
         it("acts only on the orders the agent scores", async () => {
             const env = new AgentEnv();
             const result = await env.reset({ seed: 4, agents: [9] });

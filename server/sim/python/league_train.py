@@ -154,11 +154,14 @@ def main():
     saved = torch.load(pt.ckpt_path(run_dir, start), map_location="cpu")
     techs = saved["n_techs"]
     model = cr.build_model(techs)
-    model.load_state_dict(saved["model"])
+    cr.load_commander(model, saved["model"])
     model.to(device)
     opt = pt.optimizer(model)
     if "optimizer" in saved:
-        opt.load_state_dict(saved["optimizer"])
+        try:
+            opt.load_state_dict(saved["optimizer"])
+        except ValueError:
+            print("The checkpoint has fewer heads than the commander now: new optimizer state.")
     print(f"league run {run_dir}: from iteration {start}, {len(league['members'])} members, "
           f"on {device}", flush=True)
 
@@ -191,6 +194,7 @@ def main():
                 add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
             save_league(run_dir, league)
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
+                              "hired": steps.hired,
                               "placed_above": against,
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})

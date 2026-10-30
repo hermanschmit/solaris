@@ -49,8 +49,18 @@ def build_model(n_techs, belief=None, checkpoint=None):
     if belief:
         model.load_belief(belief)
     if checkpoint:
-        model.load_state_dict(torch.load(checkpoint, map_location="cpu")["model"])
+        load_commander(model, torch.load(checkpoint, map_location="cpu")["model"])
     return model
+
+
+def load_commander(model, state):
+    """Load a commander's weights. Heads added since the checkpoint was
+    saved keep their starting weights, which leave the built-in AI's
+    choices alone."""
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    new_heads = ("plan_head.", "specialist_head.", "specialist_star_head.")
+    if unexpected or any(not k.startswith(new_heads) for k in missing):
+        raise ValueError(f"Checkpoint does not fit: missing {missing}, unexpected {unexpected}")
 
 
 def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=None,
@@ -115,17 +125,15 @@ def pack(steps, place, agents, seed, standings):
             x = np.concatenate([x, np.full((C - x.shape[0],) + x.shape[1:], value, x.dtype)])
         return x
 
-    out = {k: [] for k in ("seat", "tick", "logp", "bonus", "act_order", "act_config",
-                           "act_research")}
+    out = {k: [] for k in ("seat", "tick", "logp", "bonus")}
     inputs, truths = {}, {}
     for seat, tick, rec, truth, bonus in steps:
         out["seat"].append(seat)
         out["tick"].append(tick)
         out["logp"].append(float(rec["logp"][0]))
         out["bonus"].append(bonus)
-        out["act_order"].append(pad(rec["act"]["order"]))
-        out["act_config"].append(rec["act"]["config"][0].numpy())
-        out["act_research"].append(int(rec["act"]["research"][0]))
+        for k, v in rec["act"].items():
+            out.setdefault("act_" + k, []).append(pad(v) if k == "order" else v[0].numpy())
         for k, v in rec["inputs"].items():
             inputs.setdefault(k, []).append(pad(v, -1 if k == "cand_star" else 0) if k.startswith("cand_") else v[0].numpy())
         for k in ("star_x", "player_x", "owner", "time"):
@@ -139,6 +147,9 @@ def pack(steps, place, agents, seed, standings):
     arrays["place"] = np.array([place[s] for s in agents])
     arrays["final_reward"] = np.array([placement_reward(place[s], players) for s in agents],
                                       np.float32)
+    arrays["hired"] = np.array([standings["players"][s].get("hired", 0) for s in agents])
+    arrays["hires_refused"] = np.array([standings["players"][s].get("hiresRefused", 0)
+                                        for s in agents])
     arrays["place_all"] = np.array([place[p["seat"]] for p in standings["players"]])
     arrays["seed"] = np.array(seed)
     arrays["ticks"] = np.array(standings["tick"])
