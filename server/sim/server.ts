@@ -26,6 +26,13 @@ import readline from "readline";
 const write = (message: any) =>
     process.stdout.write(JSON.stringify(message) + "\n");
 
+// The agent may stop reading at any time (a training run ending while this
+// game is still playing): then there is no one left to answer.
+process.stdout.on("error", (e: any) => {
+    if (e.code === "EPIPE") process.exit(0);
+    throw e;
+});
+
 const main = async () => {
     // Imported after console is redirected, since loading the server's config
     // prints to it.

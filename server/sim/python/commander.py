@@ -261,6 +261,12 @@ class CommanderAgent:
     """Plays seats with a Commander, through solaris_env.SolarisEnv."""
 
     def __init__(self, model, static, sample=False):
+        """sample: True to sample every decision (for training), False to
+        take each one's most likely value, or "discrete" to sample only
+        the choices among options (research, spending plan, specialists)
+        and take the most likely order weights and tuning. A rare but good
+        choice, such as hiring, can be one no single decision makes most
+        likely."""
         self.model = model.eval()
         self.static = static
         self.sample = sample
@@ -280,6 +286,8 @@ class CommanderAgent:
         if self.sample:
             d = self.model.distributions(out, b)
             act = {k: d[k].sample() for k in ("order", "config", "research", "plan", "spec")}
+            if self.sample == "discrete":
+                act.update(order=out["order_mu"], config=out["config_mu"])
             act["spec_star"] = self.model.distributions(out, b, act)["spec_star"].sample()
         else:
             act = dict(order=out["order_mu"], config=out["config_mu"],
