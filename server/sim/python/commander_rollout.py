@@ -162,19 +162,21 @@ def eval_seats(seed, seats=3):
     return sorted(int(s) for s in rng.choice(10, seats, replace=False))
 
 
-def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000):
+def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False):
     """Play a seed's evaluation seats with the commander's most likely
-    decisions, under fog, and return their placements. Without a
-    checkpoint, the built-in AI plays every seat with the whole game in
-    view: the bar to beat."""
+    decisions (or as `sample` says, see CommanderAgent), under fog, and
+    return their placements. Without a checkpoint, the built-in AI plays
+    every seat with the whole game in view: the bar to beat."""
     torch.set_num_threads(1)
+    torch.manual_seed(seed)
     agents = eval_seats(seed, seats)
     with SolarisEnv() as env:
         result = env.reset(agents=agents if checkpoint else [], seed=seed,
                            max_ticks=max_ticks, fog=True)
         if checkpoint:
             static = bd.Static(env.header())
-            agent = cm.CommanderAgent(build_model(len(static.techs), None, checkpoint), static)
+            agent = cm.CommanderAgent(build_model(len(static.techs), None, checkpoint), static,
+                                      sample=sample)
         while not result["done"]:
             for seat in result["seats"]:
                 obs = env.observe(seat, frame=True)

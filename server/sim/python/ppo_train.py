@@ -282,8 +282,8 @@ def update(model, opt, steps, device):
 
 
 def _eval_job(args):
-    seed, checkpoint = args
-    return seed, checkpoint, cr.play_eval(seed, SEATS, checkpoint, MAX_TICKS)
+    seed, checkpoint, sample = args
+    return seed, checkpoint, cr.play_eval(seed, SEATS, checkpoint, MAX_TICKS, sample)
 
 
 def evaluate(run_dir, i, games, workers, pool=None):
@@ -291,17 +291,18 @@ def evaluate(run_dir, i, games, workers, pool=None):
         ckpt_path(run_dir, i), Path(run_dir) / "eval_baseline.json", games, workers, pool)}
 
 
-def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None):
+def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None, sample=False):
     """Placements of the commander's seats over the evaluation seeds,
     against the built-in AI (seeing everything) in the same seats. The
     built-in AI's games are kept in base_path, to be played only once.
     With a pool, its workers play them, once they finish the games they
-    are playing."""
+    are playing. sample is how the commander decides (see
+    CommanderAgent)."""
     seeds = list(range(EVAL_FIRST_SEED, EVAL_FIRST_SEED + games))
     base_path = Path(base_path)
     base = json.loads(base_path.read_text()) if base_path.exists() else {}
-    jobs = [(s, str(checkpoint)) for s in seeds]
-    jobs += [(s, None) for s in seeds if str(s) not in base]
+    jobs = [(s, str(checkpoint), sample) for s in seeds]
+    jobs += [(s, None, False) for s in seeds if str(s) not in base]
     ours = {}
     own_pool = pool is None
     pool = pool or Pool(workers)
