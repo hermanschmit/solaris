@@ -56,6 +56,20 @@ SPENDING_PLANS = [
 # Star specialists are chosen by id; index 0 is "hire none".
 MAX_SPECIALIST_ID = 18
 
+# The specialist head starts from a rule that placed better than hiring
+# nobody in scripted games: a Research Station when the seat can afford
+# one, otherwise a Space Dock, otherwise an Orbital Cannon, each at the own
+# star with the most of the infrastructure it helps (all of it, for the
+# cannon) and no specialist yet. These are fixed amounts added to the
+# head's logits, so they also apply to commanders trained before them;
+# "hire none" starts KEEP_BIAS ahead, so these are set above it.
+SPECIALIST_PRIOR = {
+    11: (7.0, ("science",)),                        # Research Station
+    2: (6.0, ("industry",)),                        # Space Dock
+    4: (5.5, ("economy", "industry", "science")),   # Orbital Cannon
+}
+STAR_PRIOR = 4.0  # the best star for a specialist starts this far ahead of a bare one
+
 # name, default, how the network's output moves it, scale, lowest, highest.
 # "add" adds scale * output; "mul" multiplies by exp(scale * output). The
 # spending split's defaults come from the spending plan.
@@ -170,7 +184,9 @@ class Commander(nn.Module):
         spec_logits = self.specialist_head(torch.cat([g, budget], -1))
         spec_logits = spec_logits.masked_fill(~b["spec_mask"], -1e9)
         own = b["star_x"][..., bt.SF["owner_self"]] > 0
-        star_logits = self.specialist_star_head(h)  # [B, S, specialist]
+        spec_prior, star_prior = specialist_prior(b["star_x"], own)
+        spec_logits = spec_logits + spec_prior
+        star_logits = self.specialist_star_head(h) + star_prior  # [B, S, specialist]
         star_logits = star_logits.masked_fill(~own.unsqueeze(-1), -1e9)
         return dict(order_mu=order_mu, config_mu=config_mu, research_logits=research_logits,
                     plan_logits=plan_logits, spec_logits=spec_logits, star_logits=star_logits)
@@ -216,6 +232,23 @@ class Commander(nn.Module):
                + (self.config_log_std.sum() + d["research"].entropy() + d["plan"].entropy()
                   + d["spec"].entropy()) * turn)
         return lp, ent
+
+
+def specialist_prior(star_x, own):
+    """The fixed starting rule (SPECIALIST_PRIOR), as amounts to add to the
+    specialist logits [B, 1 + MAX_SPECIALIST_ID] and the star logits
+    [B, S, MAX_SPECIALIST_ID]. A specialist gets its amount only when the
+    seat has a star without a specialist to put it on."""
+    B, S = own.shape
+    spec = star_x.new_zeros(B, 1 + MAX_SPECIALIST_ID)
+    star = star_x.new_zeros(B, S, MAX_SPECIALIST_ID)
+    free = own & (star_x[..., bt.SF["has_specialist"]] <= 0)
+    for sid, (amount, infra) in SPECIALIST_PRIOR.items():
+        value = sum(star_x[..., bt.SF[k]] for k in infra).clamp(min=0) * free
+        best = value.max(1, keepdim=True).values
+        star[..., sid - 1] = STAR_PRIOR * value / best.clamp(min=1e-6)
+        spec[:, sid] = amount * free.any(1)
+    return spec, star
 
 
 def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="cpu",
