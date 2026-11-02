@@ -216,7 +216,11 @@ logistics stockpile) and, at the start of each cycle, whether to switch
 research. At the start of each cycle it also picks a spending plan
 (balanced, economy, industry, science, or saving for carriers), holds its
 tuning for the cycle, and may hire a star specialist with its specialist
-tokens (`hire` in a decision), which the built-in AI never spends. Every
+tokens (`hire` in a decision), which the built-in AI never spends. The simulator
+also lets an agent hire carrier specialists (`hireCarrier`, on carriers
+listed in the observation's `ownCarriers`); the commander does not use
+this yet, since scripted Lieutenants and Siege Breakers did no better than
+the star specialists they took tokens from. Every
 head starts at zero, so an untrained commander plays like the
 built-in AI: weights of 1, default tuning and plan, research left alone.
 Specialists are the exception, since the built-in AI never hires them and
@@ -226,7 +230,10 @@ afford one, otherwise a Space Dock or an Orbital Cannon, at the own star
 with the most of the infrastructure it helps. The rule is a fixed amount
 added to the head's scores, so training can move away from it, back to
 hiring nobody if that does better, and it applies to older checkpoints as
-well. Older checkpoints load with the newer heads at their
+well. The other exception is the invasion margin: the built-in AI attacks
+with 1.5 times the ships it estimates it needs, and the commander starts at
+3.5, which placed better in scripted games (this too applies to older
+checkpoints, scaled by what they learned). Older checkpoints load with the newer heads at their
 start, so they too play as they did; continue training one in a new run
 directory, since its old games lack the newer actions. A separate critic reads a truth frame (`observe(seat, { truthFrame:
 true })`), which the policy never sees.

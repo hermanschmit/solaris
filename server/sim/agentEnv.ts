@@ -42,6 +42,9 @@ export interface AgentDecision {
     // owns. A hire the game refuses (unaffordable, or not allowed there) is
     // skipped.
     hire?: { star: number; specialist: number }[];
+    // Carrier specialists to hire now, the same way: specialist id on a
+    // carrier (id, as ownCarriers lists it) orbiting a star the seat owns.
+    hireCarrier?: { carrier: string; specialist: number }[];
     // Under fog: what the agent believes, for the executor to act on. ships
     // gives believed ships per star index, used where the seat cannot see
     // a star's ships. Stars left out (or null) show the last ships seen.
@@ -90,6 +93,16 @@ export interface Observation {
     // can afford now (ids, among the header's starSpecialists).
     specialistBudget: number;
     affordableStarSpecialists: number[];
+    // The same for carrier specialists, and the seat's own carriers: id,
+    // ships, the star index it orbits (-1 in transit) and its specialist
+    // (0 for none).
+    affordableCarrierSpecialists: number[];
+    ownCarriers: {
+        id: string;
+        ships: number;
+        orbiting: number;
+        specialist: number;
+    }[];
 }
 
 export interface StepResult {
@@ -305,6 +318,25 @@ export class AgentEnv {
             .sort((a, b) => a.id - b.id);
     }
 
+    // Carrier specialists that can be hired in this game, by id.
+    _carrierSpecialists() {
+        const { specialistService, specialistBanService } =
+            this.engine.container;
+        if (this.game.settings.specialGalaxy.specialistCost === "none") {
+            return [];
+        }
+        return specialistService
+            .listCarrier(this.game)
+            .filter(
+                (s) =>
+                    !specialistBanService.isCarrierSpecialistBanned(
+                        this.game,
+                        s.id,
+                    ),
+            )
+            .sort((a, b) => a.id - b.id);
+    }
+
     _specialistCost(specialist: Specialist) {
         const currency = this.game.settings.specialGalaxy.specialistsCurrency;
         return this.engine.container.specialistService.getSpecialistActualCost(
@@ -357,6 +389,30 @@ export class AgentEnv {
                         this._specialistBudget(seat.player),
                 )
                 .map((s) => s.id),
+            affordableCarrierSpecialists: this._carrierSpecialists()
+                .filter(
+                    (s) =>
+                        this._specialistCost(s) <=
+                        this._specialistBudget(seat.player),
+                )
+                .map((s) => s.id),
+            ownCarriers: this.game.galaxy.carriers
+                .filter(
+                    (c) =>
+                        c.ownedByPlayerId?.toString() ===
+                        seat.player._id.toString(),
+                )
+                .map((c) => ({
+                    id: c._id.toString(),
+                    ships: c.ships ?? 0,
+                    orbiting: c.orbiting
+                        ? this.game.galaxy.stars.findIndex(
+                              (s) =>
+                                  s._id.toString() === c.orbiting!.toString(),
+                          )
+                        : -1,
+                    specialist: c.specialistId ?? 0,
+                })),
         };
 
         if (options.frame) {
@@ -410,6 +466,26 @@ export class AgentEnv {
             if (!target) continue;
             try {
                 await this.engine.container.specialistHireService.hireStarSpecialist(
+                    this.game,
+                    seat.player,
+                    target._id,
+                    specialist,
+                    this.engine.container.statisticsService,
+                );
+                seat.hired += 1;
+            } catch (e: any) {
+                if (!(e instanceof ValidationError)) throw e;
+                seat.hiresRefused += 1;
+            }
+        }
+
+        for (const { carrier, specialist } of decision.hireCarrier ?? []) {
+            const target = this.game.galaxy.carriers.find(
+                (c) => c._id.toString() === carrier,
+            );
+            if (!target) continue;
+            try {
+                await this.engine.container.specialistHireService.hireCarrierSpecialist(
                     this.game,
                     seat.player,
                     target._id,

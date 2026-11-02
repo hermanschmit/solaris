@@ -314,6 +314,39 @@ describe("sim engine", () => {
             expect(env.standings().players[9].hiresRefused).toBe(1);
         });
 
+        it("hires a carrier specialist on a carrier at its own star", async () => {
+            const env = new AgentEnv();
+            await env.reset({ seed: 3, agents: [9], fog: true });
+            const player = env.game.galaxy.players[9];
+            const observation = await env.observe(9);
+            const carrier = observation.ownCarriers.find(
+                (c) => c.orbiting >= 0 && c.specialist === 0,
+            )!;
+            const id = observation.affordableCarrierSpecialists[0];
+            const cost =
+                env.engine.container.specialistService.getSpecialistActualCost(
+                    env.game,
+                    env.engine.container.specialistService.getByIdCarrier(id)!,
+                ).creditsSpecialists;
+
+            expect(carrier).toBeDefined();
+            await env.act(9, {
+                hireCarrier: [{ carrier: carrier.id, specialist: id }],
+            });
+
+            const hired = env.game.galaxy.carriers.find(
+                (c) => c._id.toString() === carrier.id,
+            )!;
+            expect(hired.specialistId).toBe(id);
+            expect(player.creditsSpecialists).toBe(
+                observation.specialistBudget - cost,
+            );
+            expect(env.standings().players[9].hired).toBe(1);
+            expect((await env.observe(9)).ownCarriers).toContain(
+                jasmine.objectContaining({ id: carrier.id, specialist: id }),
+            );
+        });
+
         it("acts only on the orders the agent scores", async () => {
             const env = new AgentEnv();
             const result = await env.reset({ seed: 4, agents: [9] });

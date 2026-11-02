@@ -84,6 +84,16 @@ export const createSimContainer = (): DependencyContainer => {
     // keeps. In the sim, memory is the game, so take it once.
     const hire = c.specialistHireService;
     hire.gameRepo = { bulkWrite: async () => {} };
+    // A carrier specialist can shorten the carrier's hyperspace range, and
+    // hiring one then drops the waypoints it can no longer reach, in
+    // memory and in the database. Keep the in-memory part.
+    const cull = hire.cullWaypointsService;
+    hire.cullWaypointsService = Object.create(cull, {
+        cullWaypointsByHyperspaceRangeDB: {
+            value: async (game: any, carrier: any) =>
+                cull.cullWaypointsByHyperspaceRange(game, carrier),
+        },
+    });
     hire._deductSpecialistCost = async (game: any, player: any, spec: any) => {
         const cost = hire.specialistService.getSpecialistActualCost(game, spec);
         return game.settings.specialGalaxy.specialistsCurrency === "credits"
