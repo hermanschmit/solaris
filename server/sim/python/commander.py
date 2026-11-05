@@ -76,7 +76,10 @@ STAR_PRIOR = 4.0  # the best star for a specialist starts this far ahead of a ba
 CONFIG_KNOBS = [
     ("firstTickSciencePercentage", 20, "add", 15.0, 0, 60),
     ("firstTickIndustryPercentage", 30, "add", 15.0, 0, 70),
-    ("invasionAttackFactor", 1.5, "mul", 0.3, 1.05, 4.0),
+    # The built-in AI attacks with 1.5 times the ships it estimates it needs.
+    # Scripted games placed better with 3.5 or more (3.62 against 4.19 at
+    # the learned 1.6), so the commander starts there.
+    ("invasionAttackFactor", 3.5, "mul", 0.3, 1.05, 6.0),
     ("logisticStockpileCycles", 0.7, "mul", 0.3, 0.1, 3.0),
 ]
 
