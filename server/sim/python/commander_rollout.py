@@ -10,7 +10,9 @@ was, and the critic's inputs (the true state). At the end it records each
 seat's placement and the reward:
 
   reward = 1 for a win down to -1 for first out, by placement, plus a small
-  bonus each cycle for the share of stars the seat holds.
+  bonus each cycle for the share of all stars the seat holds and its share
+  of all ships (so trading ships evenly earns nothing, and losing them
+  costs).
 
 Games run in parallel, one per worker process, and each writes
 <out_dir>/r<seed>.npz. A commander checkpoint, when given, is the policy
@@ -32,6 +34,7 @@ import commander as cm
 from solaris_env import SolarisEnv
 
 STAR_SHARE_BONUS = 0.02  # per cycle, times the seat's share of all stars
+SHIP_SHARE_BONUS = 0.05  # per cycle, times the seat's share of all ships
 
 
 def placement_reward(place, players):
@@ -105,7 +108,9 @@ def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=Non
                 if obs["cycle"] != last_cycle.get(seat):
                     last_cycle[seat] = obs["cycle"]
                     own = sum(1 for o in obs["frame"]["owner"] if o == seat)
-                    bonus = STAR_SHARE_BONUS * own / static.S
+                    ships = [row[1] for row in obs["frame"]["stats"]]
+                    bonus = (STAR_SHARE_BONUS * own / static.S
+                             + SHIP_SHARE_BONUS * ships[seat] / max(sum(ships), 1))
                 steps.append((seat, obs["tick"], rec, truth, bonus))
             result = env.step()
 

@@ -152,7 +152,7 @@ def train_jobs(run_dir):
 class Steps:
     """Every decision of an iteration's games, with each agent seat's
     decisions together and in order, and its reward: the share-of-stars
-    bonus at each, plus the placement reward at the seat's last."""
+    and share-of-ships bonus at each, plus the placement reward at the seat's last."""
 
     def __init__(self, paths):
         parts = [np.load(p) for p in paths]

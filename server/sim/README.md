@@ -241,7 +241,8 @@ true })`), which the policy never sees.
 `python/commander_rollout.py` plays games with the commander in a few seats
 under fog, sampling its decisions, and records for each one the policy's
 inputs, its actions and their log-probabilities, the critic's inputs, and
-the rewards (placement, plus a small bonus per cycle for stars held):
+the rewards (placement, plus a small bonus per cycle for the seat's share of all
+stars and of all ships, so an even trade of ships earns nothing):
 
 ```sh
 python3 sim/python/commander_rollout.py data/rollouts 20 1 13 3 belief_model.pt
