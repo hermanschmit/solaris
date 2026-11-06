@@ -49,10 +49,6 @@ export interface AiConfig {
         invade: number;
         claim: number;
     };
-    // When no single star or carrier has enough ships for an invasion,
-    // gather up to this many and time them to arrive together (the
-    // nearer ones wait before leaving). 1 keeps one source per invasion.
-    invasionSources: number;
 }
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
@@ -74,5 +70,4 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
         invade: 3,
         claim: 2,
     },
-    invasionSources: 1,
 };

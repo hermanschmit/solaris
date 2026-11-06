@@ -1069,7 +1069,6 @@ export default class AIService {
                     continue;
                 }
 
-                let launched = false;
                 for (const { assignment, trace } of fittingAssignments) {
                     const ticksUntilArrival = this._calculateTraceDuration(
                         context,
@@ -1115,22 +1114,8 @@ export default class AIService {
                             arrivalTick: game.state.tick + (ticksEtaTotal || 0),
                         });
 
-                        launched = true;
                         break;
                     }
-                }
-
-                if (!launched && config.invasionSources > 1) {
-                    await this._invadeTogether(
-                        context,
-                        game,
-                        player,
-                        config,
-                        assignments,
-                        order.star,
-                        starToInvade,
-                        fittingAssignments,
-                    );
                 }
             } else if (order.type === AiAction.ClaimStar) {
                 // Skip double claiming stars that might have been claimed by an earlier action
@@ -1195,84 +1180,6 @@ export default class AIService {
         }
 
         player.aiState!.startedClaims = claimsInProgress;
-    }
-
-    // An invasion from several sources (config.invasionSources), nearest
-    // first, each held at its star so that all arrive on the same tick.
-    async _invadeTogether(
-        context: Context,
-        game: Game,
-        player: Player,
-        config: AiConfig,
-        assignments: Map<string, Assignment>,
-        starId: string,
-        starToInvade: Star,
-        fitting: FoundAssignment[],
-    ) {
-        const chosen: { found: FoundAssignment; ticks: number }[] = [];
-        let ships = 0;
-        let arrival = 0;
-        let required = Infinity;
-
-        for (const found of fitting) {
-            if (chosen.length >= config.invasionSources) break;
-            if (
-                chosen.some(
-                    (c) => c.found.assignment.star === found.assignment.star,
-                ) ||
-                found.assignment.totalShips <= 1
-            ) {
-                continue;
-            }
-            const ticks = this._calculateTraceDuration(
-                context,
-                game,
-                found.trace,
-            );
-            chosen.push({ found, ticks });
-            ships += found.assignment.totalShips;
-            arrival = Math.max(arrival, ticks);
-            required = Math.floor(
-                (this._calculateRequiredShipsForAttack(
-                    game,
-                    player,
-                    context,
-                    starToInvade,
-                    arrival,
-                ) || 1) * config.invasionAttackFactor,
-            );
-            if (ships >= required) break;
-        }
-
-        if (chosen.length < 2 || ships < required) return;
-
-        let remaining = required;
-        for (const { found, ticks } of chosen) {
-            if (remaining <= 0) break;
-            const send = Math.min(found.assignment.totalShips, remaining);
-            remaining -= send;
-            const waypoints = this._createWaypointsFromTrace(found.trace);
-            waypoints[0].delayTicks = arrival - ticks;
-            await this._useAssignment(
-                context,
-                game,
-                player,
-                assignments,
-                found.assignment,
-                waypoints,
-                send,
-            );
-        }
-
-        player.aiState!.invasionsInProgress.push({
-            star: starId,
-            arrivalTick: game.state.tick + arrival,
-        });
-        if (process.env.TOGETHER_DEBUG) {
-            console.error(
-                `together tick ${game.state.tick} sources ${chosen.length} ships ${required} arrival ${arrival}`,
-            );
-        }
     }
 
     async _useAssignment(
