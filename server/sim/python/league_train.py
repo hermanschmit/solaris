@@ -157,6 +157,7 @@ def main():
     cr.load_commander(model, saved["model"])
     model.to(device)
     opt = pt.optimizer(model)
+    ema = pt.ema_start(model, saved)
     if "optimizer" in saved:
         try:
             opt.load_state_dict(saved["optimizer"])
@@ -174,9 +175,7 @@ def main():
     with Pool(workers) as pool:
         collector = pt.Collector(pool, workers, _game_job, game_maker(run_dir, league))
         for i in range(start, start + iterations):
-            if eval_games and i % pt.EVAL_EVERY == 0:
-                print(f"evaluating ckpt_{i} against the built-in AI", flush=True)
-                log("eval.jsonl", pt.evaluate(run_dir, i, eval_games, workers, pool))
+            pt.evaluations(run_dir, i, eval_games, workers, pool, log)
 
             t0 = time.time()
             print(f"iteration {i}: playing {games} league games", flush=True)
@@ -188,8 +187,8 @@ def main():
             t1 = time.time()
             model.eval()  # no dropout: the recorded log-probabilities must match
             stats = pt.update(model, opt, steps, device)
-            torch.save({"model": model.state_dict(), "n_techs": techs,
-                        "optimizer": opt.state_dict()}, pt.ckpt_path(run_dir, i + 1))
+            pt.ema_update(ema, model)
+            pt.save_checkpoint(run_dir, i + 1, model, opt, ema, techs)
             if (i + 1) % SNAPSHOT_EVERY == 0:
                 add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
             save_league(run_dir, league)
@@ -199,7 +198,7 @@ def main():
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
 
-        if eval_games:
+        if eval_games and (start + iterations) % pt.EVAL_EVERY:
             print(f"evaluating ckpt_{start + iterations} against the built-in AI", flush=True)
             log("eval.jsonl", pt.evaluate(run_dir, start + iterations, eval_games, workers, pool))
 

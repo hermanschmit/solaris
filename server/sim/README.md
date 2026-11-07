@@ -274,7 +274,17 @@ on average.
 seats in training games, losses, how far the policy moved) and
 `eval.jsonl` a line per evaluation (`placement` against
 `builtin_placement`, lower is better, and how many seats did better or
-worse). Run it again with the same directory to continue. Set
+worse). Run it again with the same directory to continue.
+
+Evaluations play a running average of the weights (each iteration moves
+it a fifth of the way to the new weights), which smooths out the jitter
+between one iteration's weights and the next. Each checkpoint `ckpt_<i>.pt`
+carries the average, and `ema_<i>.pt` holds it as a commander of its own,
+to evaluate or start a league from. `weights` in `eval.jsonl` says whether
+the average (`ema`) or the trained weights were played. Every 20
+iterations it also evaluates on a second set of seeds (from 500,000, with
+its own baseline in `eval_baseline_b.json`), logged with `"set": "b"`, so
+an improvement that only fits the first set's seeds shows up. Set
 `PPO_MAX_TICKS` to cut games short when trying it out.
 
 ### The league
