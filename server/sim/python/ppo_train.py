@@ -16,7 +16,15 @@ checkpoint:
 Every EVAL_EVERY iterations (and at the start) it evaluates: the commander
 plays `eval_games` fixed seeds with its most likely decisions, and its
 placements are compared with the built-in AI's in the same seats on the
-same seeds, where the built-in AI sees the whole game.
+same seeds, where the built-in AI sees the whole game. Every
+EVAL_B_EVERY iterations it also plays a second, separate set of seeds
+(set "b"), to show whether gains on the first set hold on games it has
+never been judged on.
+
+What is evaluated is a running average of the commander's weights over
+recent iterations (EMA_DECAY), kept in each checkpoint and saved as
+ema_<i>.pt: it changes less from one iteration to the next than the
+weights being trained, so small gains are easier to see.
 
 It picks up where it left off: run it again with the same run_dir to
 continue. The belief model initializes the commander's star encoding; it is
@@ -56,6 +64,9 @@ DUAL_CLIP = 3.0  # bounds the loss of a bad action the policy now likes much mor
 SEATS = 3
 EVAL_EVERY = 5
 EVAL_FIRST_SEED = 1  # evaluation seeds; training seeds start far above
+EVAL_B_FIRST_SEED = 500_000  # the second evaluation set
+EVAL_B_EVERY = 20
+EMA_DECAY = 0.8  # per iteration: about the last five iterations' weights
 TRAIN_FIRST_SEED = 1_000_000
 MAX_TICKS = int(os.environ.get("PPO_MAX_TICKS", 3000))  # shorter games, for trying it out
 
@@ -67,6 +78,38 @@ TRUTH_KEYS = ["star_x", "player_x", "owner", "time"]
 
 def ckpt_path(run_dir, i):
     return Path(run_dir) / f"ckpt_{i}.pt"
+
+
+def ema_path(run_dir, i):
+    return Path(run_dir) / f"ema_{i}.pt"
+
+
+def ema_start(model, saved):
+    """The running average of the weights: from the checkpoint, or the
+    weights themselves when it has none (or is for an older commander)."""
+    ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    for k, v in saved.get("ema", {}).items():
+        if k in ema and ema[k].shape == v.shape:
+            ema[k] = v.to(ema[k].device).clone()
+    return ema
+
+
+@torch.no_grad()
+def ema_update(ema, model):
+    for k, v in model.state_dict().items():
+        if v.is_floating_point():
+            ema[k].mul_(EMA_DECAY).add_(v, alpha=1 - EMA_DECAY)
+        else:
+            ema[k].copy_(v)
+
+
+def save_checkpoint(run_dir, i, model, opt, ema, techs):
+    """ckpt_<i>.pt (the weights being trained, the optimizer and the
+    average) and ema_<i>.pt (the average, as a commander of its own)."""
+    cpu = {k: v.cpu() for k, v in ema.items()}
+    torch.save({"model": model.state_dict(), "n_techs": techs,
+                "optimizer": opt.state_dict(), "ema": cpu}, ckpt_path(run_dir, i))
+    torch.save({"model": cpu, "n_techs": techs}, ema_path(run_dir, i))
 
 
 def latest(run_dir):
@@ -286,19 +329,39 @@ def _eval_job(args):
     return seed, checkpoint, cr.play_eval(seed, SEATS, checkpoint, MAX_TICKS, sample)
 
 
-def evaluate(run_dir, i, games, workers, pool=None):
-    return {"iteration": i, **evaluate_checkpoint(
-        ckpt_path(run_dir, i), Path(run_dir) / "eval_baseline.json", games, workers, pool)}
+def evaluate(run_dir, i, games, workers, pool=None, second=False):
+    """Evaluate the average weights after iteration i (or, before there
+    is an average, the checkpoint itself) on the first evaluation set, or
+    on the second."""
+    checkpoint = ema_path(run_dir, i) if ema_path(run_dir, i).exists() else ckpt_path(run_dir, i)
+    weights = "ema" if checkpoint == ema_path(run_dir, i) else "trained"
+    if second:
+        return {"iteration": i, "set": "b", "weights": weights, **evaluate_checkpoint(
+            checkpoint, Path(run_dir) / "eval_baseline_b.json", games, workers, pool,
+            first_seed=EVAL_B_FIRST_SEED)}
+    return {"iteration": i, "weights": weights, **evaluate_checkpoint(
+        checkpoint, Path(run_dir) / "eval_baseline.json", games, workers, pool)}
 
 
-def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None, sample=False):
+def evaluations(run_dir, i, games, workers, pool, log):
+    """The evaluations due after iteration i, logged to eval.jsonl."""
+    if games and i % EVAL_EVERY == 0:
+        print(f"evaluating ckpt_{i} against the built-in AI", flush=True)
+        log("eval.jsonl", evaluate(run_dir, i, games, workers, pool))
+    if games and i % EVAL_B_EVERY == 0:
+        print(f"evaluating ckpt_{i} on the second set", flush=True)
+        log("eval.jsonl", evaluate(run_dir, i, games, workers, pool, second=True))
+
+
+def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None, sample=False,
+                        first_seed=EVAL_FIRST_SEED):
     """Placements of the commander's seats over the evaluation seeds,
     against the built-in AI (seeing everything) in the same seats. The
     built-in AI's games are kept in base_path, to be played only once.
     With a pool, its workers play them, once they finish the games they
     are playing. sample is how the commander decides (see
     CommanderAgent)."""
-    seeds = list(range(EVAL_FIRST_SEED, EVAL_FIRST_SEED + games))
+    seeds = list(range(first_seed, first_seed + games))
     base_path = Path(base_path)
     base = json.loads(base_path.read_text()) if base_path.exists() else {}
     jobs = [(s, str(checkpoint), sample) for s in seeds]
@@ -346,6 +409,7 @@ def main():
     cr.load_commander(model, saved["model"])
     model.to(device)
     opt = optimizer(model)
+    ema = ema_start(model, saved)
     if "optimizer" in saved:
         try:
             opt.load_state_dict(saved["optimizer"])
@@ -362,9 +426,7 @@ def main():
     with Pool(workers) as pool:
         collector = Collector(pool, workers, _train_job, train_jobs(run_dir))
         for i in range(start, start + iterations):
-            if eval_games and i % EVAL_EVERY == 0:
-                print(f"evaluating ckpt_{i}", flush=True)
-                log("eval.jsonl", evaluate(run_dir, i, eval_games, workers, pool))
+            evaluations(run_dir, i, eval_games, workers, pool, log)
 
             t0 = time.time()
             print(f"iteration {i}: playing {games} games", flush=True)
@@ -374,14 +436,14 @@ def main():
             t1 = time.time()
             model.eval()  # no dropout: the recorded log-probabilities must match
             stats = update(model, opt, steps, device)
-            torch.save({"model": model.state_dict(), "n_techs": techs,
-                        "optimizer": opt.state_dict()}, ckpt_path(run_dir, i + 1))
+            ema_update(ema, model)
+            save_checkpoint(run_dir, i + 1, model, opt, ema, techs)
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
                               "hired": steps.hired,
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
 
-        if eval_games:
+        if eval_games and (start + iterations) % EVAL_EVERY:
             print(f"evaluating ckpt_{start + iterations}", flush=True)
             log("eval.jsonl", evaluate(run_dir, start + iterations, eval_games, workers, pool))
 
