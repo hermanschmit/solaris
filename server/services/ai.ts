@@ -1082,7 +1082,6 @@ export default class AIService {
                             context,
                             starToInvade,
                             ticksUntilArrival,
-                            config.invasionReinforcementWeight,
                         ) || 1) * config.invasionAttackFactor,
                     );
 
@@ -1555,7 +1554,6 @@ export default class AIService {
         context: Context,
         starToInvade: Star,
         ticksToArrival: number,
-        reinforcementWeight: number = 0,
     ): number | undefined {
         const starId = starToInvade._id.toString();
         const defendingCarriers = context.carriersOrbiting.get(starId) || [];
@@ -1577,18 +1575,7 @@ export default class AIService {
             game.settings.galaxy.productionTicks,
         );
         const shipsAtArrival =
-            (starToInvade.shipsActual || 0) +
-            shipsOnCarriers +
-            shipsProduced +
-            Math.floor(
-                reinforcementWeight *
-                    this._possibleReinforcements(
-                        game,
-                        context,
-                        starToInvade,
-                        ticksToArrival,
-                    ),
-            );
+            (starToInvade.shipsActual || 0) + shipsOnCarriers + shipsProduced;
 
         return this.combatService.calculateBasic(
             {
@@ -1602,50 +1589,6 @@ export default class AIService {
             true,
             game.settings.specialGalaxy.defenderBonus === "enabled",
         ).attacker.shipsNeeded;
-    }
-
-    // Ships the target's owner has at its other stars (garrisons and
-    // carriers in orbit) that could reach the target, in one hop within
-    // its hyperspace range, before an invasion arriving in ticksToArrival.
-    _possibleReinforcements(
-        game: Game,
-        context: Context,
-        target: Star,
-        ticksToArrival: number,
-    ): number {
-        if (!target.ownedByPlayerId) {
-            return 0;
-        }
-        const ownerId = target.ownedByPlayerId.toString();
-        const owner = game.galaxy.players.find(
-            (p) => p._id.toString() === ownerId,
-        );
-        if (!owner) {
-            return 0;
-        }
-        const range = this._getHyperspaceRangeInternal(game, owner);
-        const speed = game.settings.specialGalaxy.carrierSpeed;
-        let ships = 0;
-        for (const star of game.galaxy.stars) {
-            if (
-                star === target ||
-                !star.ownedByPlayerId ||
-                star.ownedByPlayerId.toString() !== ownerId
-            ) {
-                continue;
-            }
-            const distance = this._calculateTravelDistance(star, target);
-            if (distance > range || distance / speed > ticksToArrival) {
-                continue;
-            }
-            const orbiting = (
-                context.carriersOrbiting.get(star._id.toString()) || []
-            )
-                .filter((c) => c.ownedByPlayerId?.toString() === ownerId)
-                .reduce((sum, c) => sum + (c.ships || 0), 0);
-            ships += (star.shipsActual || 0) + orbiting;
-        }
-        return ships;
     }
 
     _calculateRequiredShipsForDefense(

@@ -27,10 +27,6 @@ export interface AiConfig {
     lastTickEconomyPercentage: number;
     // Ships sent to invade, as a multiple of the ships needed to win.
     invasionAttackFactor: number;
-    // Ships the defender could bring in before an invasion arrives (from
-    // its other stars within its hyperspace range), counted at this weight
-    // when sizing the invasion. 0 counts only the target's own garrison.
-    invasionReinforcementWeight: number;
     // Angular gap to other own stars that makes a star a border star.
     borderStarAngleThresholdDegrees: number;
     // Ships stockpiled at a star, in cycles of its production, before a new
@@ -60,7 +56,6 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
     firstTickIndustryPercentage: 30,
     lastTickEconomyPercentage: 100,
     invasionAttackFactor: 1.5,
-    invasionReinforcementWeight: 0,
     borderStarAngleThresholdDegrees: 120,
     logisticStockpileCycles: 0.7,
     carrierReserveEconomyMultiplier: 5,
