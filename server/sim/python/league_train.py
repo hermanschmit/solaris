@@ -182,16 +182,18 @@ def main():
             collector.start(i)
             played = collector.take(games)
             paths = [path for _, path in played]
-            against = score(league, paths)
+            with collector.lock:  # games starting meanwhile read the league
+                against = score(league, paths)
             steps = pt.Steps(paths)
             t1 = time.time()
             model.eval()  # no dropout: the recorded log-probabilities must match
             stats = pt.update(model, opt, steps, device)
             pt.ema_update(ema, model)
             pt.save_checkpoint(run_dir, i + 1, model, opt, ema, techs)
-            if (i + 1) % SNAPSHOT_EVERY == 0:
-                add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
-            save_league(run_dir, league)
+            with collector.lock:
+                if (i + 1) % SNAPSHOT_EVERY == 0:
+                    add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
+                save_league(run_dir, league)
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
                               "hired": steps.hired,
                               "placed_above": against,

@@ -37,6 +37,7 @@ and all heads, and, more slowly, in the star encoding.
 import json
 import os
 import queue
+import threading
 import sys
 import time
 from multiprocessing import Pool
@@ -48,7 +49,7 @@ import torch
 import belief_data as bd
 import commander_rollout as cr
 
-GAMMA = 0.998  # per decision; a seat makes a few hundred decisions a game
+GAMMA = 0.998  # per tick; a seat decides about once a cycle (20 ticks)
 LAMBDA = 0.95
 CLIP = 0.2
 EPOCHS = 4
@@ -133,45 +134,64 @@ def train_seed(first, i, k):
 
 class Collector:
     """Keeps every worker playing training games, so none waits for the
-    slowest game of an iteration. An iteration learns from the first games
-    to finish; games still playing then count towards the next one, though
-    they were played with an earlier checkpoint (their recorded
-    log-probabilities keep PPO correct). make_job(i, k) gives the arguments
+    slowest game of an iteration, or for the update. An iteration learns
+    from the first games to finish; games still playing then count towards
+    the next one, though they were played with an earlier checkpoint (their
+    recorded log-probabilities keep PPO correct). A worker that finishes a
+    game starts the next at once, even while the model is learning, until
+    half a batch of finished games is waiting. make_job(i, k) gives the arguments
     for job, the k-th game started in iteration i, and job returns the
-    path of the game's record (and anything else, as a tuple)."""
+    path of the game's record (and anything else, as a tuple). make_job
+    runs in the pool's result thread: hold `lock` while changing anything
+    it reads."""
 
     def __init__(self, pool, workers, job, make_job):
         self.pool, self.workers = pool, workers
         self.job, self.make_job = job, make_job
         self.finished = queue.Queue()
+        self.lock = threading.RLock()
         self.playing = 0
+        self.wanted = workers  # finished games worth keeping ready
         self.iteration, self.started = None, 0
 
-    def _start_one(self):
-        i, k = self.iteration, self.started
-        self.started += 1
-        self.playing += 1
-        self.pool.apply_async(self.job, (self.make_job(i, k),),
-                              callback=lambda r: self.finished.put((i, r)),
-                              error_callback=lambda e: self.finished.put((i, e)))
+    def _fill(self):
+        # Called with the lock held.
+        while self.playing < self.workers and self.finished.qsize() < self.wanted:
+            i, k = self.iteration, self.started
+            self.started += 1
+            self.playing += 1
+            self.pool.apply_async(self.job, (self.make_job(i, k),),
+                                  callback=lambda r, i=i: self._done(i, r),
+                                  error_callback=lambda e, i=i: self._done(i, e))
+
+    def _done(self, i, result):
+        with self.lock:
+            self.playing -= 1
+            self.finished.put((i, result))
+            self._fill()
 
     def start(self, i):
         """New games from now on use iteration i's checkpoint."""
-        if i != self.iteration:
-            self.iteration, self.started = i, 0
-        while self.playing < self.workers:
-            self._start_one()
+        with self.lock:
+            if i != self.iteration:
+                self.iteration, self.started = i, 0
+            self._fill()
 
     def take(self, n):
         """The next n games to finish, as (iteration started, result)."""
+        with self.lock:
+            # Games finished during the update are older; keep at most half
+            # a batch of them, so most of the next batch is fresh.
+            self.wanted = max(self.workers, n // 2)
+            self._fill()
         out = []
         while len(out) < n:
             i, result = self.finished.get()
-            self.playing -= 1
             if isinstance(result, BaseException):
                 raise result
             out.append((i, result))
-            self._start_one()
+            with self.lock:
+                self._fill()
             print(f"  played {len(out)}/{n}", end="\r", flush=True)
         print()
         return out
@@ -200,7 +220,7 @@ class Steps:
     def __init__(self, paths):
         parts = [np.load(p) for p in paths]
         C = max(z["in_cand_mask"].shape[1] for z in parts)
-        cols, rewards, done, places = {}, [], [], []
+        cols, rewards, done, places, gaps = {}, [], [], [], []
         for z in parts:
             seat = z["seat"]
             order = np.lexsort((np.arange(len(seat)), seat))
@@ -214,6 +234,8 @@ class Steps:
                     last[idx[-1]] = True
             rewards.append(reward[order])
             done.append(last[order])
+            tick = z["tick"][order]
+            gaps.append(np.append(np.maximum(np.diff(tick), 1), 1))
             for k in z.files:
                 if not (k.startswith("in_") or k.startswith("truth_") or k.startswith("act_")
                         or k == "logp"):
@@ -227,6 +249,9 @@ class Steps:
         self.cols = {k: torch.from_numpy(np.concatenate(v)) for k, v in cols.items()}
         self.reward = np.concatenate(rewards)
         self.done = np.concatenate(done)
+        # Ticks to each seat's next decision (1 when decisions were every
+        # tick), for discounting by game time, not decisions.
+        self.gap = np.concatenate(gaps)
         self.places = places
         self.hired = float(np.mean(np.concatenate([z["hired"] for z in parts]))) \
             if all("hired" in z.files for z in parts) else 0.0
@@ -253,13 +278,16 @@ def values(model, steps, device, size=256):
     return np.concatenate(out)
 
 
-def gae(reward, value, done):
+def gae(reward, value, done, gap=None):
+    """GAE with GAMMA per tick between decisions (gap) and LAMBDA per
+    decision."""
     adv = np.zeros_like(value)
     last = 0.0
     for t in reversed(range(len(reward))):
+        g = GAMMA ** (1 if gap is None else gap[t])
         next_value = 0.0 if done[t] else value[t + 1]
-        delta = reward[t] + GAMMA * next_value - value[t]
-        last = delta + GAMMA * LAMBDA * (0.0 if done[t] else last)
+        delta = reward[t] + g * next_value - value[t]
+        last = delta + g * LAMBDA * (0.0 if done[t] else last)
         adv[t] = last
     return adv, adv + value
 
@@ -274,7 +302,7 @@ def optimizer(model):
 
 def update(model, opt, steps, device):
     v = values(model, steps, device)
-    adv, ret = gae(steps.reward, v, steps.done)
+    adv, ret = gae(steps.reward, v, steps.done, steps.gap)
     value_error = float(np.mean((ret - v) ** 2))
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     adv_t, ret_t = torch.from_numpy(adv).float(), torch.from_numpy(ret).float()
