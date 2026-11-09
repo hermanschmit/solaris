@@ -66,6 +66,15 @@ def load_commander(model, state):
         raise ValueError(f"Checkpoint does not fit: missing {missing}, unexpected {unexpected}")
 
 
+def observe(env, agent, seat, truth_frame=False):
+    """The seat's observation, with the frames only when the agent will
+    decide on it (not when it holds its order weights)."""
+    obs = env.observe(seat)
+    if agent.wants_frame(obs, seat):
+        obs = env.observe(seat, frame=True, truth_frame=truth_frame)
+    return obs
+
+
 def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=None,
          opponents=None, record=None):
     """Play a game with the commander being trained in `agents` (or
@@ -94,13 +103,16 @@ def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=Non
         while not result["done"]:
             for seat in result["seats"]:
                 if seat in opponents:
-                    obs = env.observe(seat, frame=True)
-                    env.act(seat, frozen[opponents[seat]].decide(obs, seat)[0])
+                    member = frozen[opponents[seat]]
+                    obs = observe(env, member, seat)
+                    env.act(seat, member.decide(obs, seat)[0])
                     continue
 
-                obs = env.observe(seat, frame=True, truth_frame=True)
+                obs = observe(env, agent, seat, truth_frame=True)
                 decision, rec = agent.decide(obs, seat)
                 env.act(seat, decision)
+                if rec is None:  # held order weights: nothing to learn from
+                    continue
 
                 truth = cm.batch_inputs(static, obs["truthFrame"], seat, obs["candidates"],
                                         obs["tick"], False)
@@ -184,7 +196,7 @@ def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False):
                                       sample=sample)
         while not result["done"]:
             for seat in result["seats"]:
-                obs = env.observe(seat, frame=True)
+                obs = observe(env, agent, seat)
                 env.act(seat, agent.decide(obs, seat)[0])
             result = env.step()
         place = placements(env.standings())
