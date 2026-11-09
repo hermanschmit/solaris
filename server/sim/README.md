@@ -216,7 +216,13 @@ logistics stockpile) and, at the start of each cycle, whether to switch
 research. At the start of each cycle it also picks a spending plan
 (balanced, economy, industry, science, or saving for carriers), holds its
 tuning for the cycle, and may hire a star specialist with its specialist
-tokens (`hire` in a decision), which the built-in AI never spends. The simulator
+tokens (`hire` in a decision), which the built-in AI never spends. The order
+weights are decided once a cycle too, with everything else, and held until
+the next cycle (`HOLD_ORDERS`); orders that appear in between get weight 1,
+the built-in AI's own score. Holding cost an untrained commander little
+(3.31 against 3.24 over 72 seeds), and it cuts a game's decisions per seat
+from hundreds to about 25, so each one's effect on the game is far easier
+to learn, and the update has far fewer steps to train on. The simulator
 also lets an agent hire carrier specialists (`hireCarrier`, on carriers
 listed in the observation's `ownCarriers`); the commander does not use
 this yet, since scripted Lieutenants and Siege Breakers did no better than
@@ -264,11 +270,13 @@ seats, where the built-in AI sees the whole game.
 python3 sim/python/ppo_train.py data/ppo1 20 52 13 belief_model.pt 26
 ```
 
-Workers never wait for each other: every worker keeps playing, and each
-iteration learns from the first games to finish. Games still playing count
+Workers never wait for each other or for the update: every worker keeps
+playing, and each iteration learns from the first games to finish. Games
+still playing, or finished during the update (up to half a batch), count
 towards the next iteration, though they were played with the previous
 checkpoint; `lag` in `log.jsonl` is how many iterations old the games were,
-on average.
+on average. Rewards are discounted per tick of game time, not per
+decision.
 
 `log.jsonl` has a line per iteration (mean placement of the commander's
 seats in training games, losses, how far the policy moved) and

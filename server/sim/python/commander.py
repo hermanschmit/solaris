@@ -42,6 +42,11 @@ import belief_train as bt
 
 ORDER_KINDS = ["defend", "invade", "claim"]
 
+# Order weights are decided once a cycle and held (see CommanderAgent).
+# Holding cost the untrained ckpt_200 at most a little (3.31 vs 3.24 over
+# 72 seeds) and cuts a game's decisions per seat from hundreds to ~25.
+HOLD_ORDERS = True
+
 # Spending plans: the share of credits upgraded at the start of each cycle
 # (science, industry) and of what is left at its end (economy). The first
 # is the built-in AI's; "save" keeps credits for carriers.
@@ -296,24 +301,42 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
 class CommanderAgent:
     """Plays seats with a Commander, through solaris_env.SolarisEnv."""
 
-    def __init__(self, model, static, sample=False):
+    def __init__(self, model, static, sample=False, hold=None):
         """sample: True to sample every decision (for training), False to
         take each one's most likely value, or "discrete" to sample only
         the choices among options (research, spending plan, specialists)
         and take the most likely order weights and tuning. A rare but good
         choice, such as hiring, can be one no single decision makes most
-        likely."""
+        likely.
+
+        hold (default HOLD_ORDERS): decide the order weights once a cycle,
+        with everything else, and hold them until the next cycle. Orders
+        that appear in between get weight 1, the built-in AI's own score.
+        decide then returns no record between decisions."""
         self.model = model.eval()
         self.static = static
         self.sample = sample
+        self.hold = HOLD_ORDERS if hold is None else hold
+        self.held = {}  # seat -> the order weights it holds
+
+    def research_turn(self, observation):
+        return observation["ticksToProduction"] == self.static.cycle - 1
+
+    def wants_frame(self, observation, seat):
+        """Whether decide needs the frame for this observation (one taken
+        without it): when it is a decision, not a held one."""
+        return not self.hold or seat not in self.held or self.research_turn(observation)
 
     @torch.no_grad()
     def decide(self, observation, seat):
         """The decision to send for this observation, and what to record
         for training (inputs, sampled actions and their log-probability)."""
         tick = observation["tick"]
-        research_turn = observation["ticksToProduction"] == self.static.cycle - 1
+        research_turn = self.research_turn(observation)
         cands = observation["candidates"]
+        if not self.wants_frame(observation, seat):
+            held = self.held[seat]
+            return {"orderWeights": {c["key"]: held.get(c["key"], 1.0) for c in cands}}, None
         b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn,
                          affordable=observation.get("affordableStarSpecialists", ()),
                          budget=observation.get("specialistBudget", 0))
@@ -334,6 +357,8 @@ class CommanderAgent:
 
         weights = torch.exp(act["order"][0]).tolist()
         decision = {"orderWeights": {c["key"]: w for c, w in zip(cands, weights)}}
+        if self.hold:
+            self.held[seat] = decision["orderWeights"]
         if research_turn:
             # Decided once a cycle and kept until the next.
             decision["config"] = knob_values(act["config"][0].tolist(), int(act["plan"][0]))
