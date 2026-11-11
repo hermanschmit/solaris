@@ -195,7 +195,7 @@ def main():
                     add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
                 save_league(run_dir, league)
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
-                              "hired": steps.hired,
+                              "hired": steps.hired, **pt.strategy_shares(steps),
                               "placed_above": against,
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})

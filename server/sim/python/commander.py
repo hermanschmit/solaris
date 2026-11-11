@@ -42,6 +42,10 @@ import belief_train as bt
 
 ORDER_KINDS = ["defend", "invade", "claim"]
 
+# Each cycle the commander also picks a stance and a target player (or
+# none), and the order weights respond to them (see Commander.forward).
+POSTURES = ["none", "expand", "fortify", "attack"]
+
 # Order weights are decided once a cycle and held (see CommanderAgent).
 # Holding cost the untrained ckpt_200 at most a little (3.31 vs 3.24 over
 # 72 seeds) and cuts a game's decisions per seat from hundreds to ~25.
@@ -110,6 +114,10 @@ def knob_values(outputs, plan=0):
     return config
 
 
+def n_global_dims(d, n_player):
+    return 2 * d + n_player + 2
+
+
 def zero_last(module):
     nn.init.zeros_(module.weight)
     nn.init.zeros_(module.bias)
@@ -131,11 +139,20 @@ class Commander(nn.Module):
         # Candidate order: its star's encoding, its kind, the built-in AI's
         # score and how soon an attack lands.
         self.order_head = mlp(d + len(ORDER_KINDS) + 2, 1)
+        # The cycle's strategy: a stance, and a target player (or none),
+        # scored from that player's public stats and the encodings of its
+        # stars. The order weights respond to it through strategy_order_head:
+        # each candidate's kind, the stance, and whether its star is the
+        # target's. All start at zero: a uniform pick that changes nothing.
+        self.posture_head = mlp(n_global_dims(d, n_player), len(POSTURES))
+        self.target_head = mlp(d + n_player + n_global_dims(d, n_player), 1)
+        self.no_target_head = mlp(n_global_dims(d, n_player), 1)
+        self.strategy_order_head = mlp(1 + len(POSTURES) + 2 * len(ORDER_KINDS), 1, hidden=32)
         self.order_log_std = nn.Parameter(torch.tensor(math.log(INITIAL_STD)))
 
         # The whole position: mean and max over own stars, own public stats,
         # and where in the cycle and game it is.
-        n_global = 2 * d + n_player + 2
+        n_global = n_global_dims(d, n_player)
         self.config_head = mlp(n_global, len(CONFIG_KNOBS))
         self.config_log_std = nn.Parameter(torch.full((len(CONFIG_KNOBS),), math.log(INITIAL_STD)))
         self.research_head = mlp(n_global, 1 + n_techs)
@@ -165,14 +182,42 @@ class Commander(nn.Module):
         mx = torch.where(own.any(1), mx, torch.zeros_like(mx))
         return torch.cat([mean, mx, b["player_x"][:, 0], b["time"]], -1)
 
-    def forward(self, b):
+    def _strategy_logits(self, h, g, b):
+        """Stance logits [B, len(POSTURES)] and target logits [B, P]: index
+        0 is no target, q > 0 the q-th other player in player_x's order,
+        masked out when defeated or holding no stars."""
+        px, owner = b["player_x"], b["owner"]
+        P = px.shape[1]
+        onehot = F.one_hot(owner.clamp(min=-1) + 1, P + 1)[..., 1:].float()  # [B, S, P]
+        count = onehot.sum(1)  # [B, P]
+        pooled = torch.einsum("bsp,bsd->bpd", onehot, h) / count.clamp(min=1).unsqueeze(-1)
+        others = torch.cat([pooled[:, 1:], px[:, 1:],
+                            g.unsqueeze(1).expand(-1, P - 1, -1)], -1)
+        target_logits = torch.cat([self.no_target_head(g),
+                                   self.target_head(others).squeeze(-1)], 1)
+        alive = torch.cat([torch.ones_like(count[:, :1], dtype=torch.bool),
+                           (px[:, 1:, 1] <= 0) & (count[:, 1:] > 0)], 1)
+        return self.posture_head(g), target_logits.masked_fill(~alive, -1e9)
+
+    def forward(self, b, strategy=None, sample=False):
         """Distributions for every decision, for a batch of B decisions.
 
         b holds star_x [B,S,F], player_x [B,P,Fp], owner [B,S], time [B,2],
         cand_star [B,C], cand_kind [B,C], cand_score [B,C], cand_ticks [B,C]
-        and cand_mask [B,C] (False for padding)."""
+        and cand_mask [B,C] (False for padding). The order weights depend
+        on the cycle's strategy: strategy = (target, posture) as recorded,
+        or else picked here, sampled or the most likely."""
         _, _, h = self.trunk.encode(b)
         g = self._global(h, b)
+
+        posture_logits, target_logits = self._strategy_logits(h, g, b)
+        if strategy is not None:
+            target, posture = strategy
+        elif sample:
+            target = torch.distributions.Categorical(logits=target_logits).sample()
+            posture = torch.distributions.Categorical(logits=posture_logits).sample()
+        else:
+            target, posture = target_logits.argmax(-1), posture_logits.argmax(-1)
 
         idx = b["cand_star"].clamp(min=0)
         ch = torch.gather(h, 1, idx.unsqueeze(-1).expand(-1, -1, h.shape[-1]))
@@ -182,7 +227,16 @@ class Commander(nn.Module):
             torch.log1p(b["cand_score"].clamp(min=0)).unsqueeze(-1),
             (b["cand_ticks"] / 20.0).unsqueeze(-1),
         ], -1)
-        order_mu = self.order_head(cx).squeeze(-1)
+        kind = F.one_hot(b["cand_kind"], len(ORDER_KINDS)).float()
+        cand_owner = torch.gather(b["owner"], 1, idx)
+        is_target = ((cand_owner == target.unsqueeze(-1)) & (target > 0).unsqueeze(-1)).float()
+        sx = torch.cat([
+            is_target.unsqueeze(-1),
+            F.one_hot(posture, len(POSTURES)).float().unsqueeze(1).expand(-1, idx.shape[1], -1),
+            kind,
+            kind * is_target.unsqueeze(-1),
+        ], -1)
+        order_mu = self.order_head(cx).squeeze(-1) + self.strategy_order_head(sx).squeeze(-1)
         config_mu = self.config_head(g)
         research_logits = self.research_head(g)
         plan_logits = self.plan_head(g)
@@ -197,7 +251,9 @@ class Commander(nn.Module):
         star_logits = self.specialist_star_head(h) + star_prior  # [B, S, specialist]
         star_logits = star_logits.masked_fill(~own.unsqueeze(-1), -1e9)
         return dict(order_mu=order_mu, config_mu=config_mu, research_logits=research_logits,
-                    plan_logits=plan_logits, spec_logits=spec_logits, star_logits=star_logits)
+                    plan_logits=plan_logits, spec_logits=spec_logits, star_logits=star_logits,
+                    target_logits=target_logits, posture_logits=posture_logits,
+                    target=target, posture=posture)
 
     def value(self, b):
         """The critic's estimate of the outcome, from the true state."""
@@ -220,6 +276,8 @@ class Commander(nn.Module):
             plan=torch.distributions.Categorical(logits=out["plan_logits"]),
             spec=spec,
             spec_star=torch.distributions.Categorical(logits=star_logits),
+            target=torch.distributions.Categorical(logits=out["target_logits"]),
+            posture=torch.distributions.Categorical(logits=out["posture_logits"]),
         )
 
     def log_prob(self, out, b, act):
@@ -239,6 +297,9 @@ class Commander(nn.Module):
         ent = (self.order_log_std * mask.sum(-1)
                + (self.config_log_std.sum() + d["research"].entropy() + d["plan"].entropy()
                   + d["spec"].entropy()) * turn)
+        if "target" in act:  # the strategy, picked with every order decision
+            lp = lp + d["target"].log_prob(act["target"]) + d["posture"].log_prob(act["posture"])
+            ent = ent + d["target"].entropy() + d["posture"].entropy()
         return lp, ent
 
 
@@ -340,7 +401,7 @@ class CommanderAgent:
         b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn,
                          affordable=observation.get("affordableStarSpecialists", ()),
                          budget=observation.get("specialistBudget", 0))
-        out = self.model(b)
+        out = self.model(b, sample=bool(self.sample))
 
         if self.sample:
             d = self.model.distributions(out, b)
@@ -353,6 +414,7 @@ class CommanderAgent:
                        research=out["research_logits"].argmax(-1),
                        plan=out["plan_logits"].argmax(-1), spec=out["spec_logits"].argmax(-1))
             act["spec_star"] = self.model.distributions(out, b, act)["spec_star"].logits.argmax(-1)
+        act.update(target=out["target"], posture=out["posture"])
         logp, _ = self.model.log_prob(out, b, act)
 
         weights = torch.exp(act["order"][0]).tolist()

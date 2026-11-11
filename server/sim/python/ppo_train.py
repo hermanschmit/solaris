@@ -47,6 +47,7 @@ import numpy as np
 import torch
 
 import belief_data as bd
+import commander as cm
 import commander_rollout as cr
 
 GAMMA = 0.998  # per tick; a seat decides about once a cycle (20 ticks)
@@ -269,6 +270,15 @@ class Steps:
         return policy, truth, act, get("logp").float()
 
 
+def strategy_shares(steps):
+    """How often the cycle's strategy picked each stance, and a target."""
+    if "act_posture" not in steps.cols:
+        return {}
+    posture = steps.cols["act_posture"].numpy()
+    return {"postures": [round(float(np.mean(posture == k)), 3) for k in range(len(cm.POSTURES))],
+            "targeted": round(float(np.mean(steps.cols["act_target"].numpy() > 0)), 3)}
+
+
 @torch.no_grad()
 def values(model, steps, device, size=256):
     out = []
@@ -317,7 +327,8 @@ def update(model, opt, steps, device):
             policy, truth, act, old_logp = steps.batch(idx, device)
             a, r = adv_t[idx].to(device), ret_t[idx].to(device)
 
-            out = model(policy)
+            strategy = (act["target"], act["posture"]) if "target" in act else None
+            out = model(policy, strategy)
             logp, ent = model.log_prob(out, policy, act)
             log_ratio = (logp - old_logp).clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO)
             ratio = torch.exp(log_ratio)
@@ -467,6 +478,7 @@ def main():
             ema_update(ema, model)
             save_checkpoint(run_dir, i + 1, model, opt, ema, techs)
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
+                              **strategy_shares(steps),
                               "hired": steps.hired,
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
