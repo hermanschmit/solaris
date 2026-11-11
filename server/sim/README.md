@@ -219,7 +219,19 @@ tuning for the cycle, and may hire a star specialist with its specialist
 tokens (`hire` in a decision), which the built-in AI never spends. The order
 weights are decided once a cycle too, with everything else, and held until
 the next cycle (`HOLD_ORDERS`); orders that appear in between get weight 1,
-the built-in AI's own score. Holding cost an untrained commander little
+the built-in AI's own score.
+
+With the order weights, each cycle it also picks a strategy: a stance
+(`POSTURES`: none, expand, fortify or attack) and a target player, or none.
+The target is scored from that player's public stats and the encodings of
+its stars, so what makes a good target (weak, close, distracted) is learned
+rather than scripted. The order weights respond to the strategy through a
+small head that sees each candidate's kind, the stance and whether its
+star is the target's. A scripted "fortify the border, attack the weakest
+neighbour" rule did no better than the commander alone, which is why this
+is learned. Every part starts at zero, so an untrained strategy is picked
+at random and changes nothing; `postures` and `targeted` in `log.jsonl`
+show what it picks. Holding cost an untrained commander little
 (3.31 against 3.24 over 72 seeds), and it cuts a game's decisions per seat
 from hundreds to about 25, so each one's effect on the game is far easier
 to learn, and the update has far fewer steps to train on. The simulator
