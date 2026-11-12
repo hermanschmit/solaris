@@ -45,6 +45,17 @@ ORDER_KINDS = ["defend", "invade", "claim"]
 # Each cycle the commander also picks a stance and a target player (or
 # none), and the order weights respond to them (see Commander.forward).
 POSTURES = ["none", "expand", "fortify", "attack"]
+# What each stance starts out doing to the order weights, as multipliers:
+# (kind, applies to) -> factor, where applies to is "target" (the target's
+# stars), "other" (anyone else's, when there is a target) or "all". A fixed
+# amount added to the learned order weights, so every stance changes play
+# from the start and training only has to learn when each pays off.
+STRATEGY_PRIOR = {
+    "expand": {("claim", "all"): 1.5},
+    "fortify": {("defend", "all"): 1.5, ("invade", "all"): 0.75},
+    "attack": {("invade", "target"): 2.0, ("invade", "other"): 0.75},
+}
+POSTURE_PRIOR = 2.0  # "none" starts this far ahead: picked ~70% of the time
 
 # Order weights are decided once a cycle and held (see CommanderAgent).
 # Holding cost the untrained ckpt_200 at most a little (3.31 vs 3.24 over
@@ -197,7 +208,10 @@ class Commander(nn.Module):
                                    self.target_head(others).squeeze(-1)], 1)
         alive = torch.cat([torch.ones_like(count[:, :1], dtype=torch.bool),
                            (px[:, 1:, 1] <= 0) & (count[:, 1:] > 0)], 1)
-        return self.posture_head(g), target_logits.masked_fill(~alive, -1e9)
+        posture_logits = self.posture_head(g)
+        posture_logits = posture_logits + posture_logits.new_tensor(
+            [POSTURE_PRIOR] + [0.0] * (len(POSTURES) - 1))
+        return posture_logits, target_logits.masked_fill(~alive, -1e9)
 
     def forward(self, b, strategy=None, sample=False):
         """Distributions for every decision, for a batch of B decisions.
@@ -236,7 +250,8 @@ class Commander(nn.Module):
             kind,
             kind * is_target.unsqueeze(-1),
         ], -1)
-        order_mu = self.order_head(cx).squeeze(-1) + self.strategy_order_head(sx).squeeze(-1)
+        order_mu = (self.order_head(cx).squeeze(-1) + self.strategy_order_head(sx).squeeze(-1)
+                    + strategy_prior(b["cand_kind"], is_target, target, posture))
         config_mu = self.config_head(g)
         research_logits = self.research_head(g)
         plan_logits = self.plan_head(g)
@@ -301,6 +316,22 @@ class Commander(nn.Module):
             lp = lp + d["target"].log_prob(act["target"]) + d["posture"].log_prob(act["posture"])
             ent = ent + d["target"].entropy() + d["posture"].entropy()
         return lp, ent
+
+
+def strategy_prior(cand_kind, is_target, target, posture):
+    """STRATEGY_PRIOR as amounts to add to the order weights' logs [B, C]."""
+    out = torch.zeros_like(is_target)
+    has_target = (target > 0).unsqueeze(-1)
+    for p, effects in STRATEGY_PRIOR.items():
+        on = (posture == POSTURES.index(p)).unsqueeze(-1)
+        for (kind, where), factor in effects.items():
+            hit = cand_kind == ORDER_KINDS.index(kind)
+            if where == "target":
+                hit = hit & (is_target > 0)
+            elif where == "other":
+                hit = hit & (is_target == 0) & has_target
+            out = out + math.log(factor) * (hit & on).float()
+    return out
 
 
 def specialist_prior(star_x, own):
