@@ -229,9 +229,14 @@ rather than scripted. The order weights respond to the strategy through a
 small head that sees each candidate's kind, the stance and whether its
 star is the target's. A scripted "fortify the border, attack the weakest
 neighbour" rule did no better than the commander alone, which is why this
-is learned. Every part starts at zero, so an untrained strategy is picked
-at random and changes nothing; `postures` and `targeted` in `log.jsonl`
-show what it picks. Holding cost an untrained commander little
+is learned. Learned from nothing, though, the strategy never took hold (in
+70 iterations its effect on any order weight stayed under 1%), so each
+stance now starts with a fixed effect (`STRATEGY_PRIOR`): attack doubles
+invasions of the target's stars and cuts other invasions to 0.75, fortify
+makes defence 1.5 and invasion 0.75, expand makes claims 1.5. "None" starts
+ahead (`POSTURE_PRIOR`, about 70% of picks), so the most likely strategy,
+which evaluation plays, changes nothing until training prefers another.
+`postures` and `targeted` in `log.jsonl` show what it picks. Holding cost an untrained commander little
 (3.31 against 3.24 over 72 seeds), and it cuts a game's decisions per seat
 from hundreds to about 25, so each one's effect on the game is far easier
 to learn, and the update has far fewer steps to train on. The simulator
