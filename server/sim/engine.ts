@@ -13,6 +13,7 @@ import { Game } from "../services/types/Game";
 import { DBObjectId } from "../services/types/DBObjectId";
 import { DependencyContainer } from "../services/types/DependencyContainer";
 import { seededRng } from "./random";
+import { fastCalculateBasic } from "./fastCombat";
 import { AiConfig, DEFAULT_AI_CONFIG } from "../services/types/Ai";
 
 // The server turns object ids into strings constantly (every lookup by id
@@ -46,9 +47,11 @@ export class SimEngine {
 
         // The built-in AI sizes each attack by simulating the combat, which
         // is pure arithmetic on a few numbers and is asked the same question
-        // many times. Remember the answers.
+        // many times. Answer it with the same arithmetic on plain numbers
+        // (fastCombat.ts, checked against calculateBasic in the specs), and
+        // remember the answers.
         const combat = this.container.combatService;
-        const calculateBasic = combat.calculateBasic.bind(combat);
+        const calculateBasic = fastCalculateBasic;
         const answers = new Map<string, any>();
         combat.calculateBasic = (defender, attacker, toStar, bonus) => {
             const key = `${defender.ships},${defender.weaponsLevel},${attacker.ships},${attacker.weaponsLevel},${toStar},${bonus}`;
