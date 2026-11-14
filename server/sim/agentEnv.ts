@@ -49,6 +49,9 @@ export interface AgentDecision {
     // gives believed ships per star index, used where the seat cannot see
     // a star's ships. Stars left out (or null) show the last ships seen.
     beliefs?: { ships?: (number | null)[] };
+    // Keep an Explorer carrier claiming unowned stars beyond the seat's
+    // own hyperspace range (see AgentEnv._explore).
+    explore?: boolean;
 }
 
 export interface ResetOptions {
@@ -124,6 +127,8 @@ interface Seat {
     memory: SeatMemory;
 }
 
+const EXPLORER = 6; // carrier specialist: +3 hyperspace, faster, weaker
+
 export class AgentEnv {
     engine = new SimEngine();
     game!: Game;
@@ -156,6 +161,7 @@ export class AgentEnv {
                 const restore = this._fog(seat, true);
                 try {
                     await ai.playForAgent(eventService, game, seat.player);
+                    if (seat.decision.explore) await this._explore(seat);
                 } finally {
                     restore();
                 }
@@ -172,6 +178,137 @@ export class AgentEnv {
             const weights = this._seatOf(player)?.decision.orderWeights;
             return weights ? new Map(Object.entries(weights)) : null;
         };
+    }
+
+    // An Explorer (+3 hyperspace) carrier claims unowned stars the seat's
+    // executor cannot reach. With none, hire one on a carrier at the own
+    // star closest to such a star (building the carrier if need be); an
+    // idle one flies to the nearest unowned star in its range. Star owners
+    // are public, so this needs nothing hidden by fog.
+    async _explore(seat: Seat) {
+        const c = this.engine.container as any;
+        const game = this.game;
+        const player = seat.player;
+        const id = player._id.toString();
+        const distance = (a: any, b: any) =>
+            c.distanceService.getDistanceBetweenLocations(a.location, b.location);
+        const level = player.research.hyperspace.level;
+        const near = c.distanceService.getHyperspaceDistance(game, level);
+        const far = c.distanceService.getHyperspaceDistance(game, level + 3);
+
+        const owned = game.galaxy.stars.filter(
+            (s) => s.ownedByPlayerId?.toString() === id,
+        );
+        const free = game.galaxy.stars.filter(
+            (s) => !s.ownedByPlayerId && !c.starDataService.isDeadStar(s),
+        );
+        if (!owned.length || !free.length) return;
+
+        const explorers = game.galaxy.carriers.filter(
+            (x) =>
+                x.ownedByPlayerId?.toString() === id &&
+                x.specialistId === EXPLORER,
+        );
+        const taken = new Set(
+            explorers.flatMap((x) =>
+                (x.waypoints ?? []).map((w) => w.destination.toString()),
+            ),
+        );
+
+        for (const carrier of explorers) {
+            if (!carrier.orbiting || carrier.waypoints?.length) continue;
+            const from = game.galaxy.stars.find(
+                (s) => s._id.toString() === carrier.orbiting!.toString(),
+            )!;
+            const options = free
+                .filter((s) => !taken.has(s._id.toString()))
+                .map((s) => [distance(from, s), s] as const)
+                .filter(([d]) => d <= far)
+                .sort((a, b) => a[0] - b[0]);
+            if (!options.length) continue;
+            const target = options[0][1];
+            try {
+                await c.saveWaypointsService.saveWaypointsForCarrier(
+                    game,
+                    player,
+                    carrier,
+                    [
+                        {
+                            _id: new mongoose.Types.ObjectId(),
+                            source: from._id,
+                            destination: target._id,
+                            action: "nothing",
+                            actionShips: 0,
+                            delayTicks: 0,
+                        },
+                    ],
+                    false,
+                    false,
+                );
+                taken.add(target._id.toString());
+            } catch (e: any) {
+                if (!(e instanceof ValidationError)) throw e;
+            }
+        }
+
+        if (explorers.length) return;
+
+        // Stars only an Explorer reaches, and the own star closest to one.
+        let best: { d: number; star: any } | null = null;
+        for (const target of free) {
+            let closest: { d: number; star: any } | null = null;
+            for (const star of owned) {
+                const d = distance(star, target);
+                if (!closest || d < closest.d) closest = { d, star };
+            }
+            if (closest && closest.d > near && closest.d <= far) {
+                if (!best || closest.d < best.d) best = closest;
+            }
+        }
+        if (!best) return;
+
+        const explorer = this._carrierSpecialists().find(
+            (x) => x.id === EXPLORER,
+        );
+        if (
+            !explorer ||
+            this._specialistCost(explorer) > this._specialistBudget(player)
+        ) {
+            return;
+        }
+
+        try {
+            let carrier = game.galaxy.carriers.find(
+                (x) =>
+                    x.ownedByPlayerId?.toString() === id &&
+                    x.orbiting?.toString() === best!.star._id.toString() &&
+                    !x.waypoints?.length &&
+                    x.specialistId == null,
+            );
+            if (!carrier) {
+                if ((best.star.ships ?? 0) < 1) return;
+                const built = await c.starUpgradeService.buildCarrier(
+                    game,
+                    player,
+                    best.star._id,
+                    1,
+                    false,
+                    c.statisticsService,
+                );
+                carrier = c.carrierService.getById(game, built.carrier._id);
+            }
+            await c.specialistHireService.hireCarrierSpecialist(
+                game,
+                player,
+                carrier!._id,
+                EXPLORER,
+                c.statisticsService,
+            );
+            seat.hired += 1;
+        } catch (e: any) {
+            if (!(e instanceof ValidationError)) throw e;
+            seat.hiresRefused += 1;
+        }
     }
 
     _seatOf(player: Player): Seat | undefined {
