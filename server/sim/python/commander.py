@@ -131,6 +131,10 @@ def knob_values(outputs, plan=0):
     return config
 
 
+N_FLEET = 2        # own carrier ships orbiting each star, and headed to it
+N_ORDER_SHIPS = 3  # ships needed, ships nearby, and their log ratio
+
+
 def n_global_dims(d, n_player):
     return 2 * d + n_player + 2
 
@@ -165,6 +169,13 @@ class Commander(nn.Module):
         self.target_head = mlp(d + n_player + n_global_dims(d, n_player), 1)
         self.no_target_head = mlp(n_global_dims(d, n_player), 1)
         self.strategy_order_head = mlp(1 + len(POSTURES) + 2 * len(ORDER_KINDS), 1, hidden=32)
+        # What the seat sees but the belief trunk leaves out (see
+        # batch_inputs): its own fleets at and headed to each star, its
+        # credits, and the ships each order needs against the ships near
+        # it. All start at zero, so older checkpoints play as before.
+        self.fleet_head = mlp(N_FLEET, d, hidden=32)
+        self.credits_head = mlp(1, n_global_dims(d, n_player), hidden=32)
+        self.order_ships_head = mlp(d + len(ORDER_KINDS) + 2 + N_ORDER_SHIPS, 1, hidden=64)
         self.order_log_std = nn.Parameter(torch.tensor(math.log(INITIAL_STD)))
 
         # The whole position: mean and max over own stars, own public stats,
@@ -228,7 +239,11 @@ class Commander(nn.Module):
         on the cycle's strategy: strategy = (target, posture) as recorded,
         or else picked here, sampled or the most likely."""
         _, _, h = self.trunk.encode(b)
+        if "own_fleet" in b:
+            h = h + self.fleet_head(torch.log1p(b["own_fleet"]) / 4)
         g = self._global(h, b)
+        if "credits" in b:
+            g = g + self.credits_head(torch.log1p(b["credits"]).unsqueeze(-1) / 8)
 
         posture_logits, target_logits = self._strategy_logits(h, g, b)
         if strategy is not None:
@@ -256,7 +271,12 @@ class Commander(nn.Module):
             kind,
             kind * is_target.unsqueeze(-1),
         ], -1)
-        order_mu = (self.order_head(cx).squeeze(-1) + self.strategy_order_head(sx).squeeze(-1)
+        order_mu = self.order_head(cx).squeeze(-1)
+        if "cand_needed" in b:
+            needed, nearby = torch.log1p(b["cand_needed"]), torch.log1p(b["cand_nearby"])
+            ox = torch.cat([cx, torch.stack([needed / 4, nearby / 4, nearby - needed], -1)], -1)
+            order_mu = order_mu + self.order_ships_head(ox).squeeze(-1)
+        order_mu = (order_mu + self.strategy_order_head(sx).squeeze(-1)
                     + strategy_prior(b["cand_kind"], is_target, target, posture))
         config_mu = self.config_head(g)
         research_logits = self.research_head(g)
@@ -358,7 +378,7 @@ def specialist_prior(star_x, own):
 
 
 def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="cpu",
-                 affordable=(), budget=0):
+                 affordable=(), budget=0, own_carriers=None, credits=None):
     """Model inputs for one decision, as a batch of one. affordable lists
     the star specialists (ids) the seat can hire now, with budget tokens."""
     f = static.features(frame, seat)
@@ -368,13 +388,23 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
     kind = np.zeros(C, int)
     score = np.zeros(C, np.float32)
     ticks = np.zeros(C, np.float32)
+    needed = np.zeros(C, np.float32)
+    nearby = np.zeros(C, np.float32)
     mask = np.zeros(C, bool)
     for i, c in enumerate(candidates):
         star[i] = c["starIndex"]
         kind[i] = ORDER_KINDS.index(c["kind"])
         score[i] = c["score"]
         ticks[i] = c.get("ticksUntil") or 0
+        needed[i] = c.get("shipsNeeded", 0)
+        nearby[i] = c.get("shipsNearby", 0)
         mask[i] = True
+    fleet = np.zeros((static.S, N_FLEET), np.float32)
+    for car in own_carriers or ():
+        if car["orbiting"] >= 0:
+            fleet[car["orbiting"], 0] += car["ships"]
+        if car.get("destination", -1) >= 0:
+            fleet[car["destination"], 1] += car["ships"]
     spec_mask = np.zeros(1 + MAX_SPECIALIST_ID, bool)
     spec_mask[0] = True
     if research_turn:
@@ -390,6 +420,10 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
         cand_score=t(score),
         cand_ticks=t(ticks),
         cand_mask=t(mask, torch.bool),
+        cand_needed=t(needed),
+        cand_nearby=t(nearby),
+        own_fleet=t(fleet),
+        credits=t(float(credits or 0)),
         research_turn=t(float(research_turn)),
         spec_mask=t(spec_mask, torch.bool),
         spec_budget=t(float(budget)),
@@ -438,7 +472,9 @@ class CommanderAgent:
                     "explore": EXPLORE}, None
         b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn,
                          affordable=observation.get("affordableStarSpecialists", ()),
-                         budget=observation.get("specialistBudget", 0))
+                         budget=observation.get("specialistBudget", 0),
+                         own_carriers=observation.get("ownCarriers"),
+                         credits=observation.get("credits"))
         out = self.model(b, sample=bool(self.sample))
 
         if self.sample:
