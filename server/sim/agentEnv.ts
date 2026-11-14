@@ -512,6 +512,63 @@ export class AgentEnv {
         }
     }
 
+    // Try other order weights for one seat on copies of the game: for each
+    // plan, play a copy forward `ticks` ticks with the seat's decision's
+    // order weights replaced by the plan's, everyone else playing as they
+    // are, and report where every player stands then. The game itself, the
+    // seats' memories and the random numbers it would have drawn are left
+    // as they were. Each copy draws the same random numbers (from `seed`),
+    // so plans differ only by what they do.
+    async lookahead(
+        index: number,
+        plans: Record<string, number>[],
+        ticks: number,
+        seed = 1,
+    ) {
+        const seat = this._seat(index);
+        const game = this.game;
+        const random = Math.random;
+        const saved = [...this.seats.values()].map((s) => ({
+            seat: s,
+            player: s.player,
+            decision: s.decision,
+            memory: s.memory,
+        }));
+
+        const results: ReturnType<AgentEnv["standings"]>["players"][] = [];
+        try {
+            for (const plan of plans) {
+                const copy = this.engine.clone(game);
+                const byId = new Map(
+                    copy.galaxy.players.map((p) => [p._id.toString(), p]),
+                );
+                for (const s of saved) {
+                    s.seat.player = byId.get(s.player._id.toString())!;
+                    s.seat.memory = s.memory.copy();
+                    s.seat.decision = s.decision;
+                }
+                seat.decision = { ...seat.decision, orderWeights: plan };
+
+                this.game = copy;
+                this.engine.seed(seed);
+                const end = Math.min(game.state.tick + ticks, this.maxTicks);
+                while (!copy.state.endDate && copy.state.tick < end) {
+                    await this.engine.tick(copy, 1);
+                }
+                results.push(this.standings().players);
+            }
+        } finally {
+            this.game = game;
+            Math.random = random;
+            for (const s of saved) {
+                s.seat.player = s.player;
+                s.seat.decision = s.decision;
+                s.seat.memory = s.memory;
+            }
+        }
+        return results;
+    }
+
     // Advance until a seat needs a decision or the game ends.
     async step(): Promise<StepResult> {
         while (!this._isDone()) {

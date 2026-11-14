@@ -33,6 +33,17 @@ export class SeatMemory {
         this.specialist = new Uint8Array(stars);
     }
 
+    // An independent copy, for playing a copy of the game forward.
+    copy(): SeatMemory {
+        const m = new SeatMemory(this.ships.length);
+        m.seenTick.set(this.seenTick);
+        m.ships.set(this.ships);
+        m.infrastructure.set(this.infrastructure);
+        m.warpGate.set(this.warpGate);
+        m.specialist.set(this.specialist);
+        return m;
+    }
+
     update(
         engine: SimEngine,
         game: Game,
