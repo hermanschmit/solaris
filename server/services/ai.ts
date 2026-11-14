@@ -587,6 +587,10 @@ export default class AIService {
             playerStars,
             this._getHyperspaceRangeExternal(game, player),
         );
+        // Unowned stars are claimed within this range.
+        const claimRange = this.getConfig(game, player).claimToHyperspaceRange
+            ? this._getHyperspaceRangeInternal(game, player)
+            : this._getHyperspaceRangeExternal(game, player);
         // All stars (unowned or owned by this player) that can be reached from player stars
         const freelyReachableFromPlayerStars = this._computeStarGraph(
             starsById,
@@ -594,7 +598,7 @@ export default class AIService {
             player,
             playerStars,
             traversableStars,
-            this._getHyperspaceRangeExternal(game, player),
+            claimRange,
         );
         // Player stars reachable from player stars
         const reachablePlayerStars = this._computeStarGraph(
@@ -612,7 +616,7 @@ export default class AIService {
             player,
             traversableStars,
             traversableStars,
-            this._getHyperspaceRangeExternal(game, player),
+            claimRange,
         );
         // All stars that can be reached from player stars with globally highest range tech
         const starsInGlobalRange = this._computeStarGraph(

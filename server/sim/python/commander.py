@@ -62,6 +62,11 @@ POSTURE_PRIOR = 2.0  # "none" starts this far ahead: picked ~70% of the time
 # 72 seeds) and cuts a game's decisions per seat from hundreds to ~25.
 HOLD_ORDERS = True
 
+# Commander seats claim out to their full hyperspace range and keep an
+# Explorer carrier claiming stars beyond it (AgentEnv._explore). Over 72
+# scripted seeds with ema580: 2.85 against 3.00 without (-0.15 +- 0.11).
+EXPLORE = True
+
 # Spending plans: the share of credits upgraded at the start of each cycle
 # (science, industry) and of what is left at its end (economy). The first
 # is the built-in AI's; "save" keeps credits for carriers.
@@ -118,6 +123,7 @@ def knob_values(outputs, plan=0):
         value = default + scale * x if how == "add" else default * math.exp(scale * x)
         value = min(max(value, lo), hi)
         config[name] = round(value) if how == "add" else value
+    config["claimToHyperspaceRange"] = EXPLORE
     # The spending split cannot exceed the whole budget.
     over = config["firstTickSciencePercentage"] + config["firstTickIndustryPercentage"] - 100
     if over > 0:
@@ -428,7 +434,8 @@ class CommanderAgent:
         cands = observation["candidates"]
         if not self.wants_frame(observation, seat):
             held = self.held[seat]
-            return {"orderWeights": {c["key"]: held.get(c["key"], 1.0) for c in cands}}, None
+            return {"orderWeights": {c["key"]: held.get(c["key"], 1.0) for c in cands},
+                    "explore": EXPLORE}, None
         b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn,
                          affordable=observation.get("affordableStarSpecialists", ()),
                          budget=observation.get("specialistBudget", 0))
@@ -449,7 +456,8 @@ class CommanderAgent:
         logp, _ = self.model.log_prob(out, b, act)
 
         weights = torch.exp(act["order"][0]).tolist()
-        decision = {"orderWeights": {c["key"]: w for c, w in zip(cands, weights)}}
+        decision = {"orderWeights": {c["key"]: w for c, w in zip(cands, weights)},
+                    "explore": EXPLORE}
         if self.hold:
             self.held[seat] = decision["orderWeights"]
         if research_turn:

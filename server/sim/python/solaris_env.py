@@ -109,6 +109,12 @@ class SolarisEnv:
     def standings(self):
         return self._call("standings")
 
+    def lookahead(self, seat, plans, ticks, seed=1):
+        """Play copies of the game forward `ticks` ticks, one per plan (a
+        dict of order weights that replaces the seat's own), and return
+        standings()["players"] for each. The game itself is unchanged."""
+        return self._call("lookahead", seat=seat, plans=plans, ticks=ticks, seed=seed)
+
     def close(self):
         if self._proc.poll() is None:
             self._proc.stdin.close()

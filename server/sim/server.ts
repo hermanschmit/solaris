@@ -15,6 +15,9 @@
 //   act       {seat, decision}         -> null
 //   step      {}                       -> {tick, done, seats}
 //   standings {}                       -> each seat's stars and ships, winner
+//   lookahead {seat, plans, ticks, seed?} -> standings' players, per plan,
+//             after playing a copy of the game forward with each plan's
+//             order weights for the seat
 //
 // Anything else the server code prints goes to stderr, so stdout carries
 // only replies.
@@ -54,6 +57,8 @@ const main = async () => {
             return null;
         },
         step: () => env.step(),
+        lookahead: (args) =>
+            env.lookahead(args.seat, args.plans, args.ticks, args.seed),
         standings: () => env.standings(),
     };
 

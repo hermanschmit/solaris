@@ -37,6 +37,9 @@ export interface AiConfig {
     carrierReserveEconomyMultiplier: number;
     // Maximum travel time for invasions and claims, in cycles.
     orderReachCycles: number;
+    // Claim unowned stars out to the full hyperspace range, rather than
+    // only within the smaller of hyperspace and scanning range.
+    claimToHyperspaceRange: boolean;
     // Weights for scoring a star by its infrastructure.
     starValueWeights: {
         economy: number;
@@ -60,6 +63,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
     logisticStockpileCycles: 0.7,
     carrierReserveEconomyMultiplier: 5,
     orderReachCycles: 2,
+    claimToHyperspaceRange: false,
     starValueWeights: {
         economy: 1,
         industry: 2,
