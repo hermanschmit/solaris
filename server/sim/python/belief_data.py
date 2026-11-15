@@ -85,6 +85,27 @@ def load(path):
     return header, arrays
 
 
+STAR_TYPES = ["isNebula", "isPulsar", "isBlackHole", "isAsteroidField", "isBinaryStar",
+              "hasWormHole"]
+N_QUALITY = 3 + len(STAR_TYPES)
+
+
+def star_quality(stars):
+    """What every player knows of each star from the start [S, N_QUALITY]:
+    its natural resources (economy, industry, science; hidden for nebulas,
+    as the game hides them) and its type. Headers from before a type was
+    recorded read it as absent."""
+    out = np.zeros((len(stars), N_QUALITY), np.float32)
+    for i, s in enumerate(stars):
+        nr = s.get("naturalResources") or {}
+        if not isinstance(nr, dict):
+            nr = {"economy": nr, "industry": nr, "science": nr}
+        if not s.get("isNebula"):
+            out[i, :3] = [np.log1p(max(nr.get(k) or 0, 0)) / 5 for k in ("economy", "industry", "science")]
+        out[i, 3:] = [float(bool(s.get(t))) for t in STAR_TYPES]
+    return out
+
+
 class Static:
     """What never changes in a game: star positions, distances, ranges."""
 
@@ -103,6 +124,7 @@ class Static:
         self.hyper_range = np.array(h["hyperspaceRange"])
         self._hs = self.techs.index("hyperspace") if "hyperspace" in self.techs else None
         self._paths = {}
+        self.quality = star_quality(h["stars"])
 
     def paths(self, level):
         """Travel ticks between every pair of stars for a carrier with the

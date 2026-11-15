@@ -174,6 +174,8 @@ class Commander(nn.Module):
         # credits, and the ships each order needs against the ships near
         # it. All start at zero, so older checkpoints play as before.
         self.fleet_head = mlp(N_FLEET, d, hidden=32)
+        # Each star's natural resources and type, also zero at the start.
+        self.quality_head = mlp(bd.N_QUALITY, d, hidden=32)
         self.credits_head = mlp(1, n_global_dims(d, n_player), hidden=32)
         self.order_ships_head = mlp(d + len(ORDER_KINDS) + 2 + N_ORDER_SHIPS, 1, hidden=64)
         self.order_log_std = nn.Parameter(torch.tensor(math.log(INITIAL_STD)))
@@ -241,6 +243,8 @@ class Commander(nn.Module):
         _, _, h = self.trunk.encode(b)
         if "own_fleet" in b:
             h = h + self.fleet_head(torch.log1p(b["own_fleet"]) / 4)
+        if "star_quality" in b:
+            h = h + self.quality_head(b["star_quality"])
         g = self._global(h, b)
         if "credits" in b:
             g = g + self.credits_head(torch.log1p(b["credits"]).unsqueeze(-1) / 8)
@@ -423,6 +427,7 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
         cand_needed=t(needed),
         cand_nearby=t(nearby),
         own_fleet=t(fleet),
+        star_quality=t(static.quality),
         credits=t(float(credits or 0)),
         research_turn=t(float(research_turn)),
         spec_mask=t(spec_mask, torch.bool),
