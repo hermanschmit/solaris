@@ -74,7 +74,7 @@ MAX_TICKS = int(os.environ.get("PPO_MAX_TICKS", 3000))  # shorter games, for try
 
 POLICY_KEYS = ["star_x", "player_x", "owner", "time", "cand_star", "cand_kind",
                "cand_score", "cand_ticks", "cand_mask", "research_turn", "spec_mask",
-               "spec_budget", "cand_needed", "cand_nearby", "own_fleet", "credits"]
+               "spec_budget", "cand_needed", "cand_nearby", "own_fleet", "credits", "star_quality"]
 TRUTH_KEYS = ["star_x", "player_x", "owner", "time"]
 
 
