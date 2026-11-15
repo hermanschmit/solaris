@@ -104,8 +104,12 @@ export interface Observation {
         id: string;
         ships: number;
         orbiting: number;
+        // The star it is flying to next, -1 when it has no waypoints.
+        destination: number;
         specialist: number;
     }[];
+    // The seat's credits.
+    credits: number;
 }
 
 export interface StepResult {
@@ -506,6 +510,10 @@ export class AgentEnv {
         const ticks = this.game.settings.galaxy.productionTicks;
         const tick = this.game.state.tick;
 
+        const starIndex = (id: any) =>
+            this.game.galaxy.stars.findIndex(
+                (s) => s._id.toString() === id.toString(),
+            );
         const observation: Observation = {
             seat: index,
             tick,
@@ -548,8 +556,12 @@ export class AgentEnv {
                                   s._id.toString() === c.orbiting!.toString(),
                           )
                         : -1,
+                    destination: c.waypoints?.length
+                        ? starIndex(c.waypoints[0].destination)
+                        : -1,
                     specialist: c.specialistId ?? 0,
                 })),
+            credits: seat.player.credits ?? 0,
         };
 
         if (options.frame) {

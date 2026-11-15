@@ -62,7 +62,8 @@ def load_commander(model, state):
     choices alone."""
     missing, unexpected = model.load_state_dict(state, strict=False)
     new_heads = ("plan_head.", "specialist_head.", "specialist_star_head.", "posture_head.",
-                 "target_head.", "no_target_head.", "strategy_order_head.")
+                 "target_head.", "no_target_head.", "strategy_order_head.",
+                 "fleet_head.", "credits_head.", "order_ships_head.")
     if unexpected or any(not k.startswith(new_heads) for k in missing):
         raise ValueError(f"Checkpoint does not fit: missing {missing}, unexpected {unexpected}")
 

@@ -88,6 +88,13 @@ export interface AiOrderCandidate {
     star: string;
     score: number;
     ticksUntil?: number;
+    // Ships the order takes: for an invasion, the ships needed to win
+    // against what the player sees at the star (before the attack
+    // margin); for a defense, the attackers seen coming; 1 for a claim.
+    shipsNeeded: number;
+    // The player's ships, at its stars and on carriers orbiting them, one
+    // hyperspace jump from the star (including the star itself).
+    shipsNearby: number;
 }
 
 type StarGraph = Map<string, Set<string>>;
@@ -261,15 +268,55 @@ export default class AIService {
             this._setInitialState(game, player);
         }
 
-        return this._gatherOrders(game, player, context).map((order) => ({
-            key: this._orderKey(order),
-            kind: this._orderKind(order),
-            star: order.star,
-            score: order.score,
-            ...(order.type === AiAction.DefendStar
-                ? { ticksUntil: order.ticksUntil }
-                : {}),
-        }));
+        const playerId = player._id.toString();
+        const shipsAt = (starId: string) => {
+            const star = context.starsById.get(starId);
+            if (star?.ownedByPlayerId?.toString() !== playerId) return 0;
+            const carriers = context.carriersOrbiting.get(starId) ?? [];
+            return (
+                (star.shipsActual ?? star.ships ?? 0) +
+                carriers
+                    .filter((c) => c.ownedByPlayerId?.toString() === playerId)
+                    .reduce((a, c) => a + (c.ships ?? 0), 0)
+            );
+        };
+
+        return this._gatherOrders(game, player, context).map((order) => {
+            let shipsNeeded = 1;
+            if (order.type === AiAction.InvadeStar) {
+                shipsNeeded =
+                    this._calculateRequiredShipsForAttack(
+                        game,
+                        player,
+                        context,
+                        context.starsById.get(order.star)!,
+                        0,
+                    ) || 1;
+            } else if (order.type === AiAction.DefendStar) {
+                shipsNeeded = order.incomingCarriers.reduce(
+                    (a, c) => a + (c.ships ?? 0),
+                    0,
+                );
+            }
+
+            let shipsNearby = shipsAt(order.star);
+            for (const id of context.allCanReachPlayerStars.get(order.star) ??
+                []) {
+                if (id !== order.star) shipsNearby += shipsAt(id);
+            }
+
+            return {
+                key: this._orderKey(order),
+                kind: this._orderKind(order),
+                star: order.star,
+                score: order.score,
+                ...(order.type === AiAction.DefendStar
+                    ? { ticksUntil: order.ticksUntil }
+                    : {}),
+                shipsNeeded,
+                shipsNearby,
+            };
+        });
     }
 
     _orderKind(order: Order): AiOrderCandidate["kind"] {
