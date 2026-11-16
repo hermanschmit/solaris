@@ -1,7 +1,7 @@
 """Python client for the Solaris simulator's agent environment.
 
-Starts `npx tsx sim/server.ts` as a subprocess and talks to it over JSON
-lines. Needs only the standard library.
+Starts `node <tsx> sim/server.ts` (tsx from the workspace's node_modules, or
+else `npx tsx`) as a subprocess and talks to it over JSON lines. Needs only the standard library.
 
     from solaris_env import SolarisEnv
 
@@ -22,6 +22,18 @@ import subprocess
 SERVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+def _default_command(server_dir):
+    """Run tsx's CLI with node directly when it is installed (in server/ or,
+    with npm workspaces, the repository root): npx can stop to print
+    notices or ask questions, which the simulator's pipe never answers."""
+    for root in (server_dir, os.path.dirname(server_dir)):
+        cli = os.path.join(root, "node_modules", "tsx", "dist", "cli.mjs")
+        if os.path.exists(cli):
+            return ["node", cli, "sim/server.ts"], False
+    # On Windows, npx is a batch file and needs a shell.
+    return ["npx", "tsx", "sim/server.ts"], os.name == "nt"
+
+
 class SolarisError(RuntimeError):
     pass
 
@@ -29,15 +41,17 @@ class SolarisError(RuntimeError):
 class SolarisEnv:
     def __init__(self, server_dir=SERVER_DIR, command=None):
         self._next_id = 0
+        shell = False
+        if command is None:
+            command, shell = _default_command(server_dir)
         self._proc = subprocess.Popen(
-            command or ["npx", "tsx", "sim/server.ts"],
+            command,
             cwd=server_dir,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
             bufsize=1,
-            # On Windows, npx is a batch file and needs a shell.
-            shell=(os.name == "nt" and command is None),
+            shell=shell,
         )
 
     def _call(self, cmd, **args):
