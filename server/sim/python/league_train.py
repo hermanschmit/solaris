@@ -8,7 +8,8 @@ the first league member, and the learner starts from it.
 
 Each game seats the learner in LEARNER_SEATS random seats, league members
 in OPPONENT_SEATS more (each picked separately), and the built-in AI in the
-rest. Members play their most likely decisions under fog, like the learner.
+rest; in PERSONA_SHARE of games, some of those play a flawed persona
+(personas.py). Members play their most likely decisions under fog, like the learner.
 Members the learner does badly against are picked more often, so it keeps
 working on what it cannot yet beat. Every SNAPSHOT_EVERY iterations the
 learner joins the league as a new member.
@@ -40,6 +41,7 @@ import numpy as np
 import torch
 
 import commander_rollout as cr
+import personas as pa
 import ppo_train as pt
 
 LEARNER_SEATS = 3
@@ -50,6 +52,10 @@ FIRST_SEED = 2_000_000
 RATE_DECAY = 0.7  # per iteration: how fast the learner's record against a member follows new games
 HARD_POWER = 2.0  # members are picked in proportion to (1 - rate) ** HARD_POWER ...
 MIN_PICK = 0.05  # ... plus this, so none is dropped entirely
+# In this share of games, 1 or 2 of the built-in AI seats play a flawed
+# persona (personas.TRAIN), so the learner practises punishing mistakes;
+# the other games are as before, so it keeps practising against sound play.
+PERSONA_SHARE = 0.5
 
 
 def load_league(run_dir):
@@ -88,26 +94,34 @@ def game_maker(run_dir, league):
         members = rng.choice(len(league["members"]), OPPONENT_SEATS, p=pick_weights(league))
         opponents = {int(s): int(m) for s, m in
                      zip(seats[LEARNER_SEATS:LEARNER_SEATS + OPPONENT_SEATS], members)}
+        builtin = seats[LEARNER_SEATS + OPPONENT_SEATS:]
+        flawed = {}
+        if rng.random() < PERSONA_SHARE:
+            flawed = pa.assign(rng, builtin[:int(rng.integers(1, 3))])
         out = Path(run_dir) / f"iter_{i}"
         out.mkdir(parents=True, exist_ok=True)
         (Path(run_dir) / "belief").mkdir(exist_ok=True)
         record = (str(Path(run_dir) / "belief" / f"g{seed}.sbd")
                   if seed % RECORD_EVERY == 0 else None)
         return (str(out), seed, str(pt.ckpt_path(run_dir, i)), learner, opponents,
-                [m["path"] for m in league["members"]], record)
+                [m["path"] for m in league["members"]], record, flawed)
     return make_job
 
 
 def _game_job(args):
-    out, seed, checkpoint, learner, opponents, paths, record = args
+    out, seed, checkpoint, learner, opponents, paths, record, flawed = args
     path = Path(out) / f"r{seed}.npz"
     if not path.exists():
         arrays = cr.play(seed, belief=None, checkpoint=checkpoint, max_ticks=pt.MAX_TICKS,
                          agents=learner, opponents={s: paths[m] for s, m in opponents.items()},
-                         record=record)
+                         record=record,
+                         ai_configs={s: config for s, (_, config) in flawed.items()})
         # Which league member sat where, for scoring the learner against it.
         arrays["opponent_seats"] = np.array(list(opponents), int)
         arrays["opponent_members"] = np.array(list(opponents.values()), int)
+        # Which built-in seats played a flawed persona, for league_elo.py.
+        arrays["persona_seats"] = np.array(list(flawed), int)
+        arrays["persona_names"] = np.array([name for name, _ in flawed.values()], dtype="U16")
         np.savez_compressed(str(path) + ".tmp.npz", **arrays)
         os.replace(str(path) + ".tmp.npz", path)
     return path
