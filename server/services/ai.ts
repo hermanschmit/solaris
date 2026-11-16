@@ -1689,8 +1689,7 @@ export default class AIService {
 
         // A careless player (AiConfig.ignoreDefenderWeapons) sizes attacks
         // on ship counts alone.
-        const careless =
-            this.getConfig(game, player).ignoreDefenderWeapons;
+        const careless = this.getConfig(game, player).ignoreDefenderWeapons;
         return this.combatService.calculateBasic(
             {
                 ships: shipsAtArrival,
