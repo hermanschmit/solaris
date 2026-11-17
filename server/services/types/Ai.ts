@@ -40,6 +40,20 @@ export interface AiConfig {
     // Claim unowned stars out to the full hyperspace range, rather than
     // only within the smaller of hyperspace and scanning range.
     claimToHyperspaceRange: boolean;
+    // Human-like flaws, for training against imperfect opponents. All off
+    // by default.
+    // Act only every this many ticks, as a player who checks in now and
+    // then; spending missed at the cycle's edges is done at the next
+    // check-in.
+    actEveryTicks: number;
+    // Each cycle, ignore this share of the orders, picked at random.
+    orderDropout: number;
+    // Each cycle, multiply each order's score by exp(orderNoise * a
+    // standard normal draw).
+    orderNoise: number;
+    // Size attacks as if the defender's weapons matched one's own and
+    // there were no defender bonus.
+    ignoreDefenderWeapons: boolean;
     // Weights for scoring a star by its infrastructure.
     starValueWeights: {
         economy: number;
@@ -64,6 +78,10 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
     carrierReserveEconomyMultiplier: 5,
     orderReachCycles: 2,
     claimToHyperspaceRange: false,
+    actEveryTicks: 1,
+    orderDropout: 0,
+    orderNoise: 0,
+    ignoreDefenderWeapons: false,
     starValueWeights: {
         economy: 1,
         industry: 2,

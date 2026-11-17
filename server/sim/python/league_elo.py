@@ -11,7 +11,8 @@ a 400-point gap means 10 to 1 odds), with the built-in AI pinned at 1000.
 The learner changes every iteration, so it is rated in blocks of `block`
 iterations (default 10, the same as SNAPSHOT_EVERY): "learner 100-109" is
 the checkpoints that played iterations 100 to 109. Members are frozen, so
-each is one player throughout.
+each is one player throughout. Built-in AI seats playing a flawed persona
+(personas.py) are rated per persona.
 
 Nothing here changes training; run it while a league trains. Results
 within one game are not independent, so the ± (a bootstrap over games)
@@ -52,6 +53,9 @@ def results(run_dir, block):
                     who[int(s)] = learner
                 for s, m in zip(z["opponent_seats"], z["opponent_members"]):
                     who[int(s)] = names[int(m)]
+                if "persona_seats" in z.files:
+                    for s, name in zip(z["persona_seats"], z["persona_names"]):
+                        who[int(s)] = f"persona {name}"
             except (OSError, ValueError, KeyError, IndexError):
                 continue  # a game still being written
             pairs = [(who[a], who[b]) if place[a] < place[b] else (who[b], who[a])
@@ -103,7 +107,8 @@ def main():
 
     def order(p):
         m = re.search(r"(\d+)", p)
-        return (p == BUILTIN, p.startswith("learner"), int(m.group(1)) if m else -1)
+        return (p == BUILTIN, p.startswith("persona"), p.startswith("learner"),
+                int(m.group(1)) if m else -1, p)
 
     print(f"{len(games)} games\n")
     print(f"{'player':<22}{'rating':>8}{'±':>6}{'games':>7}")

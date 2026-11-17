@@ -21,6 +21,23 @@ EVAL_B_EVERY iterations it also plays a second, separate set of seeds
 (set "b"), to show whether gains on the first set hold on games it has
 never been judged on.
 
+With EVAL_REFERENCE set to a frozen checkpoint, the evaluations every
+EVAL_B_EVERY iterations also compare the commander with that reference,
+seed by seed (the reference's games are played once and kept in
+run_dir/ref_<set>.json):
+
+  a, b    the sets above, against the reference's placements on them: the
+          guardrail against getting worse at the built-in AI
+  c       seeds where every other seat is a flawed persona used in
+          training (personas.TRAIN)
+  d       the same with personas never trained against (personas.HELD_OUT)
+  h2h     3 seats against 3 of the reference's own, with the built-in AI in
+          the rest: the share of pairings the commander places above
+
+A checkpoint is promoted (copied to run_dir/best.pt, recorded in
+best.jsonl) when it is no worse than the reference on a and b, by more
+than PAIRED_NOISE, and better on c by more than one standard error.
+
 What is evaluated is a running average of the commander's weights over
 recent iterations (EMA_DECAY), kept in each checkpoint and saved as
 ema_<i>.pt: it changes less from one iteration to the next than the
@@ -49,6 +66,7 @@ import torch
 import belief_data as bd
 import commander as cm
 import commander_rollout as cr
+import personas as pa
 
 GAMMA = 0.998  # per tick; a seat decides about once a cycle (20 ticks)
 LAMBDA = 0.95
@@ -68,6 +86,11 @@ EVAL_EVERY = 5
 EVAL_FIRST_SEED = 1  # evaluation seeds; training seeds start far above
 EVAL_B_FIRST_SEED = 500_000  # the second evaluation set
 EVAL_B_EVERY = 20
+EVAL_REFERENCE = os.environ.get("EVAL_REFERENCE")  # a frozen checkpoint to compare with
+# Set name -> (first seed, persona pool, head-to-head against the reference).
+PAIRED_SETS = {"c": (600_000, "TRAIN", False), "d": (650_000, "HELD_OUT", False),
+               "h2h": (700_000, None, True)}
+PAIRED_NOISE = 0.1  # how much worse than the reference on a or b still counts as no worse
 EMA_DECAY = 0.8  # per iteration: about the last five iterations' weights
 TRAIN_FIRST_SEED = 1_000_000
 MAX_TICKS = int(os.environ.get("PPO_MAX_TICKS", 3000))  # shorter games, for trying it out
@@ -368,32 +391,123 @@ def _eval_job(args):
     return seed, checkpoint, cr.play_eval(seed, SEATS, checkpoint, MAX_TICKS, sample)
 
 
-def evaluate(run_dir, i, games, workers, pool=None, second=False):
+def _paired_job(args):
+    seed, checkpoint, personas, opponent = args
+    return seed, checkpoint, cr.play_eval(seed, SEATS, checkpoint, MAX_TICKS, False,
+                                          getattr(pa, personas) if personas else None,
+                                          opponent)
+
+
+def _run(pool, jobs):
+    """Placements per (checkpoint, seed) for _paired_job jobs."""
+    out = {}
+    for seed, checkpoint, places in pool.imap_unordered(_paired_job, jobs):
+        out[(checkpoint, seed)] = places
+    return out
+
+
+def reference_places(run_dir, name, reference, seeds, pool, personas=None):
+    """The reference's placements on a set, played once and kept."""
+    path = Path(run_dir) / f"ref_{name}.json"
+    ref = json.loads(path.read_text()) if path.exists() else {}
+    if ref.get("reference") != str(reference):
+        ref = {"reference": str(reference), "seeds": {}}
+    todo = [(s, str(reference), personas, None) for s in seeds if str(s) not in ref["seeds"]]
+    if todo:
+        print(f"  playing the reference on set {name} ({len(todo)} games)", flush=True)
+        for (_, seed), places in _run(pool, todo).items():
+            ref["seeds"][str(seed)] = [places[k] for k in sorted(places) if k >= 0]
+        path.write_text(json.dumps(ref))
+    return {int(k): v for k, v in ref["seeds"].items()}
+
+
+def paired(ours, ref):
+    """Mean placement change from the reference, seed by seed (lower is
+    better), with its standard error."""
+    d = np.array([np.mean(ours[s]) - np.mean(ref[s]) for s in ours])
+    return {"placement": float(np.mean([x for s in ours for x in ours[s]])),
+            "ref_placement": float(np.mean([x for s in ours for x in ref[s]])),
+            "change": float(d.mean()), "se": float(d.std() / max(len(d), 1) ** 0.5)}
+
+
+def evaluate_against_reference(run_dir, i, checkpoint, ours_a, ours_b, games, pool, log):
+    """The paired evaluations against EVAL_REFERENCE, and promotion."""
+    reference = EVAL_REFERENCE
+    results = {}
+    for name, ours, first in (("a", ours_a, EVAL_FIRST_SEED), ("b", ours_b, EVAL_B_FIRST_SEED)):
+        ref = reference_places(run_dir, name, reference, range(first, first + games), pool)
+        results[name] = paired(ours, ref)
+    for name, (first, personas, h2h) in PAIRED_SETS.items():
+        seeds = range(first, first + games)
+        print(f"evaluating ckpt_{i} against the reference on set {name}", flush=True)
+        played = _run(pool, [(s, str(checkpoint), personas, reference if h2h else None)
+                             for s in seeds])
+        if h2h:
+            pairs = [float(a < b) for places in played.values()
+                     for k, a in places.items() if k >= 0
+                     for j, b in places.items() if j < 0]
+            mine = [p for places in played.values() for k, p in places.items() if k >= 0]
+            theirs = [p for places in played.values() for k, p in places.items() if k < 0]
+            results[name] = {"placed_above": float(np.mean(pairs)),
+                             "se": float(np.std(pairs) / len(pairs) ** 0.5),
+                             "placement": float(np.mean(mine)),
+                             "ref_placement": float(np.mean(theirs))}
+            continue
+        ours = {seed: [p[k] for k in sorted(p) if k >= 0] for (_, seed), p in played.items()}
+        ref = reference_places(run_dir, name, reference, seeds, pool, personas)
+        results[name] = paired(ours, ref)
+    promoted = (results["a"]["change"] <= PAIRED_NOISE
+                and results["b"]["change"] <= PAIRED_NOISE
+                and results["c"]["change"] < -results["c"]["se"])
+    record = {"iteration": i, "reference": str(reference), "promoted": promoted,
+              **{f"{name}_{k}": round(v, 3) for name, r in results.items() for k, v in r.items()}}
+    log("eval_ref.jsonl", record)
+    if promoted:
+        import shutil
+        shutil.copy(checkpoint, Path(run_dir) / "best.pt")
+        with open(Path(run_dir) / "best.jsonl", "a") as f:
+            f.write(json.dumps(record) + "\n")
+        print(f"  ckpt_{i} promoted to best.pt", flush=True)
+
+
+def evaluate(run_dir, i, games, workers, pool=None, second=False, keep=None):
     """Evaluate the average weights after iteration i (or, before there
     is an average, the checkpoint itself) on the first evaluation set, or
     on the second."""
     checkpoint = ema_path(run_dir, i) if ema_path(run_dir, i).exists() else ckpt_path(run_dir, i)
     weights = "ema" if checkpoint == ema_path(run_dir, i) else "trained"
+    if keep is not None:
+        keep["checkpoint"] = checkpoint
     if second:
         return {"iteration": i, "set": "b", "weights": weights, **evaluate_checkpoint(
             checkpoint, Path(run_dir) / "eval_baseline_b.json", games, workers, pool,
-            first_seed=EVAL_B_FIRST_SEED)}
+            first_seed=EVAL_B_FIRST_SEED, keep=keep)}
     return {"iteration": i, "weights": weights, **evaluate_checkpoint(
-        checkpoint, Path(run_dir) / "eval_baseline.json", games, workers, pool)}
+        checkpoint, Path(run_dir) / "eval_baseline.json", games, workers, pool, keep=keep)}
 
 
 def evaluations(run_dir, i, games, workers, pool, log):
     """The evaluations due after iteration i, logged to eval.jsonl."""
+    kept_a, kept_b = {}, {}
     if games and i % EVAL_EVERY == 0:
         print(f"evaluating ckpt_{i} against the built-in AI", flush=True)
-        log("eval.jsonl", evaluate(run_dir, i, games, workers, pool))
+        log("eval.jsonl", evaluate(run_dir, i, games, workers, pool, keep=kept_a))
     if games and i % EVAL_B_EVERY == 0:
         print(f"evaluating ckpt_{i} on the second set", flush=True)
-        log("eval.jsonl", evaluate(run_dir, i, games, workers, pool, second=True))
+        log("eval.jsonl", evaluate(run_dir, i, games, workers, pool, second=True, keep=kept_b))
+        if EVAL_REFERENCE:
+            own_pool = pool is None
+            pool = pool or Pool(workers)
+            try:
+                evaluate_against_reference(run_dir, i, kept_b["checkpoint"], kept_a["ours"],
+                                           kept_b["ours"], games, pool, log)
+            finally:
+                if own_pool:
+                    pool.terminate()
 
 
 def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None, sample=False,
-                        first_seed=EVAL_FIRST_SEED):
+                        first_seed=EVAL_FIRST_SEED, keep=None):
     """Placements of the commander's seats over the evaluation seeds,
     against the built-in AI (seeing everything) in the same seats. The
     built-in AI's games are kept in base_path, to be played only once.
@@ -419,6 +533,8 @@ def evaluate_checkpoint(checkpoint, base_path, games, workers, pool=None, sample
             pool.terminate()
     base_path.write_text(json.dumps(base))
 
+    if keep is not None:
+        keep["ours"] = ours
     pairs = [(a, b) for s in seeds for a, b in zip(ours[s], base[str(s)])]
     mine, theirs = [a for a, _ in pairs], [b for _, b in pairs]
     return {"games": games, "placement": float(np.mean(mine)),

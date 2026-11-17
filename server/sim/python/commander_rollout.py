@@ -78,13 +78,14 @@ def observe(env, agent, seat, truth_frame=False):
 
 
 def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=None,
-         opponents=None, record=None):
+         opponents=None, record=None, ai_configs=None):
     """Play a game with the commander being trained in `agents` (or
     `seats` random seats), sampling its decisions, and record them.
     `opponents` maps other seats to frozen commander checkpoints, which
     play their most likely decisions under fog; the built-in AI plays the
-    rest. With `record`, the game is also saved there for belief-model
-    training."""
+    rest, tuned per seat by `ai_configs` ({seat: AiConfig overrides}, see
+    personas.py). With `record`, the game is also saved there for
+    belief-model training."""
     torch.set_num_threads(1)
     rng = np.random.default_rng(seed)
     opponents = opponents or {}
@@ -92,7 +93,8 @@ def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=Non
         agents = sorted(int(s) for s in rng.choice(10, seats, replace=False))
     with SolarisEnv() as env:
         result = env.reset(agents=sorted(list(agents) + list(opponents)), seed=seed,
-                           max_ticks=max_ticks, fog=True, record=record)
+                           max_ticks=max_ticks, fog=True, record=record,
+                           ai_configs=ai_configs)
         static = bd.Static(env.header())
         model = build_model(len(static.techs), belief, checkpoint)
         agent = cm.CommanderAgent(model, static, sample=True)
@@ -181,28 +183,49 @@ def eval_seats(seed, seats=3):
     return sorted(int(s) for s in rng.choice(10, seats, replace=False))
 
 
-def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False):
+def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False,
+              personas=None, opponent=None):
     """Play a seed's evaluation seats with the commander's most likely
     decisions (or as `sample` says, see CommanderAgent), under fog, and
     return their placements. Without a checkpoint, the built-in AI plays
-    every seat with the whole game in view: the bar to beat."""
+    every seat with the whole game in view: the bar to beat.
+
+    personas (a personas.py pool) gives every other built-in seat a flawed
+    persona, the same ones for every checkpoint on a seed. opponent (a
+    checkpoint) plays `seats` more seats, picked by the seed, with its most
+    likely decisions; their placements come back under negative keys
+    (-1 - seat), for head-to-head scoring."""
+    import personas as pa
     torch.set_num_threads(1)
     torch.manual_seed(seed)
     agents = eval_seats(seed, seats)
+    rng = np.random.default_rng(seed + 7_919)
+    others = [s for s in rng.permutation(10).tolist() if s not in agents]
+    rivals = sorted(others[:seats]) if opponent else []
+    ai_configs, names = {}, {}
+    if personas:
+        for s, (name, config) in pa.assign(rng, [s for s in others if s not in rivals],
+                                           personas).items():
+            ai_configs[s], names[s] = config, name
     with SolarisEnv() as env:
-        result = env.reset(agents=agents if checkpoint else [], seed=seed,
-                           max_ticks=max_ticks, fog=True)
+        result = env.reset(agents=sorted(agents + rivals) if checkpoint else [], seed=seed,
+                           max_ticks=max_ticks, fog=True, ai_configs=ai_configs)
         if checkpoint:
             static = bd.Static(env.header())
             agent = cm.CommanderAgent(build_model(len(static.techs), None, checkpoint), static,
                                       sample=sample)
+            rival = (cm.CommanderAgent(build_model(len(static.techs), None, opponent), static)
+                     if opponent else None)
         while not result["done"]:
             for seat in result["seats"]:
-                obs = observe(env, agent, seat)
-                env.act(seat, agent.decide(obs, seat)[0])
+                who = rival if seat in rivals else agent
+                obs = observe(env, who, seat)
+                env.act(seat, who.decide(obs, seat)[0])
             result = env.step()
         place = placements(env.standings())
-    return {s: place[s] for s in agents}
+    out = {s: place[s] for s in agents}
+    out.update({-1 - s: place[s] for s in rivals})
+    return out
 
 
 def _job(args):

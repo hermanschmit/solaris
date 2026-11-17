@@ -146,7 +146,21 @@ const log = logger("AI Service");
 // This is performed automatically by mongoose (when calling game.save()).
 // Use the writeToDB parameters to skip (or introduce them where needed).
 // Otherwise, changes will get duplicated.
+// A fixed number in [0, 1) for a string (FNV-1a), for choices that must not
+// draw on Math.random and so change nothing else in the game.
+const _hashUnit = (text: string): number => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0) / 4294967296;
+};
+
 export default class AIService {
+    // The cycle of each player's last check-in, for AiConfig.actEveryTicks.
+    _checkInCycle = new Map<string, number>();
+
     starUpgradeService: StarUpgradeService;
     carrierService: CarrierService;
     starService: StarService;
@@ -335,11 +349,31 @@ export default class AIService {
     }
 
     async _play(eventService: IEventService, game: Game, player: Player) {
-        const isFirstTickOfCycle =
+        let isFirstTickOfCycle =
             game.state.tick % game.settings.galaxy.productionTicks === 1;
-        const isLastTickOfCycle =
+        let isLastTickOfCycle =
             game.state.tick % game.settings.galaxy.productionTicks ===
             game.settings.galaxy.productionTicks - 1;
+
+        // A player who only checks in now and then (AiConfig.actEveryTicks)
+        // does nothing in between, and catches up on the cycle's spending
+        // at its first check-in after production.
+        const every = this.getConfig(game, player).actEveryTicks;
+        if (every > 1) {
+            const id = player._id.toString();
+            const phase = Math.floor(_hashUnit(id) * every);
+            if ((game.state.tick + phase) % every !== 0) return;
+            const key = `${game._id.toString()}:${id}`;
+            const cycle = Math.floor(
+                game.state.tick / game.settings.galaxy.productionTicks,
+            );
+            const last = this._checkInCycle.get(key);
+            if (last !== undefined && last < cycle) {
+                isFirstTickOfCycle = true;
+                isLastTickOfCycle = true;
+            }
+            this._checkInCycle.set(key, cycle);
+        }
 
         // Considering the growing complexity of AI logic,
         // it's better to catch any possible errors and have the game continue with dysfunctional AI than to break the game tick logic.
@@ -417,6 +451,31 @@ export default class AIService {
         if (weights) {
             for (const order of orders) {
                 order.score *= weights.get(this._orderKey(order)) ?? 1;
+            }
+        }
+
+        // A sloppy player (AiConfig.orderDropout, orderNoise) overlooks some
+        // orders and misjudges the rest, differently each cycle.
+        const { orderDropout, orderNoise } = this.getConfig(game, player);
+        if (orderDropout > 0 || orderNoise > 0) {
+            const salt = `${player._id.toString()}:${Math.floor(
+                game.state.tick / game.settings.galaxy.productionTicks,
+            )}:`;
+            orders = orders.filter(
+                (order) =>
+                    _hashUnit(salt + "drop:" + this._orderKey(order)) >=
+                    orderDropout,
+            );
+            if (orderNoise > 0) {
+                for (const order of orders) {
+                    const k = salt + this._orderKey(order);
+                    const u1 = Math.max(_hashUnit(k + ":a"), 1e-12);
+                    const u2 = _hashUnit(k + ":b");
+                    const normal =
+                        Math.sqrt(-2 * Math.log(u1)) *
+                        Math.cos(2 * Math.PI * u2);
+                    order.score *= Math.exp(orderNoise * normal);
+                }
             }
         }
 
@@ -1628,17 +1687,23 @@ export default class AIService {
         const shipsAtArrival =
             (starToInvade.shipsActual || 0) + shipsOnCarriers + shipsProduced;
 
+        // A careless player (AiConfig.ignoreDefenderWeapons) sizes attacks
+        // on ship counts alone.
+        const careless = this.getConfig(game, player).ignoreDefenderWeapons;
         return this.combatService.calculateBasic(
             {
                 ships: shipsAtArrival,
-                weaponsLevel: techLevel.weapons,
+                weaponsLevel: careless
+                    ? player.research.weapons.level
+                    : techLevel.weapons,
             },
             {
                 ships: 1,
                 weaponsLevel: player.research.weapons.level,
             },
             true,
-            game.settings.specialGalaxy.defenderBonus === "enabled",
+            !careless &&
+                game.settings.specialGalaxy.defenderBonus === "enabled",
         ).attacker.shipsNeeded;
     }
 
