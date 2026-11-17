@@ -462,6 +462,13 @@ def evaluate_against_reference(run_dir, i, checkpoint, ours_a, ours_b, games, po
     record = {"iteration": i, "reference": str(reference), "promoted": promoted,
               **{f"{name}_{k}": round(v, 3) for name, r in results.items() for k, v in r.items()}}
     log("eval_ref.jsonl", record)
+    for name, r in results.items():
+        if "change" in r:
+            print(f"  iteration {i}, set {name} vs reference: placement {r['placement']:.3f} vs {r['ref_placement']:.3f}, "
+                  f"change {r['change']:+.3f} ± {r['se']:.3f}", flush=True)
+        else:
+            print(f"  iteration {i}, head to head vs reference: placed above {r['placed_above']:.3f} "
+                  f"± {r['se']:.3f}, placement {r['placement']:.3f} vs {r['ref_placement']:.3f}", flush=True)
     if promoted:
         import shutil
         shutil.copy(checkpoint, Path(run_dir) / "best.pt")
