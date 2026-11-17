@@ -67,6 +67,17 @@ HOLD_ORDERS = True
 # scripted seeds with ema580: 2.85 against 3.00 without (-0.15 +- 0.11).
 EXPLORE = True
 
+# Under fog, the executor sizes attacks on the ships it last saw at a star,
+# which is 0 at stars it has never seen (most hidden enemy stars). With
+# SEND_BELIEFS, the commander passes its trunk's ship predictions for those
+# stars instead (the trunk's star head, from the belief model). Its error
+# there is far smaller than memory's (log error 1.27 against 2.32, unbiased,
+# over 4 games). Scripted with ema580 over 144 seeds, 3 seats under fog:
+# -0.13 +- 0.07 in placement (half the predictions: -0.02 +- 0.09 over 72).
+# It changes how every checkpoint plays, so reference results cached
+# before it (ref_<set>.json) are stale.
+SEND_BELIEFS = True
+
 # Spending plans: the share of credits upgraded at the start of each cycle
 # (science, industry) and of what is left at its end (economy). The first
 # is the built-in AI's; "save" keeps credits for carriers.
@@ -240,7 +251,7 @@ class Commander(nn.Module):
         and cand_mask [B,C] (False for padding). The order weights depend
         on the cycle's strategy: strategy = (target, posture) as recorded,
         or else picked here, sampled or the most likely."""
-        _, _, h = self.trunk.encode(b)
+        star_out, _, h = self.trunk.encode(b)
         if "own_fleet" in b:
             h = h + self.fleet_head(torch.log1p(b["own_fleet"]) / 4)
         if "star_quality" in b:
@@ -298,7 +309,8 @@ class Commander(nn.Module):
         return dict(order_mu=order_mu, config_mu=config_mu, research_logits=research_logits,
                     plan_logits=plan_logits, spec_logits=spec_logits, star_logits=star_logits,
                     target_logits=target_logits, posture_logits=posture_logits,
-                    target=target, posture=posture)
+                    target=target, posture=posture,
+                    believed_ships=torch.expm1(star_out[..., bt.ST["ships"]]).clamp(min=0))
 
     def value(self, b):
         """The critic's estimate of the outcome, from the true state."""
@@ -455,6 +467,7 @@ class CommanderAgent:
         self.sample = sample
         self.hold = HOLD_ORDERS if hold is None else hold
         self.held = {}  # seat -> the order weights it holds
+        self.beliefs = {}  # seat -> believed ships, as last decided (SEND_BELIEFS)
 
     def research_turn(self, observation):
         return observation["ticksToProduction"] == self.static.cycle - 1
@@ -473,8 +486,11 @@ class CommanderAgent:
         cands = observation["candidates"]
         if not self.wants_frame(observation, seat):
             held = self.held[seat]
-            return {"orderWeights": {c["key"]: held.get(c["key"], 1.0) for c in cands},
-                    "explore": EXPLORE}, None
+            decision = {"orderWeights": {c["key"]: held.get(c["key"], 1.0) for c in cands},
+                        "explore": EXPLORE}
+            if seat in self.beliefs:
+                decision["beliefs"] = {"ships": self.beliefs[seat]}
+            return decision, None
         b = batch_inputs(self.static, observation["frame"], seat, cands, tick, research_turn,
                          affordable=observation.get("affordableStarSpecialists", ()),
                          budget=observation.get("specialistBudget", 0),
@@ -501,6 +517,13 @@ class CommanderAgent:
                     "explore": EXPLORE}
         if self.hold:
             self.held[seat] = decision["orderWeights"]
+        if SEND_BELIEFS:
+            # Only for stars never seen: elsewhere the last ships seen are
+            # the better guess, and None leaves them to the executor.
+            never = (b["star_x"][0, :, bt.SF["seen_ever"]] <= 0).tolist()
+            self.beliefs[seat] = [round(float(x), 1) if n else None
+                                  for x, n in zip(out["believed_ships"][0].tolist(), never)]
+            decision["beliefs"] = {"ships": self.beliefs[seat]}
         if research_turn:
             # Decided once a cycle and kept until the next.
             decision["config"] = knob_values(act["config"][0].tolist(), int(act["plan"][0]))
