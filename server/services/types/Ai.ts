@@ -54,6 +54,16 @@ export interface AiConfig {
     // Size attacks as if the defender's weapons matched one's own and
     // there were no defender bonus.
     ignoreDefenderWeapons: boolean;
+    // Executor fixes, off by default so the built-in AI plays as it always
+    // has. Don't bulk-upgrade stars under attack (the original code meant
+    // to, but overwrote the setting).
+    protectAttackedStars: boolean;
+    // Skip a defence that all reachable ships together cannot hold,
+    // instead of sending ships to die there.
+    abandonHopelessDefence: boolean;
+    // Add this times the star's natural resources (economy + industry +
+    // science) to its score, so undeveloped stars are not all worth 0.
+    starResourceWeight: number;
     // Weights for scoring a star by its infrastructure.
     starValueWeights: {
         economy: number;
@@ -82,6 +92,9 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
     orderDropout: 0,
     orderNoise: 0,
     ignoreDefenderWeapons: false,
+    protectAttackedStars: false,
+    abandonHopelessDefence: false,
+    starResourceWeight: 0,
     starValueWeights: {
         economy: 1,
         industry: 2,
