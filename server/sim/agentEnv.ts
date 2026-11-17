@@ -70,6 +70,10 @@ export interface ResetOptions {
     aiConfigs?: Record<number, Partial<AiConfig>>;
     maxTicks?: number;
     maxGap?: number;
+    // Wake agents only at the start of each cycle: for agents that decide
+    // once a cycle and hold their orders in between (the commander), the
+    // other wake-ups change nothing and cost an order proposal each.
+    cycleOnly?: boolean;
     // Agent seats see only what their scanners show: their observations
     // and their executor (the built-in AI acting on their orders) both
     // work from the seat's view and memory instead of the whole game.
@@ -160,6 +164,7 @@ export class AgentEnv {
     seats = new Map<number, Seat>();
     maxTicks = 3000;
     maxGap = 4;
+    cycleOnly = false;
     fog = false;
     recorder: BeliefRecorder | null = null;
     recordFile: string | null = null;
@@ -546,6 +551,7 @@ export class AgentEnv {
         const seed = options.seed ?? 1;
         this.maxTicks = options.maxTicks ?? 3000;
         this.maxGap = options.maxGap ?? 4;
+        this.cycleOnly = options.cycleOnly ?? false;
         this.fog = options.fog ?? false;
         this.engine.aiConfigs.clear();
         this.seats.clear();
@@ -976,6 +982,7 @@ export class AgentEnv {
         const tick = this.game.state.tick;
         const cycleStart =
             tick % this.game.settings.galaxy.productionTicks === 1;
+        if (this.cycleOnly) return cycleStart;
         const defendKeys = this._proposeOrders(seat)
             .filter((o) => o.kind === "defend")
             .map((o) => o.key)

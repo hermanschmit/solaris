@@ -7,7 +7,7 @@
 // {"id": 1, "ok": true, "result": ...} or {"id": 1, "ok": false, "error":
 // "..."}. Commands:
 //
-//   reset     {agents, settings?, seed?, aiConfigs?, maxTicks?, maxGap?, fog?,
+//   reset     {agents, settings?, seed?, aiConfigs?, maxTicks?, maxGap?, cycleOnly?, fog?,
 //              record?, recordInfo?}
 //             -> {tick, done, seats}
 //   header    {}                       -> the game's stars, ranges, techs
