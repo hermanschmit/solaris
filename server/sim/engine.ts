@@ -156,6 +156,21 @@ export class SimEngine {
     // it makes a run reproducible.
     seed(seed: number) {
         Math.random = seededRng(seed);
+
+        // Database ids are part of the game: the AI breaks ties and draws
+        // its flaws (AiConfig.orderDropout, ...) from them. bson makes them
+        // from the clock and random bytes, so the same seed played
+        // differently each time. Number them from the seed instead, in
+        // creation order as before.
+        const ObjectId = mongoose.Types.ObjectId as any;
+        let count = 0;
+        ObjectId.generate = () => {
+            const buffer = Buffer.alloc(12);
+            buffer.writeUInt32BE(0x60000000, 0);
+            buffer.writeUInt32BE(seed >>> 0, 4);
+            buffer.writeUInt32BE(count++, 8);
+            return buffer;
+        };
     }
 
     loadSettings(name: string) {
