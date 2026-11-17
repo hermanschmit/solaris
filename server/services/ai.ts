@@ -495,6 +495,8 @@ export default class AIService {
     }
 
     _handleBulkUpgradeStates(game: Game, player: Player, context: Context) {
+        const { protectAttackedStars } = this.getConfig(game, player);
+
         for (const star of context.playerStars) {
             if (context.attackedStarIds.has(star._id.toString())) {
                 star.ignoreBulkUpgrade = {
@@ -502,6 +504,10 @@ export default class AIService {
                     industry: true,
                     science: true,
                 };
+
+                if (protectAttackedStars) {
+                    continue;
+                }
             }
 
             const borderStarData = context.borderStars.get(star._id.toString());
@@ -1101,6 +1107,18 @@ export default class AIService {
                     );
 
                 let shipsNeeded = requiredAdditionallyForDefense;
+
+                if (
+                    config.abandonHopelessDefence &&
+                    shipsNeeded > 0 &&
+                    allPossibleAssignments.reduce(
+                        (total, { assignment }) =>
+                            total + assignment.totalShips,
+                        0,
+                    ) < shipsNeeded
+                ) {
+                    continue;
+                }
 
                 for (const { assignment, trace } of allPossibleAssignments) {
                     if (shipsNeeded <= 0 || assignment.totalShips === 1) {
@@ -1856,11 +1874,16 @@ export default class AIService {
 
     _getStarScore(star: Star, config: AiConfig = this.config): number {
         const weights = config.starValueWeights;
+        const resources = star.naturalResources;
 
         return (
             weights.economy * (star.infrastructure.economy || 0) +
             weights.industry * (star.infrastructure.industry || 0) +
-            weights.science * (star.infrastructure.science || 0)
+            weights.science * (star.infrastructure.science || 0) +
+            (config.starResourceWeight && resources
+                ? config.starResourceWeight *
+                  (resources.economy + resources.industry + resources.science)
+                : 0)
         );
     }
 
