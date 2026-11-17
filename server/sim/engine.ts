@@ -64,6 +64,23 @@ export class SimEngine {
             return answer;
         };
 
+        // Scanning (every fog update, several a tick per seat) builds a k-d
+        // tree of all stars each time. Stars only move in orbital games, so
+        // elsewhere build it once per game.
+        const scanning = this.container.scanningService as any;
+        const starTree = scanning.starTree.bind(scanning);
+        const starTrees = new WeakMap<Game, any>();
+        scanning.starTree = (game: Game) => {
+            if (this.container.gameTypeService.isOrbitalMode(game))
+                return starTree(game);
+            let tree = starTrees.get(game);
+            if (!tree) {
+                tree = starTree(game);
+                starTrees.set(game, tree);
+            }
+            return tree;
+        };
+
         // The built-in AI builds several reachability graphs for every
         // player on every tick, each measuring the distance between every
         // pair of stars. Stars only move in orbital games, so elsewhere
