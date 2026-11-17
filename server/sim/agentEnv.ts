@@ -52,6 +52,13 @@ export interface AgentDecision {
     // Keep an Explorer carrier claiming unowned stars beyond the seat's
     // own hyperspace range (see AgentEnv._explore).
     explore?: boolean;
+    // Buy an alliance with the nearest built-in AI player in scanning
+    // range: declare it an ally and gift technology or credits, whichever
+    // buys reputation cheapest, until its reputation reaches the level at
+    // which the AI declares back (see AgentEnv._court).
+    court?: boolean;
+    // Break every alliance with a built-in AI player (declare it an enemy).
+    betray?: boolean;
 }
 
 export interface ResetOptions {
@@ -129,9 +136,23 @@ interface Seat {
     hiresRefused: number;
     defendKeys: string;
     memory: SeatMemory;
+    // The AI player being courted, credits spent on gifts, and the tick
+    // the alliance formed (null while it has not).
+    courting: Player | null;
+    courtSpent: number;
+    givenUp: Set<Player>;
+    gifted: number;
+    alliedTick: number | null;
 }
 
 const EXPLORER = 6; // carrier specialist: +3 hyperspace, faster, weaker
+// ReputationService: the AI declares a player an ally at this reputation,
+// which each gift raises by REPUTATION_INCREMENT (credits) or by the levels
+// given (technology).
+const ALLY_REPUTATION = 5;
+const REPUTATION_INCREMENT = 1;
+// Credits a seat spends courting one player before trying another.
+const COURT_BUDGET = 1000;
 
 export class AgentEnv {
     engine = new SimEngine();
@@ -162,6 +183,9 @@ export class AgentEnv {
 
                 seat.player.lastSeen = new Date();
 
+                if (seat.decision.betray) await this._betray(seat);
+                else if (seat.decision.court) await this._court(seat);
+
                 const restore = this._fog(seat, true);
                 try {
                     await ai.playForAgent(eventService, game, seat.player);
@@ -184,6 +208,198 @@ export class AgentEnv {
         };
     }
 
+    // Court the nearest built-in AI player in scanning range (the trade
+    // setting requires it): declare it an ally, and gift technology or
+    // credits, whichever is cheapest per point of its reputation for the
+    // seat, until the reputation reaches the AI's alliance threshold and it
+    // declares back. Each gift that raises reputation lets the AI send a
+    // technology back, as TradeService.tryTradeBack does. The trade service
+    // itself writes to the database, so the gifts are applied here in
+    // memory, through the same reputation calls.
+    async _court(seat: Seat) {
+        const c = this.engine.container as any;
+        const game = this.game;
+        const player = seat.player;
+        const agents = new Set([...this.seats.values()].map((s) => s.player));
+        const allied = (other: Player) =>
+            c.diplomacyService.getDiplomaticStatusToPlayer(
+                game,
+                player._id,
+                other._id,
+            ).actualStatus === "allies";
+
+        let target = seat.courting;
+        if (target && seat.courtSpent > COURT_BUDGET && !allied(target)) {
+            // Fighting keeps resetting its reputation: try someone else.
+            seat.givenUp.add(target);
+            target = null;
+        }
+        if (!target || target.defeated) {
+            seat.courtSpent = 0;
+            const own = game.galaxy.stars.filter(
+                (s) => s.ownedByPlayerId?.toString() === player._id.toString(),
+            );
+            let best = Infinity;
+            target = null;
+            for (const other of game.galaxy.players) {
+                if (
+                    agents.has(other) ||
+                    other.defeated ||
+                    seat.givenUp.has(other)
+                )
+                    continue;
+                if (
+                    !c.scanningService.isInScanningRangeOfPlayer(
+                        game,
+                        player,
+                        other,
+                    )
+                )
+                    continue;
+                const id = other._id.toString();
+                for (const star of game.galaxy.stars) {
+                    if (star.ownedByPlayerId?.toString() !== id) continue;
+                    for (const mine of own) {
+                        const d = c.distanceService.getDistanceBetweenLocations(
+                            mine.location,
+                            star.location,
+                        );
+                        if (d < best) {
+                            best = d;
+                            target = other;
+                        }
+                    }
+                }
+            }
+            seat.courting = target;
+        }
+        if (!target) return;
+
+        if (
+            c.diplomacyService.getDiplomaticStatusToPlayer(
+                game,
+                player._id,
+                target._id,
+            ).statusTo !== "allies"
+        ) {
+            try {
+                await c.diplomacyService.declareAlly(
+                    c.eventService,
+                    game,
+                    player._id,
+                    target._id,
+                    false,
+                );
+            } catch {
+                return; // the alliance cap
+            }
+        }
+
+        const reputation = () =>
+            c.reputationService.getReputation(target, player).reputation.score;
+
+        for (let k = 0; k < 10 && reputation() < ALLY_REPUTATION; k++) {
+            if (
+                !c.scanningService.isInScanningRangeOfPlayer(
+                    game,
+                    player,
+                    target,
+                )
+            )
+                break;
+            const creditsCost = Math.max(
+                1,
+                (c.playerStatisticsService.getStats(game, target).totalEconomy *
+                    10) /
+                    2,
+            );
+            let gift: { cost: number; points: number; tech?: any } = {
+                cost: creditsCost,
+                points: REPUTATION_INCREMENT,
+            };
+            for (const tech of c.tradeService.listTradeableTechnologies(
+                game,
+                player,
+                target._id,
+            )) {
+                const points = tech.level - target.research[tech.name].level;
+                if (tech.cost / points < gift.cost / gift.points)
+                    gift = { cost: tech.cost, points, tech };
+            }
+            if (player.credits < gift.cost) break;
+
+            if (gift.tech) {
+                this._giveTechnology(player, target, gift.tech);
+            } else {
+                player.credits -= gift.cost;
+                target.credits += gift.cost;
+            }
+            seat.gifted += gift.cost;
+            seat.courtSpent += gift.cost;
+            const rep = await c.reputationService.increaseReputation(
+                c.eventService,
+                game,
+                target,
+                player,
+                gift.points,
+                false,
+            );
+
+            // The AI trades back a random technology it can afford.
+            if (rep.reputation.score >= 1) {
+                const back = c.tradeService
+                    .listTradeableTechnologies(game, target, player._id)
+                    .filter((t: any) => t.cost <= target!.credits);
+                if (back.length) {
+                    const tech = back[Math.floor(Math.random() * back.length)];
+                    const points =
+                        tech.level - player.research[tech.name].level;
+                    this._giveTechnology(target, player, tech);
+                    await c.reputationService.increaseReputation(
+                        c.eventService,
+                        game,
+                        player,
+                        target,
+                        points,
+                        false,
+                    );
+                }
+            }
+        }
+
+        if (seat.alliedTick === null && allied(target)) {
+            seat.alliedTick = game.state.tick;
+        }
+    }
+
+    async _betray(seat: Seat) {
+        const c = this.engine.container as any;
+        const agents = new Set([...this.seats.values()].map((s) => s.player));
+        for (const other of this.game.galaxy.players) {
+            if (other === seat.player || agents.has(other)) continue;
+            const status = c.diplomacyService.getDiplomaticStatusToPlayer(
+                this.game,
+                seat.player._id,
+                other._id,
+            );
+            if (status.statusTo === "allies") {
+                await c.diplomacyService.declareEnemy(
+                    c.eventService,
+                    this.game,
+                    seat.player._id,
+                    other._id,
+                    false,
+                );
+            }
+        }
+    }
+
+    _giveTechnology(from: Player, to: Player, tech: any) {
+        from.credits -= tech.cost;
+        to.research[tech.name].level = tech.level;
+        to.research[tech.name].progress = 0;
+    }
+
     // An Explorer (+3 hyperspace) carrier claims unowned stars the seat's
     // executor cannot reach. With none, hire one on a carrier at the own
     // star closest to such a star (building the carrier if need be); an
@@ -195,7 +411,10 @@ export class AgentEnv {
         const player = seat.player;
         const id = player._id.toString();
         const distance = (a: any, b: any) =>
-            c.distanceService.getDistanceBetweenLocations(a.location, b.location);
+            c.distanceService.getDistanceBetweenLocations(
+                a.location,
+                b.location,
+            );
         const level = player.research.hyperspace.level;
         const near = c.distanceService.getHyperspaceDistance(game, level);
         const far = c.distanceService.getHyperspaceDistance(game, level + 3);
@@ -360,6 +579,11 @@ export class AgentEnv {
                 hiresRefused: 0,
                 defendKeys: "",
                 memory: new SeatMemory(this.game.galaxy.stars.length),
+                courting: null,
+                courtSpent: 0,
+                givenUp: new Set(),
+                gifted: 0,
+                alliedTick: null,
             });
         }
 
@@ -805,6 +1029,17 @@ export class AgentEnv {
                     agent: this.seats.has(index),
                     hired: this.seats.get(index)?.hired ?? 0,
                     hiresRefused: this.seats.get(index)?.hiresRefused ?? 0,
+                    gifted: this.seats.get(index)?.gifted ?? 0,
+                    alliedTick: this.seats.get(index)?.alliedTick ?? null,
+                    allies: game.galaxy.players.filter(
+                        (q) =>
+                            q !== p &&
+                            this.engine.container.diplomacyService.getDiplomaticStatusToPlayer(
+                                game,
+                                p._id,
+                                q._id,
+                            ).actualStatus === "allies",
+                    ).length,
                     stars: stars.length,
                     ships:
                         stars.reduce((a, s) => a + (s.ships ?? 0), 0) +
