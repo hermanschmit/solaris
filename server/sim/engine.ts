@@ -81,6 +81,104 @@ export class SimEngine {
             return tree;
         };
 
+        // The AI's logistics routes carriers with
+        // PathfindingService.calculateShortestRoute, which compares star ids
+        // as strings at every step. The same search with the same visiting
+        // order (a stable sort of the open nodes by cost from the start),
+        // comparing nodes directly.
+        const pathfinding = this.container.pathfindingService as any;
+        pathfinding.calculateShortestRoute = (
+            game: Game,
+            player: any,
+            carrier: any,
+            sourceStarId: string,
+            destinStarId: string,
+        ) => {
+            const techs =
+                pathfinding.technologyService.getCarrierEffectiveTechnologyLevels(
+                    game,
+                    carrier,
+                    true,
+                );
+            const range = pathfinding.distanceService.getHyperspaceDistance(
+                game,
+                techs.hyperspace,
+            );
+            const graph = game.galaxy.stars.map((star: any) => ({
+                id: star._id,
+                star,
+                cost: 0,
+                costFromStart: 0,
+                neighbors: null as any[] | null,
+                parent: null as any,
+                open: false,
+                closed: false,
+            }));
+            const start = graph.find(
+                (n) => n.star._id.toString() === sourceStarId,
+            )!;
+            const end = graph.find(
+                (n) => n.star._id.toString() === destinStarId,
+            )!;
+            const neighborsOf = (node: any) =>
+                graph.filter(
+                    (n) =>
+                        n !== node &&
+                        (pathfinding.distanceService.getDistanceBetweenLocations(
+                            n.star.location,
+                            node.star.location,
+                        ) <= range ||
+                            pathfinding.starDataService.isStarPairWormHole(
+                                n.star,
+                                node.star,
+                            )),
+                );
+
+            const openSet = [start];
+            start.open = true;
+            while (openSet.length) {
+                openSet.sort((a, b) => a.costFromStart - b.costFromStart);
+                const current = openSet.shift()!;
+                current.open = false;
+                current.closed = true;
+
+                if (current === end) {
+                    const path = [current];
+                    let node = current;
+                    while (node.parent) {
+                        path.push(node.parent);
+                        node = node.parent;
+                    }
+                    return path.reverse();
+                }
+
+                if (!current.neighbors)
+                    current.neighbors = neighborsOf(current);
+
+                for (const neighbor of current.neighbors) {
+                    if (neighbor.closed) continue;
+                    neighbor.cost =
+                        pathfinding.waypointService.calculateTicksForDistance(
+                            game,
+                            player,
+                            carrier,
+                            current.star,
+                            neighbor.star,
+                        );
+                    const nextCost = current.costFromStart + neighbor.cost;
+                    if (!neighbor.open) {
+                        openSet.push(neighbor);
+                        neighbor.open = true;
+                    } else if (nextCost >= neighbor.costFromStart) {
+                        continue;
+                    }
+                    neighbor.costFromStart = nextCost;
+                    neighbor.parent = current;
+                }
+            }
+            return [];
+        };
+
         // The built-in AI builds several reachability graphs for every
         // player on every tick, each measuring the distance between every
         // pair of stars. Stars only move in orbital games, so elsewhere
