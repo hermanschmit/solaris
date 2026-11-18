@@ -302,6 +302,9 @@ export class SimEngine {
     async createGame(settings: any): Promise<Game> {
         // With only AI players, ready-to-quit would end the game at once.
         settings.general.readyToQuit = "disabled";
+        // Agent seats are driven through the advanced AI's executor, so the
+        // sim always uses it (presets such as 1v1 turn it off).
+        settings.general.advancedAI = "enabled";
 
         const doc = (await this.container.gameCreateService.create(
             nullService,

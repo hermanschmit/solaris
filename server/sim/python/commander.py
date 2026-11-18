@@ -119,6 +119,8 @@ CONFIG_KNOBS = [
     ("logisticStockpileCycles", 0.7, "mul", 0.3, 0.1, 3.0),
 ]
 
+END_SCALE = 400.0  # ticks to the end of a tick-limited game, scaled by this
+
 KEEP_BIAS = 4.0  # "keep research", the built-in plan and "hire none" start this far ahead
 INITIAL_STD = 0.3
 
@@ -188,6 +190,11 @@ class Commander(nn.Module):
         # Each star's natural resources and type, also zero at the start.
         self.quality_head = mlp(bd.N_QUALITY, d, hidden=32)
         self.credits_head = mlp(1, n_global_dims(d, n_player), hidden=32)
+        # The time left in a tick-limited game (the 1v1 preset), for the
+        # policy and the critic. Zero at the start; absent in games
+        # without a limit, so 10-player inputs are unchanged.
+        self.end_head = mlp(1, n_global_dims(d, n_player), hidden=32)
+        self.critic_end_head = mlp(1, n_global_dims(d, n_player), hidden=32)
         self.order_ships_head = mlp(d + len(ORDER_KINDS) + 2 + N_ORDER_SHIPS, 1, hidden=64)
         self.order_log_std = nn.Parameter(torch.tensor(math.log(INITIAL_STD)))
 
@@ -259,6 +266,8 @@ class Commander(nn.Module):
         g = self._global(h, b)
         if "credits" in b:
             g = g + self.credits_head(torch.log1p(b["credits"]).unsqueeze(-1) / 8)
+        if "ticks_to_end" in b:
+            g = g + self.end_head(b["ticks_to_end"].unsqueeze(-1) / END_SCALE)
 
         posture_logits, target_logits = self._strategy_logits(h, g, b)
         if strategy is not None:
@@ -295,6 +304,8 @@ class Commander(nn.Module):
                     + strategy_prior(b["cand_kind"], is_target, target, posture))
         config_mu = self.config_head(g)
         research_logits = self.research_head(g)
+        if "research_mask" in b:  # technologies the game cannot research
+            research_logits = research_logits.masked_fill(~b["research_mask"], -1e9)
         plan_logits = self.plan_head(g)
 
         # Specialists: only those affordable now, at stars the seat owns.
@@ -315,7 +326,10 @@ class Commander(nn.Module):
     def value(self, b):
         """The critic's estimate of the outcome, from the true state."""
         _, _, h = self.critic_trunk.encode(b)
-        return self.value_head(self._global(h, b)).squeeze(-1)
+        g = self._global(h, b)
+        if "ticks_to_end" in b:
+            g = g + self.critic_end_head(b["ticks_to_end"].unsqueeze(-1) / END_SCALE)
+        return self.value_head(g).squeeze(-1)
 
     def distributions(self, out, b, act=None):
         """The decision's distributions. The star distribution is for the
@@ -394,9 +408,12 @@ def specialist_prior(star_x, own):
 
 
 def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="cpu",
-                 affordable=(), budget=0, own_carriers=None, credits=None):
+                 affordable=(), budget=0, own_carriers=None, credits=None, ticks_to_end=None):
     """Model inputs for one decision, as a batch of one. affordable lists
-    the star specialists (ids) the seat can hire now, with budget tokens."""
+    the star specialists (ids) the seat can hire now, with budget tokens.
+    ticks_to_end is the observation's, None in games without a tick limit.
+    In games where some technologies cannot be researched (the 1v1
+    preset), research_mask leaves them out."""
     f = static.features(frame, seat)
     t = lambda x, dt=torch.float32: torch.as_tensor(np.asarray(x)[None]).to(device, dt)
     C = max(len(candidates), 1)
@@ -426,7 +443,14 @@ def batch_inputs(static, frame, seat, candidates, tick, research_turn, device="c
     if research_turn:
         spec_mask[[i for i in affordable if i <= MAX_SPECIALIST_ID]] = True
     cycle = static.cycle
+    extra = {}
+    if ticks_to_end is not None:
+        extra["ticks_to_end"] = t(float(ticks_to_end))
+    if len(static.researchable) < len(static.techs):
+        extra["research_mask"] = t([True] + [x in static.researchable for x in static.techs],
+                                   torch.bool)
     return dict(
+        **extra,
         star_x=bt.prepare_star_x(t(f["star_x"])),
         player_x=t(f["player_x"]),
         owner=t(f["star_owner_seat"], torch.long),
@@ -495,7 +519,8 @@ class CommanderAgent:
                          affordable=observation.get("affordableStarSpecialists", ()),
                          budget=observation.get("specialistBudget", 0),
                          own_carriers=observation.get("ownCarriers"),
-                         credits=observation.get("credits"))
+                         credits=observation.get("credits"),
+                         ticks_to_end=observation.get("ticksToEnd"))
         out = self.model(b, sample=bool(self.sample))
 
         if self.sample:

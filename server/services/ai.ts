@@ -423,6 +423,10 @@ export default class AIService {
 
         this._sanitizeState(game, player, context);
 
+        if (this.getConfig(game, player).researchClaimRangeWhenStranded) {
+            this._researchClaimRangeIfStranded(game, player, context);
+        }
+
         if (isFirstTickOfCycle) {
             this._handleBulkUpgradeStates(game, player, context);
             await this._playFirstTick(eventService, game, player);
@@ -2320,6 +2324,47 @@ export default class AIService {
         );
 
         return this.distanceService.getHyperspaceDistance(game, highestLevel);
+    }
+
+    _researchClaimRangeIfStranded(
+        game: Game,
+        player: Player,
+        context: Context,
+    ) {
+        if (!game.galaxy.stars.some((star) => !star.ownedByPlayerId)) {
+            return;
+        }
+
+        for (const reachables of context.freelyReachableFromPlayerStars.values()) {
+            for (const starId of reachables) {
+                if (!context.starsById.get(starId)!.ownedByPlayerId) {
+                    return;
+                }
+            }
+        }
+
+        // The claim range is the hyperspace range, or the smaller of it and
+        // the scanning range (see _createContext).
+        const hyperspace = this.distanceService.getHyperspaceDistance(
+            game,
+            player.research.hyperspace.level,
+        );
+        const scanning = this.distanceService.getScanningDistance(
+            game,
+            player.research.scanning.level,
+        );
+        const tech =
+            this.getConfig(game, player).claimToHyperspaceRange ||
+            hyperspace <= scanning
+                ? "hyperspace"
+                : "scanning";
+
+        if (
+            player.researchingNow !== tech &&
+            this.technologyService.isTechnologyResearchable(game, tech)
+        ) {
+            player.researchingNow = tech;
+        }
     }
 
     _getHyperspaceRangeLogical(game: Game, player: Player): number {

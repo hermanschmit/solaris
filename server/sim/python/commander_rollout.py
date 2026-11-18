@@ -2,9 +2,9 @@
 
     python3 commander_rollout.py <out_dir> [games] [first_seed] [workers] [seats] [belief.pt] [commander.pt]
 
-Each game puts the commander in `seats` random seats (3 by default) under
-fog of war, against the built-in AI in the rest, and samples its decisions
-so training can learn from what it tried. Per decision it records the
+Each game puts the commander in `seats` random seats (3 by default, 1 in
+1v1; see presets.py) under fog of war, against the built-in AI in the rest,
+and samples its decisions so training can learn from what it tried. Per decision it records the
 policy's inputs (the seat's view only), what it chose and how likely that
 was, and the critic's inputs (the true state). At the end it records each
 seat's placement and the reward:
@@ -31,10 +31,11 @@ import torch
 
 import belief_data as bd
 import commander as cm
+import presets
 from solaris_env import SolarisEnv
 
 STAR_SHARE_BONUS = 0.02  # per cycle, times the seat's share of all stars
-SHIP_SHARE_BONUS = 0.05  # per cycle, times the seat's share of all ships
+SHIP_SHARE_BONUS = presets.PRESET["ship_share_bonus"]  # times the seat's share of all ships
 
 
 def placement_reward(place, players):
@@ -63,7 +64,8 @@ def load_commander(model, state):
     missing, unexpected = model.load_state_dict(state, strict=False)
     new_heads = ("plan_head.", "specialist_head.", "specialist_star_head.", "posture_head.",
                  "target_head.", "no_target_head.", "strategy_order_head.",
-                 "fleet_head.", "credits_head.", "order_ships_head.", "quality_head.")
+                 "fleet_head.", "credits_head.", "order_ships_head.", "quality_head.",
+                 "end_head.", "critic_end_head.")
     if unexpected or any(not k.startswith(new_heads) for k in missing):
         raise ValueError(f"Checkpoint does not fit: missing {missing}, unexpected {unexpected}")
 
@@ -79,7 +81,7 @@ def observe(env, agent, seat, truth_frame=False):
     return obs
 
 
-def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=None,
+def play(seed, seats=presets.SEATS, belief=None, checkpoint=None, max_ticks=3000, agents=None,
          opponents=None, record=None, ai_configs=None):
     """Play a game with the commander being trained in `agents` (or
     `seats` random seats), sampling its decisions, and record them.
@@ -92,11 +94,13 @@ def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=Non
     rng = np.random.default_rng(seed)
     opponents = opponents or {}
     if agents is None:
-        agents = sorted(int(s) for s in rng.choice(10, seats, replace=False))
+        agents = sorted(int(s) for s in rng.choice(presets.PLAYERS, seats, replace=False))
+    played = sorted(list(agents) + list(opponents))
     with SolarisEnv() as env:
-        result = env.reset(agents=sorted(list(agents) + list(opponents)), seed=seed,
+        result = env.reset(agents=played, settings=presets.NAME, seed=seed,
                            max_ticks=max_ticks, fog=True, record=record,
-                           ai_configs=ai_configs, cycle_only=cm.HOLD_ORDERS)
+                           ai_configs=presets.builtin_configs(played, ai_configs),
+                           cycle_only=cm.HOLD_ORDERS)
         static = bd.Static(env.header())
         model = build_model(len(static.techs), belief, checkpoint)
         agent = cm.CommanderAgent(model, static, sample=True)
@@ -121,7 +125,7 @@ def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=Non
                     continue
 
                 truth = cm.batch_inputs(static, obs["truthFrame"], seat, obs["candidates"],
-                                        obs["tick"], False)
+                                        obs["tick"], False, ticks_to_end=obs.get("ticksToEnd"))
                 bonus = 0.0
                 if obs["cycle"] != last_cycle.get(seat):
                     last_cycle[seat] = obs["cycle"]
@@ -159,8 +163,9 @@ def pack(steps, place, agents, seed, standings):
             out.setdefault("act_" + k, []).append(pad(v) if k == "order" else v[0].numpy())
         for k, v in rec["inputs"].items():
             inputs.setdefault(k, []).append(pad(v, -1 if k == "cand_star" else 0) if k.startswith("cand_") else v[0].numpy())
-        for k in ("star_x", "player_x", "owner", "time"):
-            truths.setdefault(k, []).append(truth[k][0].numpy())
+        for k in ("star_x", "player_x", "owner", "time", "ticks_to_end"):
+            if k in truth:
+                truths.setdefault(k, []).append(truth[k][0].numpy())
 
     arrays = {k: np.asarray(v) for k, v in out.items()}
     arrays.update({"in_" + k: np.stack(v) for k, v in inputs.items()})
@@ -179,13 +184,13 @@ def pack(steps, place, agents, seed, standings):
     return arrays
 
 
-def eval_seats(seed, seats=3):
+def eval_seats(seed, seats=presets.SEATS):
     """The seats an evaluation game on this seed gives the commander."""
     rng = np.random.default_rng(seed)
-    return sorted(int(s) for s in rng.choice(10, seats, replace=False))
+    return sorted(int(s) for s in rng.choice(presets.PLAYERS, seats, replace=False))
 
 
-def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False,
+def play_eval(seed, seats=presets.SEATS, checkpoint=None, max_ticks=3000, sample=False,
               personas=None, opponent=None):
     """Play a seed's evaluation seats with the commander's most likely
     decisions (or as `sample` says, see CommanderAgent), under fog, and
@@ -202,16 +207,18 @@ def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False,
     torch.manual_seed(seed)
     agents = eval_seats(seed, seats)
     rng = np.random.default_rng(seed + 7_919)
-    others = [s for s in rng.permutation(10).tolist() if s not in agents]
+    others = [s for s in rng.permutation(presets.PLAYERS).tolist() if s not in agents]
     rivals = sorted(others[:seats]) if opponent else []
     ai_configs, names = {}, {}
     if personas:
         for s, (name, config) in pa.assign(rng, [s for s in others if s not in rivals],
                                            personas).items():
             ai_configs[s], names[s] = config, name
+    played = sorted(agents + rivals) if checkpoint else []
     with SolarisEnv() as env:
-        result = env.reset(agents=sorted(agents + rivals) if checkpoint else [], seed=seed,
-                           max_ticks=max_ticks, fog=True, ai_configs=ai_configs,
+        result = env.reset(agents=played, settings=presets.NAME, seed=seed,
+                           max_ticks=max_ticks, fog=True,
+                           ai_configs=presets.builtin_configs(played, ai_configs),
                            cycle_only=cm.HOLD_ORDERS)
         if checkpoint:
             static = bd.Static(env.header())
@@ -247,7 +254,7 @@ if __name__ == "__main__":
     games = int(sys.argv[2]) if len(sys.argv) > 2 else 10
     first = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     workers = int(sys.argv[4]) if len(sys.argv) > 4 else max(1, os.cpu_count() - 1)
-    seats = int(sys.argv[5]) if len(sys.argv) > 5 else 3
+    seats = int(sys.argv[5]) if len(sys.argv) > 5 else presets.SEATS
     belief = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] != "-" else None
     checkpoint = sys.argv[7] if len(sys.argv) > 7 else None
     os.makedirs(out_dir, exist_ok=True)
