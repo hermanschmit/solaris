@@ -73,13 +73,15 @@ class SolarisEnv:
         return reply["result"]
 
     def reset(self, agents, settings="standard", seed=1, ai_configs=None, max_ticks=3000, max_gap=4,
-              fog=False, record=None, record_info=None):
+              fog=False, record=None, record_info=None, cycle_only=False):
         """Start a new game. `agents` lists the seats (0 to 9) you control.
         With fog=True, agent seats and their executor see only what their
         scanners show. With record set to a file name, the game is recorded
         for belief-model training (like beliefBatch.ts) and saved there when
-        it ends. Returns {"tick", "done", "seats"}: the seats that
-        must decide now."""
+        it ends. With cycle_only=True, agents are woken only at the start of
+        each cycle (for agents that hold their orders in between). Returns
+        {"tick", "done", "seats"}: the seats that must decide now."""
+        self.cycle_only = cycle_only
         return self._call(
             "reset",
             agents=agents,
@@ -88,6 +90,7 @@ class SolarisEnv:
             aiConfigs=ai_configs or {},
             maxTicks=max_ticks,
             maxGap=max_gap,
+            cycleOnly=cycle_only,
             fog=fog,
             record=record,
             recordInfo=record_info or {},

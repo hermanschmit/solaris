@@ -71,6 +71,8 @@ def load_commander(model, state):
 def observe(env, agent, seat, truth_frame=False):
     """The seat's observation, with the frames only when the agent will
     decide on it (not when it holds its order weights)."""
+    if getattr(env, "cycle_only", False):  # every wake-up is a decision
+        return env.observe(seat, frame=True, truth_frame=truth_frame)
     obs = env.observe(seat)
     if agent.wants_frame(obs, seat):
         obs = env.observe(seat, frame=True, truth_frame=truth_frame)
@@ -94,7 +96,7 @@ def play(seed, seats=3, belief=None, checkpoint=None, max_ticks=3000, agents=Non
     with SolarisEnv() as env:
         result = env.reset(agents=sorted(list(agents) + list(opponents)), seed=seed,
                            max_ticks=max_ticks, fog=True, record=record,
-                           ai_configs=ai_configs)
+                           ai_configs=ai_configs, cycle_only=cm.HOLD_ORDERS)
         static = bd.Static(env.header())
         model = build_model(len(static.techs), belief, checkpoint)
         agent = cm.CommanderAgent(model, static, sample=True)
@@ -209,7 +211,8 @@ def play_eval(seed, seats=3, checkpoint=None, max_ticks=3000, sample=False,
             ai_configs[s], names[s] = config, name
     with SolarisEnv() as env:
         result = env.reset(agents=sorted(agents + rivals) if checkpoint else [], seed=seed,
-                           max_ticks=max_ticks, fog=True, ai_configs=ai_configs)
+                           max_ticks=max_ticks, fog=True, ai_configs=ai_configs,
+                           cycle_only=cm.HOLD_ORDERS)
         if checkpoint:
             static = bd.Static(env.header())
             agent = cm.CommanderAgent(build_model(len(static.techs), None, checkpoint), static,

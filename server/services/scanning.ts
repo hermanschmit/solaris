@@ -40,6 +40,13 @@ export default class ScanningService {
         this.carrierService = carrierService;
     }
 
+    // A k-d tree of all the galaxy's stars, for scanning range searches.
+    // Each search must call resetMarked() after it. (The simulator keeps
+    // one per game, since stars only move in orbital games.)
+    starTree(game: Game): KDTree {
+        return new KDTree(this.distanceService, game.galaxy.stars);
+    }
+
     starSetToSortedList(starSet: Set<Star>) {
         const stars = Array.from(starSet).sort((a, b) =>
             a._id.toString() < b._id.toString() ? -1 : 1,
@@ -381,7 +388,7 @@ export default class ScanningService {
         targetPlayer: Player,
     ) {
         // TODO: Calculate during tick processing and load stored tree
-        const kdTree = new KDTree(this.distanceService, game.galaxy.stars);
+        const kdTree = this.starTree(game);
 
         const scannedStarSet = this.getStarSetByScanningRange(
             game,
@@ -462,7 +469,7 @@ export default class ScanningService {
             starsWithScanning.length * ScanningService.SINGLE_TREE_COST_FACTOR
         ) {
             // TODO: Calculate during tick processing and load stored tree
-            const kdTree = new KDTree(this.distanceService, game.galaxy.stars);
+            const kdTree = this.starTree(game);
 
             for (const star of starsWithScanning) {
                 const starsInRange = this.getStarsWithinScanningRangeOfStar(
