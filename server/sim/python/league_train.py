@@ -206,7 +206,9 @@ def main():
             pt.save_checkpoint(run_dir, i + 1, model, opt, ema, techs)
             with collector.lock:
                 if (i + 1) % SNAPSHOT_EVERY == 0:
-                    add_member(run_dir, league, f"ckpt_{i + 1}", pt.ckpt_path(run_dir, i + 1))
+                    # The averaged weights, as the evaluations play: the
+                    # trained weights just after one update can be a dip.
+                    add_member(run_dir, league, f"ema_{i + 1}", pt.ema_path(run_dir, i + 1))
                 save_league(run_dir, league)
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
                               "hired": steps.hired, **pt.strategy_shares(steps),
