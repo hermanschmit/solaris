@@ -354,6 +354,45 @@ python3 sim/python/average_commanders.py avg.pt data/ppo1/ckpt_60.pt data/ppo1/c
 python3 sim/python/commander_eval.py avg.pt 100 13 data/ppo1/eval_baseline.json
 ```
 
+## Other presets: 1v1
+
+`agentEnv.reset` takes any preset in `config/game/settings/official`, and
+the Python tools pick one with `SOLARIS_SETTINGS` (`python/presets.py`),
+`standard` by default. Only `standard` and `1v1` are set up so far:
+
+```sh
+# Fine-tune a 10-player commander on the official 1v1 preset
+SOLARIS_SETTINGS=1v1 python3 sim/python/ppo_train.py data/1v1-ft 150 156 13 data/ppo1/ema_580.pt 200
+```
+
+`presets.py` sets the seats per game (1 commander seat in 1v1, against 1
+opponent), the reward's ship share bonus (off in 1v1: there, every ship one
+side gains the other lost) and tuning for every built-in AI seat.
+
+What the 1v1 preset needed:
+
+- The sim always runs the advanced AI (the preset turns it off), since
+  agent seats are driven through its executor.
+- Its free stars start beyond the built-in AI's claim range (the smaller of
+  hyperspace and scanning range), and the AI researches at random, so it
+  sat on its 6 starting stars until it happened to raise both. In seed 1
+  neither side claimed a star all game, and seat 1 won 8 seeds of 8.
+  `researchClaimRangeWhenStranded` (`AiConfig`, off by default) researches
+  whichever range is short while no free star is within reach;
+  `presets.py` turns it on for built-in seats in 1v1. Over 15 seeds every
+  game then expanded and seats won 8 and 7.
+- The header lists every technology, researchable or not, so that features
+  have the same layout in every preset and 10-player checkpoints load. It
+  also lists the `researchable` ones; the commander's research head masks
+  the rest (weapons and experimentation in 1v1).
+- Observations carry `ticksToEnd` for tick-limited games (1v1 ends at tick
+  400), which the commander and its critic read through heads that start
+  at zero.
+
+Checkpoints record the preset they were trained on (`settings`).
+`ppo_train.py` fine-tunes a commander checkpoint given in place of the
+belief model.
+
 ## Known gaps
 
 - Enemy credits, research progress and hidden carriers are unknown and set

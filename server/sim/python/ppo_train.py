@@ -45,7 +45,11 @@ weights being trained, so small gains are easier to see.
 
 It picks up where it left off: run it again with the same run_dir to
 continue. The belief model initializes the commander's star encoding; it is
-only used when starting.
+only used when starting. A commander checkpoint in its place is fine-tuned
+instead, for example a 10-player commander on another preset.
+
+SOLARIS_SETTINGS picks the game preset (presets.py), "standard" by
+default. Use a separate run_dir for each: checkpoints record their preset.
 
 Training runs on the GPU when there is one. Learning happens in the critic
 and all heads, and, more slowly, in the star encoding.
@@ -67,6 +71,7 @@ import belief_data as bd
 import commander as cm
 import commander_rollout as cr
 import personas as pa
+import presets
 
 GAMMA = 0.998  # per tick; a seat decides about once a cycle (20 ticks)
 LAMBDA = 0.95
@@ -81,7 +86,7 @@ MAX_GRAD = 0.5
 TARGET_KL = 0.03  # stop an iteration's epochs early past this
 MAX_LOG_RATIO = 20.0  # a decision's log-probability is a sum over many orders, so can move far
 DUAL_CLIP = 3.0  # bounds the loss of a bad action the policy now likes much more
-SEATS = 3
+SEATS = presets.SEATS  # 3 in standard games, 1 in 1v1 (presets.py)
 EVAL_EVERY = 5
 EVAL_FIRST_SEED = 1  # evaluation seeds; training seeds start far above
 EVAL_B_FIRST_SEED = 500_000  # the second evaluation set
@@ -99,6 +104,10 @@ POLICY_KEYS = ["star_x", "player_x", "owner", "time", "cand_star", "cand_kind",
                "cand_score", "cand_ticks", "cand_mask", "research_turn", "spec_mask",
                "spec_budget", "cand_needed", "cand_nearby", "own_fleet", "credits", "star_quality"]
 TRUTH_KEYS = ["star_x", "player_x", "owner", "time"]
+# Recorded only in some games: the time left in tick-limited games, and
+# which technologies can be researched where some cannot (both 1v1).
+OPTIONAL_POLICY_KEYS = ["ticks_to_end", "research_mask"]
+OPTIONAL_TRUTH_KEYS = ["ticks_to_end"]
 
 
 def ckpt_path(run_dir, i):
@@ -132,9 +141,9 @@ def save_checkpoint(run_dir, i, model, opt, ema, techs):
     """ckpt_<i>.pt (the weights being trained, the optimizer and the
     average) and ema_<i>.pt (the average, as a commander of its own)."""
     cpu = {k: v.cpu() for k, v in ema.items()}
-    torch.save({"model": model.state_dict(), "n_techs": techs,
+    torch.save({"model": model.state_dict(), "n_techs": techs, "settings": presets.NAME,
                 "optimizer": opt.state_dict(), "ema": cpu}, ckpt_path(run_dir, i))
-    torch.save({"model": cpu, "n_techs": techs}, ema_path(run_dir, i))
+    torch.save({"model": cpu, "n_techs": techs, "settings": presets.NAME}, ema_path(run_dir, i))
 
 
 def latest(run_dir):
@@ -147,7 +156,7 @@ def latest(run_dir):
 def n_techs():
     from solaris_env import SolarisEnv
     with SolarisEnv() as env:
-        env.reset(agents=[], seed=1, max_ticks=1)
+        env.reset(agents=[], settings=presets.NAME, seed=1, max_ticks=1)
         return len(bd.Static(env.header()).techs)
 
 
@@ -270,7 +279,10 @@ class Steps:
                     v = np.concatenate(
                         [v, np.full((len(v), C - v.shape[1]), fill, v.dtype)], 1)
                 cols.setdefault(k, []).append(v)
-        self.cols = {k: torch.from_numpy(np.concatenate(v)) for k, v in cols.items()}
+        # A key some games lack (an optional one, in games recorded before
+        # it existed) is left out for the whole iteration.
+        self.cols = {k: torch.from_numpy(np.concatenate(v)) for k, v in cols.items()
+                     if len(v) == len(parts)}
         self.reward = np.concatenate(rewards)
         self.done = np.concatenate(done)
         # Ticks to each seat's next decision (1 when decisions were every
@@ -285,10 +297,15 @@ class Steps:
         idx = torch.as_tensor(idx)
         get = lambda k: self.cols[k][idx].to(device)
         policy = {k: get("in_" + k) for k in POLICY_KEYS}
+        policy.update({k: get("in_" + k) for k in OPTIONAL_POLICY_KEYS if "in_" + k in self.cols})
+        if "research_mask" in policy:
+            policy["research_mask"] = policy["research_mask"].bool()
         policy["star_x"] = policy["star_x"].float()
         policy["cand_mask"] = policy["cand_mask"].bool()
         policy["spec_mask"] = policy["spec_mask"].bool()
         truth = {k: get("truth_" + k) for k in TRUTH_KEYS}
+        truth.update({k: get("truth_" + k) for k in OPTIONAL_TRUTH_KEYS
+                      if "truth_" + k in self.cols})
         act = {k[4:]: get(k) for k in self.cols if k.startswith("act_")}
         return policy, truth, act, get("logp").float()
 
@@ -563,8 +580,17 @@ def main():
 
     techs = n_techs()
     if not ckpt_path(run_dir, 0).exists():
-        model = cr.build_model(techs, belief)
-        torch.save({"model": model.state_dict(), "n_techs": techs}, ckpt_path(run_dir, 0))
+        # The start: a belief model (a new commander), or a commander
+        # checkpoint to fine-tune, for example a 10-player one on 1v1.
+        start_from = torch.load(belief, map_location="cpu") if belief else {}
+        if any(k.startswith("trunk.") for k in start_from.get("model", {})):
+            model = cr.build_model(techs, None, belief)
+            print(f"fine-tuning {belief} (trained on {start_from.get('settings', 'standard')})"
+                  f" on {presets.NAME}", flush=True)
+        else:
+            model = cr.build_model(techs, belief)
+        torch.save({"model": model.state_dict(), "n_techs": techs, "settings": presets.NAME},
+                   ckpt_path(run_dir, 0))
     start = latest(run_dir)
     saved = torch.load(ckpt_path(run_dir, start), map_location="cpu")
     model = cr.build_model(techs)

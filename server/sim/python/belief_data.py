@@ -116,6 +116,7 @@ class Static:
         self.cycle = h["productionTicks"]
         self.speed = h["carrierSpeed"]
         self.techs = h["technologies"]
+        self.researchable = h.get("researchable", self.techs)
         xy = np.array([[s["x"], s["y"]] for s in h["stars"]], np.float32)
         self.xy = xy
         d = np.sqrt(((xy[:, None] - xy[None]) ** 2).sum(-1))

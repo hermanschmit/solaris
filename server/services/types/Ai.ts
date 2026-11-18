@@ -40,6 +40,12 @@ export interface AiConfig {
     // Claim unowned stars out to the full hyperspace range, rather than
     // only within the smaller of hyperspace and scanning range.
     claimToHyperspaceRange: boolean;
+    // Whenever no unowned star is within claim range of an own star but
+    // some are left in the galaxy, research whichever of hyperspace and
+    // scanning limits the claim range. Maps whose stars start beyond that
+    // range (such as the official 1v1 preset) otherwise leave the AI on
+    // its starting stars until random research happens to raise it.
+    researchClaimRangeWhenStranded: boolean;
     // Human-like flaws, for training against imperfect opponents. All off
     // by default.
     // Act only every this many ticks, as a player who checks in now and
@@ -88,6 +94,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
     carrierReserveEconomyMultiplier: 5,
     orderReachCycles: 2,
     claimToHyperspaceRange: false,
+    researchClaimRangeWhenStranded: false,
     actEveryTicks: 1,
     orderDropout: 0,
     orderNoise: 0,

@@ -161,6 +161,49 @@ describe("sim engine", () => {
             }
         });
     });
+    describe("the official 1v1 preset", () => {
+        afterEach(() => engine.aiConfigs.clear());
+
+        const stars = (game: any, player: any) =>
+            game.galaxy.stars.filter(
+                (s: any) =>
+                    s.ownedByPlayerId?.toString() === player._id.toString(),
+            ).length;
+
+        it("uses the advanced AI and gives every technology a feature", async () => {
+            engine.seed(1);
+            const game = await engine.createGame(engine.loadSettings("1v1"));
+            const recorder = new BeliefRecorder(engine, game);
+
+            expect(game.settings.general.advancedAI).toBe("enabled");
+            expect(recorder.header.technologies.length).toBe(8);
+            expect(recorder.header.researchable).not.toContain("weapons");
+            expect(recorder.header.researchable).not.toContain(
+                "experimentation",
+            );
+        });
+
+        it("leaves the built-in AI stranded unless it researches claim range", async () => {
+            // Seed 1's free stars all start beyond the claim range.
+            const run = async (flag: boolean) => {
+                engine.seed(1);
+                const game = await engine.createGame(
+                    engine.loadSettings("1v1"),
+                );
+                for (const p of game.galaxy.players) {
+                    engine.setAiConfig(game, p._id, {
+                        researchClaimRangeWhenStranded: flag,
+                    });
+                }
+                await engine.tick(game, 120);
+                return game.galaxy.players.map((p) => stars(game, p));
+            };
+
+            expect(await run(false)).toEqual([6, 6]);
+            for (const n of await run(true)) expect(n).toBeGreaterThan(6);
+        });
+    });
+
     describe("agent environment", () => {
         const play = async (
             env: AgentEnv,

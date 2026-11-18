@@ -91,6 +91,8 @@ export interface Observation {
     cycle: number;
     // Ticks until the next production (end of cycle).
     ticksToProduction: number;
+    // Ticks until a tick-limited game ends, or null.
+    ticksToEnd: number | null;
     defeated: boolean;
     // With starIndex, the star's index in the galaxy's star list.
     candidates: (AiOrderCandidate & { starIndex: number })[];
@@ -652,6 +654,7 @@ export class AgentEnv {
             productionTicks,
             carrierSpeed,
             technologies,
+            researchable,
             hyperspaceRange,
             scanningRange,
         } = new BeliefRecorder(this.engine, this.game).header;
@@ -661,6 +664,7 @@ export class AgentEnv {
             productionTicks,
             carrierSpeed,
             technologies,
+            researchable,
             hyperspaceRange,
             scanningRange,
             starSpecialists: this._starSpecialists().map((s) => ({
@@ -749,6 +753,7 @@ export class AgentEnv {
             tick,
             cycle: Math.floor(tick / ticks),
             ticksToProduction: ticks - (tick % ticks),
+            ticksToEnd: this.game.state.ticksToEnd ?? null,
             defeated: seat.player.defeated,
             candidates: this._proposeOrders(seat).map((c) => ({
                 ...c,

@@ -21,11 +21,7 @@ import { Player } from "../services/types/Player";
 import { Carrier } from "../services/types/Carrier";
 
 type TypedArray =
-    | Int8Array
-    | Uint8Array
-    | Int16Array
-    | Int32Array
-    | Float32Array;
+    Int8Array | Uint8Array | Int16Array | Int32Array | Float32Array;
 
 const DTYPES: Record<string, string> = {
     Int8Array: "i1",
@@ -159,8 +155,11 @@ export class BeliefRecorder {
         }
 
         const startLevels = game.settings.technology.startingTechnologyLevel;
-        this.technologies = Object.keys(startLevels).filter(
-            (k) => /^[^_$]/.test(k) && startLevels[k] > 0,
+        // Every technology the game has, researchable or not, so that the
+        // features have the same layout in every preset (the 1v1 preset
+        // starts experimentation at 0 and cannot research it or weapons).
+        this.technologies = Object.keys(startLevels).filter((k) =>
+            /^[^_$]/.test(k),
         );
 
         // Hyperspace and scanning range by technology level, so ranges can
@@ -180,6 +179,12 @@ export class BeliefRecorder {
             ),
             players: game.galaxy.players.map((p) => ({ alias: p.alias })),
             technologies: this.technologies,
+            researchable: this.technologies.filter((t) =>
+                engine.container.technologyService.isTechnologyResearchable(
+                    game,
+                    t as any,
+                ),
+            ),
             stars: game.galaxy.stars.map((s) => ({
                 x: s.location.x,
                 y: s.location.y,

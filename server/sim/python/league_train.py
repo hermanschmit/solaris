@@ -42,10 +42,11 @@ import torch
 
 import commander_rollout as cr
 import personas as pa
+import presets
 import ppo_train as pt
 
-LEARNER_SEATS = 3
-OPPONENT_SEATS = 4  # the other 3 seats are the built-in AI
+LEARNER_SEATS = presets.SEATS
+OPPONENT_SEATS = presets.PRESET["league_opponents"]  # the rest are the built-in AI
 SNAPSHOT_EVERY = 10
 RECORD_EVERY = 4
 FIRST_SEED = 2_000_000
@@ -89,7 +90,7 @@ def game_maker(run_dir, league):
     def make_job(i, k):
         seed = pt.train_seed(FIRST_SEED, i, k)
         rng = np.random.default_rng(seed)
-        seats = rng.permutation(10)
+        seats = rng.permutation(presets.PLAYERS)
         learner = sorted(int(s) for s in seats[:LEARNER_SEATS])
         members = rng.choice(len(league["members"]), OPPONENT_SEATS, p=pick_weights(league))
         opponents = {int(s): int(m) for s, m in
