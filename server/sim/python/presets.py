@@ -14,6 +14,10 @@ league_opponents   seats league members play in league games
 ship_share_bonus   per-cycle reward for the seat's share of all ships
 builtin            AiConfig overrides for every built-in AI seat (and the
                    built-in baseline in evaluations)
+league_mix         (optional) the share of league games whose opponents are
+                   league members, the built-in AI, and the built-in AI
+                   with a flawed persona; without it every league game has
+                   league_opponents members and the built-in AI in the rest
 """
 
 import os
@@ -27,8 +31,11 @@ PRESETS = {
     # hyperspace or scanning; researchClaimRangeWhenStranded makes it do
     # so. In a two-player game every ship gained is one the opponent lost,
     # so the ship share bonus would mostly reward hoarding: it is off.
+    # With only one opponent seat, league games would otherwise never meet
+    # the built-in AI, which is still the evaluation's bar.
     "1v1": dict(players=2, seats=1, league_opponents=1, ship_share_bonus=0.0,
-                builtin={"researchClaimRangeWhenStranded": True}),
+                builtin={"researchClaimRangeWhenStranded": True},
+                league_mix={"member": 0.4, "builtin": 0.4, "persona": 0.2}),
 }
 
 NAME = os.environ.get("SOLARIS_SETTINGS", "standard")

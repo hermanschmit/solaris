@@ -10,6 +10,9 @@ Each game seats the learner in LEARNER_SEATS random seats, league members
 in OPPONENT_SEATS more (each picked separately), and the built-in AI in the
 rest; in PERSONA_SHARE of games, some of those play a flawed persona
 (personas.py). Members play their most likely decisions under fog, like the learner.
+A preset with a league_mix (1v1) instead picks each game's opponents as a
+whole: league members, the built-in AI, or the built-in AI with a flawed
+persona, in the mix's shares.
 Members the learner does badly against are picked more often, so it keeps
 working on what it cannot yet beat. Every SNAPSHOT_EVERY iterations the
 learner joins the league as a new member.
@@ -97,7 +100,15 @@ def game_maker(run_dir, league):
                      zip(seats[LEARNER_SEATS:LEARNER_SEATS + OPPONENT_SEATS], members)}
         builtin = seats[LEARNER_SEATS + OPPONENT_SEATS:]
         flawed = {}
-        if rng.random() < PERSONA_SHARE:
+        mix = presets.PRESET.get("league_mix")
+        if mix:
+            kind = rng.choice(sorted(mix), p=[mix[k] for k in sorted(mix)])
+            if kind != "member":
+                builtin = seats[LEARNER_SEATS:]
+                opponents = {}
+            if kind == "persona":
+                flawed = pa.assign(rng, builtin)
+        elif rng.random() < PERSONA_SHARE:
             flawed = pa.assign(rng, builtin[:int(rng.integers(1, 3))])
         out = Path(run_dir) / f"iter_{i}"
         out.mkdir(parents=True, exist_ok=True)
@@ -146,6 +157,18 @@ def score(league, games):
         member["rate"] = RATE_DECAY * member["rate"] + (1 - RATE_DECAY) * float(np.mean(r))
         member["games"] += len(r)
     return {league["members"][m]["name"]: round(float(np.mean(r)), 3) for m, r in results.items()}
+
+
+def placement_by_opponent(games):
+    """The learner's mean placement in games against league members, the
+    built-in AI and flawed personas (games with members count as members)."""
+    out = {}
+    for path in games:
+        z = np.load(path)
+        kind = ("member" if len(z.get("opponent_seats", ())) else
+                "persona" if len(z.get("persona_seats", ())) else "builtin")
+        out.setdefault(kind, []).extend(z["place"].tolist())
+    return {k: round(float(np.mean(v)), 3) for k, v in sorted(out.items())}
 
 
 def main():
@@ -214,6 +237,7 @@ def main():
             log("log.jsonl", {"iteration": i, "placement": float(np.mean(steps.places)),
                               "hired": steps.hired, **pt.strategy_shares(steps),
                               "placed_above": against,
+                              "placement_by_opponent": placement_by_opponent(paths),
                               "lag": float(np.mean([i - j for j, _ in played])), **stats,
                               "play_s": round(t1 - t0), "learn_s": round(time.time() - t1)})
 
