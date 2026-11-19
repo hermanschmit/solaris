@@ -161,6 +161,8 @@ def pack(steps, place, agents, seed, standings):
         out["bonus"].append(bonus)
         for k, v in rec["act"].items():
             out.setdefault("act_" + k, []).append(pad(v) if k == "order" else v[0].numpy())
+        for k, v in rec.get("logp_parts", {}).items():
+            out.setdefault("logp_" + k, []).append(pad(v) if k == "order" else v[0].numpy())
         for k, v in rec["inputs"].items():
             inputs.setdefault(k, []).append(pad(v, -1 if k == "cand_star" else 0) if k.startswith("cand_") else v[0].numpy())
         for k in ("star_x", "player_x", "owner", "time", "ticks_to_end"):

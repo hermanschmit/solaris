@@ -355,23 +355,36 @@ class Commander(nn.Module):
         """Log-probability of the recorded actions, and entropy, per decision.
         Research, the spending plan, tuning and specialists are decided only
         at the start of a cycle, and count only then."""
+        parts, ent = self.log_prob_parts(out, b, act)
+        return sum(lp.sum(-1) for lp in parts.values()), ent
+
+    def log_prob_parts(self, out, b, act):
+        """The log-probability of log_prob split into its independent
+        parts, each [B, K]: one column per order weight ("order", 0 for
+        padding), per tuning knob ("config"), and one each for research,
+        plan, spec, spec_star, target and posture. A part not decided at a
+        decision (research off-cycle, spec_star with no hire) is 0. PPO
+        clips each column's ratio separately (ppo_train.PART_CLIP)."""
         d = self.distributions(out, b, act)
         mask = b["cand_mask"].float()
-        turn = b["research_turn"]
-        hired = (act["spec"] > 0).float() * turn
-        lp = ((d["order"].log_prob(act["order"]) * mask).sum(-1)
-              + (d["config"].log_prob(act["config"]).sum(-1)
-                 + d["research"].log_prob(act["research"])
-                 + d["plan"].log_prob(act["plan"])
-                 + d["spec"].log_prob(act["spec"])) * turn
-              + d["spec_star"].log_prob(act["spec_star"]) * hired)
+        turn = b["research_turn"].unsqueeze(-1)
+        hired = (act["spec"] > 0).float().unsqueeze(-1) * turn
+        one = lambda x: x.unsqueeze(-1)
+        parts = {"order": d["order"].log_prob(act["order"]) * mask,
+                 "config": d["config"].log_prob(act["config"]) * turn,
+                 "research": one(d["research"].log_prob(act["research"])) * turn,
+                 "plan": one(d["plan"].log_prob(act["plan"])) * turn,
+                 "spec": one(d["spec"].log_prob(act["spec"])) * turn,
+                 "spec_star": one(d["spec_star"].log_prob(act["spec_star"])) * hired}
+        turn = turn.squeeze(-1)
         ent = (self.order_log_std * mask.sum(-1)
                + (self.config_log_std.sum() + d["research"].entropy() + d["plan"].entropy()
                   + d["spec"].entropy()) * turn)
         if "target" in act:  # the strategy, picked with every order decision
-            lp = lp + d["target"].log_prob(act["target"]) + d["posture"].log_prob(act["posture"])
+            parts["target"] = one(d["target"].log_prob(act["target"]))
+            parts["posture"] = one(d["posture"].log_prob(act["posture"]))
             ent = ent + d["target"].entropy() + d["posture"].entropy()
-        return lp, ent
+        return parts, ent
 
 
 def strategy_prior(cand_kind, is_target, target, posture):
@@ -535,7 +548,8 @@ class CommanderAgent:
                        plan=out["plan_logits"].argmax(-1), spec=out["spec_logits"].argmax(-1))
             act["spec_star"] = self.model.distributions(out, b, act)["spec_star"].logits.argmax(-1)
         act.update(target=out["target"], posture=out["posture"])
-        logp, _ = self.model.log_prob(out, b, act)
+        parts, _ = self.model.log_prob_parts(out, b, act)
+        logp = sum(lp.sum(-1) for lp in parts.values())
 
         weights = torch.exp(act["order"][0]).tolist()
         decision = {"orderWeights": {c["key"]: w for c, w in zip(cands, weights)},
@@ -558,4 +572,4 @@ class CommanderAgent:
             spec = int(act["spec"][0])
             if spec > 0:
                 decision["hire"] = [{"star": int(act["spec_star"][0]), "specialist": spec}]
-        return decision, dict(inputs=b, act=act, logp=logp)
+        return decision, dict(inputs=b, act=act, logp=logp, logp_parts=parts)

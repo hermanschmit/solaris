@@ -86,6 +86,14 @@ MAX_GRAD = 0.5
 TARGET_KL = 0.03  # stop an iteration's epochs early past this
 MAX_LOG_RATIO = 20.0  # a decision's log-probability is a sum over many orders, so can move far
 DUAL_CLIP = 3.0  # bounds the loss of a bad action the policy now likes much more
+# Clip each part of a decision on its own (Commander.log_prob_parts: every
+# order weight, every tuning knob, research, plan, specialist, strategy)
+# rather than the ratio of the whole decision. A decision's ratio is a
+# product over dozens of order weights, so it leaves the clip range after
+# small changes to each, and the clip then stops learning in every head at
+# once. PPO_JOINT=1 goes back to the whole-decision ratio. Games recorded
+# without the parts' log-probabilities are clipped jointly either way.
+PART_CLIP = os.environ.get("PPO_JOINT") != "1"
 SEATS = presets.SEATS  # 3 in standard games, 1 in 1v1 (presets.py)
 EVAL_EVERY = 5
 EVAL_FIRST_SEED = 1  # evaluation seeds; training seeds start far above
@@ -271,10 +279,11 @@ class Steps:
             gaps.append(np.append(np.maximum(np.diff(tick), 1), 1))
             for k in z.files:
                 if not (k.startswith("in_") or k.startswith("truth_") or k.startswith("act_")
-                        or k == "logp"):
+                        or k.startswith("logp")):
                     continue
                 v = z[k][order]
-                if (k.startswith("in_cand_") or k == "act_order") and v.shape[1] < C:
+                if (k.startswith("in_cand_") or k in ("act_order", "logp_order")) \
+                        and v.shape[1] < C:
                     fill = -1 if k == "in_cand_star" else 0
                     v = np.concatenate(
                         [v, np.full((len(v), C - v.shape[1]), fill, v.dtype)], 1)
@@ -308,6 +317,15 @@ class Steps:
                       if "truth_" + k in self.cols})
         act = {k[4:]: get(k) for k in self.cols if k.startswith("act_")}
         return policy, truth, act, get("logp").float()
+
+    def old_parts(self, idx, device):
+        """The recorded log-probability of each part of the decisions
+        (Commander.log_prob_parts), or None for games recorded without."""
+        names = [k[5:] for k in self.cols if k.startswith("logp_")]
+        if "order" not in names:
+            return None
+        idx = torch.as_tensor(idx)
+        return {k: self.cols["logp_" + k][idx].to(device).float() for k in names}
 
 
 def strategy_shares(steps):
@@ -350,6 +368,45 @@ def optimizer(model):
                              {"params": rest, "lr": LR_HEADS}])
 
 
+def clipped(log_ratio, a):
+    """PPO's clipped objective for log-ratios [B, ...] sharing advantages
+    a [B], with the dual clip: otherwise, for an action with negative
+    advantage whose probability has grown many times (as an older game's
+    can have), the loss grows without bound."""
+    a = a.view(-1, *([1] * (log_ratio.dim() - 1)))
+    ratio = torch.exp(log_ratio)
+    objective = torch.min(ratio * a, ratio.clamp(1 - CLIP, 1 + CLIP) * a)
+    return torch.where(a < 0, torch.max(objective, DUAL_CLIP * a), objective)
+
+
+def clipped_parts(parts, old_parts, policy, act, a):
+    """The clipped objective per decision [B], summed over the decision's
+    parts (Commander.log_prob_parts), each part clipped on its own. Where
+    every ratio is 1 its gradient is the whole decision's. Also each
+    part's KL and clipped share, over the decisions where it was decided."""
+    turn = policy["research_turn"].unsqueeze(-1) > 0
+    live = {"order": policy["cand_mask"], "config": turn, "research": turn, "plan": turn,
+            "spec": turn, "spec_star": turn & (act["spec"] > 0).unsqueeze(-1),
+            "target": None, "posture": None}
+    total, stats, clipped_n, live_n = 0.0, {}, 0.0, 0.0
+    for k, lp in parts.items():
+        log_ratio = (lp - old_parts[k]).clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO)
+        on = live[k]
+        on = torch.ones_like(lp, dtype=torch.bool) if on is None else on.expand_as(lp)
+        total = total + (clipped(log_ratio, a) * on).sum(-1)
+        with torch.no_grad():
+            ratio = torch.exp(log_ratio)
+            n = on.float().sum().clamp(min=1)
+            # KL per decision: summed over the part's columns, averaged
+            # over all decisions, so the parts add up to the decision's.
+            stats["kl_" + k] = (((ratio - 1) - log_ratio) * on).sum().item() / lp.shape[0]
+            c = (((ratio - 1).abs() > CLIP) & on).float().sum().item()
+            stats["clip_frac_" + k] = c / n.item()
+            clipped_n, live_n = clipped_n + c, live_n + on.float().sum().item()
+    stats["clip_frac"] = clipped_n / max(live_n, 1)
+    return total, stats
+
+
 def update(model, opt, steps, device):
     v = values(model, steps, device)
     adv, ret = gae(steps.reward, v, steps.done, steps.gap)
@@ -369,14 +426,16 @@ def update(model, opt, steps, device):
 
             strategy = (act["target"], act["posture"]) if "target" in act else None
             out = model(policy, strategy)
-            logp, ent = model.log_prob(out, policy, act)
-            log_ratio = (logp - old_logp).clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO)
-            ratio = torch.exp(log_ratio)
-            objective = torch.min(ratio * a, ratio.clamp(1 - CLIP, 1 + CLIP) * a)
-            # Dual-clip PPO: otherwise, for an action with negative advantage
-            # whose probability has grown many times (as an older game's can
-            # have), the loss grows without bound.
-            objective = torch.where(a < 0, torch.max(objective, DUAL_CLIP * a), objective)
+            old_parts = steps.old_parts(idx, device) if PART_CLIP else None
+            if old_parts is not None:
+                parts, ent = model.log_prob_parts(out, policy, act)
+                objective, part_stats = clipped_parts(parts, old_parts, policy, act, a)
+                log_ratio = sum((parts[k] - old_parts[k]).sum(-1) for k in parts).detach()
+            else:
+                logp, ent = model.log_prob(out, policy, act)
+                log_ratio = (logp - old_logp).clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO)
+                objective = clipped(log_ratio, a)
+                part_stats = {}
             pg = -objective.mean()
             value_loss = ((model.value(truth) - r) ** 2).mean()
             loss = pg + VALUE_COEF * value_loss - ENTROPY_COEF * ent.mean()
@@ -387,11 +446,21 @@ def update(model, opt, steps, device):
             opt.step()
 
             with torch.no_grad():
-                kl = ((ratio - 1) - log_ratio).mean().item()
-                clipped = ((ratio - 1).abs() > CLIP).float().mean().item()
+                if old_parts is not None:
+                    # Independent parts: the decision's KL is the parts' sum.
+                    kl = sum(v for k, v in part_stats.items() if k.startswith("kl_"))
+                    clipped_share = part_stats.pop("clip_frac")  # over every part's columns
+                else:
+                    ratio = torch.exp(log_ratio)
+                    kl = ((ratio - 1) - log_ratio).mean().item()
+                    clipped_share = ((ratio - 1).abs() > CLIP).float().mean().item()
+                # The whole decision's ratio, clipped or not, for comparison.
+                joint = ((log_ratio.clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO).exp() - 1).abs()
+                         > CLIP).float().mean().item()
             kls.append(kl)
             for k, x in (("policy_loss", pg.item()), ("value_loss", value_loss.item()),
-                         ("kl", kl), ("clip_frac", clipped)):
+                         ("kl", kl), ("clip_frac", clipped_share), ("joint_clip_frac", joint),
+                         *part_stats.items()):
                 sums[k] = sums.get(k, 0.0) + x
             count += 1
         stats["epochs"] = epoch + 1
