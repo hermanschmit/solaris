@@ -289,6 +289,7 @@ class BeliefTracker:
         mem_ships = np.asarray(frame["mem_ships"], dtype=np.float32)
         mem_infra = np.asarray(frame["mem_infra"], dtype=np.float32)
         levels = np.asarray(frame["levels"], dtype=np.float32)
+        stats = np.asarray(frame["stats"], dtype=np.float32)
 
         own_mask = owner == self.seat
         if own_mask.any():
@@ -328,14 +329,17 @@ class BeliefTracker:
                 ind_prior[i] = np.log1p(max(0.5, float(mem_infra[i, 1])))
                 sci_prior[i] = np.log1p(max(0.5, float(mem_infra[i, 2])))
             else:
-                base_weight = (
-                    1.0
-                    + 1.2 * home_boost[i]
-                    + 0.8 * frontier_boost[i]
-                    + 0.02 * self._nat_ind[i]
-                    + 0.1 * np.log1p(ghost_bonus[i])
+                avg_ships = max(
+                    4.0, float(stats[q, 1]) / max(1.0, float(stats[q, 0]))
                 )
-                ship_prior[i] = float(np.log(max(base_weight, 0.1)))
+                shape_factor = (
+                    0.55
+                    + 0.70 * home_boost[i]
+                    + 0.55 * frontier_boost[i]
+                    + 0.01 * self._nat_ind[i]
+                )
+                est_unseen = avg_ships * shape_factor + float(ghost_bonus[i])
+                ship_prior[i] = float(np.log1p(max(est_unseen, 0.5)))
 
         return {
             "ships": ship_prior,

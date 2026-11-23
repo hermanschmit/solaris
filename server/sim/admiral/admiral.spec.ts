@@ -317,7 +317,108 @@ describe("Admiral stack", () => {
                         doomed._id.toString(),
             );
             expect(evac).toBeDefined();
-            expect(evac!.ships).toBe(30);
+            // Leaves 1 rear-guard ship behind on `doomed` for the `1 + B` hit!
+            expect(evac!.ships).toBe(29);
+            expect(doomed.ships).toBe(1);
+        });
+
+        it("enforces $25 carrier gate and stands-and-bleeds when a friendly counter-punch can recapture", async () => {
+            const env = new AdmiralEnv();
+            await env.reset({ admiralSeats: [0], seed: 34, fog: false });
+            const game = env.game;
+            const p0 = game.galaxy.players[0];
+            const p1 = game.galaxy.players[1];
+            const speed = game.settings.specialGalaxy.carrierSpeed;
+
+            p0.credits = 500;
+            p0.research.hyperspace.level = 6;
+            p0.research.weapons.level = 1;
+            p1.research.weapons.level = 1;
+            game.galaxy.carriers = [];
+
+            const ownStars = game.galaxy.stars.filter(
+                (s) => s.ownedByPlayerId?.toString() === p0._id.toString(),
+            );
+            const doomed = ownStars[0];
+            const safe = ownStars[1];
+            for (const s of ownStars) {
+                s.ships = 0;
+                s.shipsActual = 0;
+                s.infrastructure = { economy: 0, industry: 0, science: 0 };
+            }
+
+            doomed.location = { x: 0, y: 0 };
+            safe.location = { x: speed * 4, y: 0 }; // 4 ticks away (> 2 ticks ETA, so cannot reinforce in time!)
+            const enemyStar = game.galaxy.stars.find(
+                (s) => s.ownedByPlayerId?.toString() === p1._id.toString(),
+            )!;
+            enemyStar.location = { x: -speed * 4, y: 0 };
+
+            const spawnAttack = (attShips: number) => {
+                game.galaxy.carriers = [
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        ownedByPlayerId: p1._id,
+                        name: "Attacker",
+                        orbiting: null,
+                        isGift: false,
+                        ships: attShips,
+                        specialistId: null,
+                        specialistExpireTick: null,
+                        specialist: null,
+                        location: { x: -speed * 1.5, y: 0 }, // 2 ticks until arrival
+                        locationNext: { x: -speed * 0.5, y: 0 },
+                        waypoints: [
+                            {
+                                _id: new mongoose.Types.ObjectId(),
+                                source: enemyStar._id,
+                                destination: doomed._id,
+                                action: "nothing",
+                                actionShips: 0,
+                                delayTicks: 0,
+                            },
+                        ],
+                        waypointsLooped: false,
+                    } as any,
+                ];
+            };
+
+            // Case A: Small stack (6 ships, no orbiting carrier) vs huge 300-ship fleet
+            // -> Do NOT waste $25 building an evacuation carrier for < 10 ships.
+            doomed.ships = 6;
+            doomed.shipsActual = 6;
+            safe.ships = 5;
+            safe.shipsActual = 5;
+            spawnAttack(300);
+            const credBefore = p0.credits;
+            await env.tacticalExecutor.executeTick(game, p0, {
+                attackDesire: new Array(game.galaxy.stars.length).fill(0),
+                autoCarrierSpecialist: false,
+            });
+            expect(p0.credits).toBe(credBefore);
+            expect(doomed.ships).toBe(6);
+
+            // Case B: Stand-and-Bleed Counter-Punch!
+            // `doomed` has 15 ships (W=1 + B=1 => strike 2 vs attacker W=1 => 2:1 kills!).
+            // 35 attackers lose 30 ships, leaving only 5 weakened survivors;
+            // `safe` (4 ticks away, within direct jump range) holds 25 ships to immediately recapture!
+            doomed.ships = 15;
+            doomed.shipsActual = 15;
+            safe.ships = 25;
+            safe.shipsActual = 25;
+            spawnAttack(35);
+            await env.tacticalExecutor.executeTick(game, p0, {
+                attackDesire: new Array(game.galaxy.stars.length).fill(0),
+                autoCarrierSpecialist: false,
+            });
+            const evacB = game.galaxy.carriers.find(
+                (c) =>
+                    c.ownedByPlayerId?.toString() === p0._id.toString() &&
+                    c.waypoints?.[0]?.source.toString() ===
+                        doomed._id.toString(),
+            );
+            expect(evacB).toBeUndefined();
+            expect(doomed.ships).toBe(15);
         });
     });
 

@@ -1,32 +1,25 @@
 """Heterogeneous Star+Player Graph Transformer & Distributional Critic (`AdmiralNet`).
 
-Key architectural upgrades over `Commander`:
-1. All ship, infrastructure, credit, and upgrade-cost inputs use `log1p` scaling
-   (eliminating late-game activation & critic explosions in 3000-tick wars).
-2. Explicit Pairwise Star-Graph Attention Biases (`[B, H, S, S]`): encodes
-   Euclidean travel ticks, multi-hop hyperspace shortest-path ticks, direct jump
-   reachability, wormholes/warp-gates, and shared ownership.
-3. Coupled Star <-> Player Graph Transformer: Star tokens and Empire (Player)
-   tokens exchange information every layer, giving both policy and critic a
-   symmetric representation of all `P` empires' tech, economy, and war attrition.
-4. Calculator Features: exact marginal upgrade costs per star, research progress
-   fraction (`progress / required`), ticks to research completion, and scoreboard
-   `Delta stats` war-attrition signals from `BeliefTracker`.
-5. Factored Low-Variance Policy Heads:
-   - `spatial`: 2 offensive target pointers (`attack_1`, `attack_2`), 1 defensive
-     bastion pointer (`defend`), and 3 targeted infrastructure pointers
-     (`ind_star`, `sci_star`, `wg_star`), all zero-initialized at index 0 ("broad
-     algorithmic ROI") with direct gradient flow into every star's embedding.
-   - `budget`: 5-way Dirichlet distribution over `[sci, ind, eco, wg, reserve]`.
-   - `knobs`: 3-D Gaussian over `[attackMargin, maxAttackTicks, triageThreshold]`.
-   - `macro`: `research` (`keep` + `T` techs), `specialist` (`none` + star
-     specialist + star pointer), and `diplomacy` (`hold`, `court`, `betray`).
-6. Auxiliary Conservation-Belief Head (`[B, S, 4]`): predicts residual star
-   logits for hidden `ships`, `economy`, `industry`, and `science`, projected
-   through `BeliefTracker`'s exact scoreboard-conservation layer.
-7. 10-Rank Distributional Placement Critic (`truth` & `fog`): predicts placement
-   probabilities `p(rank = 1..P)` bounded strictly in `[-1, 1]`, plus a bounded
-   shaping-bonus head.
+Key architectural capabilities:
+1. `log1p`-scaled inputs across all ship, infrastructure, credit, and marginal
+   upgrade-cost features (stable in 3,000-tick late-game wars).
+2. Explicit Pairwise Star-Graph Attention Biases (`[B, H, S, S]`): Euclidean
+   travel ticks, multi-hop hyperspace shortest-path ticks, direct jump reach,
+   wormholes/warp-gates, and shared ownership.
+3. Coupled Star <-> Player Graph Transformer (`backbone` & `critic_backbone`),
+   with `forward_pretrain` multi-task heads for offline `.sbd` supervised
+   pre-training (4-channel conservation belief, star threat/incoming fleets,
+   opponent hidden credits/tokens/research, fog & truth rank critics, and
+   2-cycle future star control).
+4. Expressive Per-Part Clipped Policy Heads (`PART_NAMES`):
+   - `frontier` (`[B, S]` continuous log-weights over reachable frontier stars,
+     giving fine-grained per-star claim & Time-on-Target invasion scoring),
+   - `posture` (`balanced`, `expand`, `conquer`, `fortify`, `warp_surge`),
+   - `target_player` (`P`-way rival empire focus with neighbor proximity prior),
+   - `budget` (5-way Dirichlet `[sci, ind, eco, wg, carrierCash]`),
+   - `knobs` (3 independent continuous knobs `[attackMargin, maxAttackTicks, triageThreshold]`),
+   - `research` (per-technology feature-conditioned head without artificial
+     terraforming caps), and `spec` + `spec_star`.
 """
 
 import math
@@ -55,30 +48,56 @@ from belief_tracker import (  # noqa: E402
 
 MAX_PLAYERS = 16
 MAX_SPECIALIST_ID = 18
+MAX_FRONTIER_STARS = 32
 N_EDGE_FEATURES = 5
-D_STAR_IN = 35
-N_BASE_PLAYER = 15  # before tech levels (T) and delta features (10)
+N_BASE_PLAYER = 16  # before tech levels (T) and delta features (10)
+D_TECH_IN = 6
 
-# Default budget shares: [science, industry, economy, warpGate, carrierReserve]
-DEFAULT_BUDGET_ALPHA = [2.2, 3.3, 3.0, 0.6, 1.1]
+POSTURES = ("balanced", "expand", "conquer", "fortify", "warp_surge")
+
+# Default cycle budget shares: [science, industry, economy, warpGate, carrierCash]
+DEFAULT_BUDGET_ALPHA = [2.4, 3.2, 3.5, 0.4, 0.5]
 
 # Continuous tactical knobs: (name, default, scale, lo, hi)
 TACTICAL_KNOBS = [
-    ("attackMargin", 1.35, 0.25, 1.02, 3.5),
-    ("maxAttackTicks", 42.0, 0.30, 12.0, 120.0),
+    ("attackMargin", 3.2, 0.35, 1.15, 6.0),
+    ("maxAttackTicks", 42.0, 0.30, 14.0, 100.0),
     ("triageThreshold", 0.85, 0.20, 0.35, 1.25),
 ]
 
 SPECIALIST_PRIOR = {
-    11: (5.5, 2),  # Research Station -> science
-    2: (5.0, 1),   # Space Dock -> industry
-    4: (4.5, 0),   # Orbital Cannon -> total/economy
+    11: (7.5, 2),  # Research Station -> 2x science output (cost 5 tokens)
+    2: (5.8, 1),   # Space Dock -> +2 manufacturing, -1 terraforming (cost 2 tokens)
+    4: (5.0, 0),   # Orbital Cannon -> +1 defender bonus (cost 2 tokens)
 }
 
-KEEP_BIAS = 3.0
-INITIAL_KNOB_STD = 0.25
+TECH_BASE_WEIGHTS = {
+    "weapons": 2.70,
+    "manufacturing": 2.65,
+    "hyperspace": 2.20,
+    "terraforming": 2.15,
+    "banking": 1.85,
+    "scanning": 1.65,
+    "experimentation": 0.55,
+    "specialists": 0.45,
+}
+CORE_TECH_NAMES = ("weapons", "manufacturing")
+
+KEEP_BIAS = 3.5
+INITIAL_KNOB_STD = 0.22
+INITIAL_FRONTIER_STD = 0.28
 
 HEAD_GROUPS = ("spatial", "budget", "knobs", "macro")
+PART_NAMES = (
+    "frontier",
+    "posture",
+    "target_player",
+    "budget",
+    "knobs",
+    "research",
+    "spec",
+    "spec_star",
+)
 
 
 def zero_last(module: nn.Linear) -> nn.Linear:
@@ -215,6 +234,10 @@ def build_admiral_inputs(
         static.hyper_range[np.clip(own_hs_lvl, 1, len(static.hyper_range)) - 1]
         / max(static.speed, 1e-4)
     )
+    far_hs_ticks = float(
+        static.hyper_range[np.clip(own_hs_lvl + 3, 1, len(static.hyper_range)) - 1]
+        / max(static.speed, 1e-4)
+    )
     own_paths = static.paths(own_hs_lvl)  # [S, S] travel ticks
 
     own_idx = np.flatnonzero(owner == seat)
@@ -225,16 +248,36 @@ def build_admiral_inputs(
         if len(own_idx) > 0
         else np.full(S, max_t, dtype=np.float32)
     )
+    euclid_to_own = (
+        static.travel[:, own_idx].min(axis=1)
+        if len(own_idx) > 0
+        else np.full(S, max_t, dtype=np.float32)
+    )
     ticks_to_enemy = (
         np.minimum(static.travel[:, enemy_idx].min(axis=1), max_t)
         if len(enemy_idx) > 0
         else np.full(S, max_t, dtype=np.float32)
     )
     in_own_jump = (
-        (static.travel[:, own_idx].min(axis=1) <= own_hs_ticks).astype(np.float32)
+        (euclid_to_own <= own_hs_ticks).astype(np.float32)
         if len(own_idx) > 0
         else np.zeros(S, dtype=np.float32)
     )
+
+    # Active frontier candidate stars [S] (reachable claims + reachable enemy border stars)
+    frontier_mask = np.zeros(S, dtype=bool)
+    if len(own_idx) > 0:
+        cand_unowned = (owner < 0) & (
+            (ticks_to_own <= float(cycle * 2.5)) | (euclid_to_own <= far_hs_ticks)
+        )
+        cand_enemy = ((owner >= 0) & (owner != seat)) & (
+            (euclid_to_own <= own_hs_ticks * 1.05) | (ticks_to_own <= float(cycle * 1.8))
+        )
+        cand_all = np.flatnonzero(cand_unowned | cand_enemy)
+        if len(cand_all) > MAX_FRONTIER_STARS:
+            order_f = np.argsort(ticks_to_own[cand_all])[:MAX_FRONTIER_STARS]
+            cand_all = cand_all[order_f]
+        frontier_mask[cand_all] = True
 
     hs_all = np.array(
         [int(static.hyperspace(levels, q)) for q in range(P)], dtype=np.int64
@@ -287,8 +330,6 @@ def build_admiral_inputs(
         axis=1,
     ).astype(np.float32)  # [S, 32]
 
-    # Append natural resource & star-type quality [S, 9] -> take first 3 + sum?
-    # Better: include full static.quality [S, 9] -> total star dim = 32 + 9 = 41!
     star_x = np.concatenate([star_core, static.quality], axis=1).astype(np.float32)
 
     # Pairwise Star Edge Features [S, S, N_EDGE_FEATURES=5]
@@ -324,11 +365,25 @@ def build_admiral_inputs(
     tot_stars = max(1.0, float(stats[:, 0].sum()))
     tot_ships = max(1.0, float(stats[:, 1].sum()))
 
+    alive_enemy_mask = np.zeros(P, dtype=bool)
+    alive_enemy_mask[0] = True  # index 0 = opportunistic / no fixed rival
+
     player_rows = []
     for idx_in_order, q in enumerate(p_order):
         is_self = 1.0 if q == seat else 0.0
         st = stats[q]
         lvl = levels[q] / 10.0
+
+        if idx_in_order >= 1 and defeated[q] <= 0.5 and st[0] > 0:
+            alive_enemy_mask[idx_in_order] = True
+
+        q_stars = owner == q
+        if q == seat:
+            min_dist_own = 0.0
+        elif q_stars.any() and len(own_idx) > 0:
+            min_dist_own = float(np.minimum(euclid_to_own[q_stars].min(), max_t))
+        else:
+            min_dist_own = max_t
 
         if truth_facts is not None:
             p_cred = float(truth_facts["playerCredits"][q])
@@ -383,9 +438,10 @@ def build_admiral_inputs(
                 r_frac,
                 np.log1p(eta_res) / 5.0,
                 float(r_now + 1) / float(T + 1),
+                np.log1p(min_dist_own) / 4.5,
             ],
             dtype=np.float32,
-        )  # length 15 == N_BASE_PLAYER
+        )  # length 16 == N_BASE_PLAYER
         player_rows.append(np.concatenate([base_p, lvl.astype(np.float32), deltas[q]]))
 
     player_x = np.stack(player_rows, axis=0).astype(np.float32)
@@ -399,6 +455,83 @@ def build_admiral_inputs(
     for ti, t_name in enumerate(static.techs):
         if t_name in static.researchable:
             research_mask[1 + ti] = True
+
+    # Per-technology calculator & light iter-0 tie-breaker features [T, D_TECH_IN=6]
+    # Note: `weapons` and `manufacturing` are NOT penalized for advancing ahead
+    # of `terraforming`, allowing late-game weapon/manufacturing scaling.
+    own_lvls = levels[seat].astype(np.float32)
+    alive_rivals = [
+        q for q in range(P) if q != seat and defeated[q] <= 0.5 and stats[q, 0] > 0
+    ]
+    max_enemy_lvls = (
+        levels[alive_rivals].max(axis=0).astype(np.float32)
+        if alive_rivals
+        else own_lvls.copy()
+    )
+    res_able = research_mask[1:]
+    core_able = np.array(
+        [
+            (t_name in CORE_TECH_NAMES) and bool(res_able[ti])
+            for ti, t_name in enumerate(static.techs)
+        ],
+        dtype=bool,
+    )
+    if core_able.any():
+        min_wm_lvl = float(own_lvls[core_able].min())
+    elif res_able.any():
+        min_wm_lvl = float(own_lvls[res_able].min())
+    else:
+        min_wm_lvl = 1.0
+
+    tech_x = np.zeros((T, D_TECH_IN), dtype=np.float32)
+    for ti, t_name in enumerate(static.techs):
+        prog_t = (
+            float(own_facts["researchProgress"][ti])
+            if (own_facts and ti < len(own_facts["researchProgress"]))
+            else 0.0
+        )
+        req_t = (
+            float(own_facts["researchRequired"][ti])
+            if (own_facts and ti < len(own_facts["researchRequired"]))
+            else max(100.0, float(own_lvls[ti]) * 100.0)
+        )
+        frac_t = float(np.clip(prog_t / max(req_t, 1.0), 0.0, 1.0)) if req_t > 0 else 0.0
+        lvl_t = float(own_lvls[ti])
+
+        base_w = TECH_BASE_WEIGHTS.get(t_name, 1.0)
+        if t_name == "hyperspace":
+            if lvl_t < 4.0:
+                base_w += 0.95 * (4.0 - lvl_t) / 3.0
+            else:
+                base_w -= 0.70 * (lvl_t - 3.0)
+        elif t_name == "terraforming":
+            if lvl_t >= 3.0:
+                base_w -= 0.65 * (lvl_t - 2.0)
+        elif t_name == "banking":
+            if lvl_t >= 3.0:
+                base_w -= 0.70 * (lvl_t - 2.0)
+        elif t_name == "scanning":
+            if lvl_t < 3.0:
+                base_w += 0.70 * (3.0 - lvl_t) / 2.0
+            else:
+                base_w -= 0.55 * (lvl_t - 2.0)
+        elif t_name == "weapons":
+            base_w += 0.45 * max(0.0, float(max_enemy_lvls[ti] - lvl_t))
+
+        ahead_wm = max(0.0, lvl_t - min_wm_lvl) if t_name in CORE_TECH_NAMES else max(0.0, lvl_t - 2.0)
+        prior_t = base_w - 0.35 * ahead_wm + 2.2 * frac_t
+
+        tech_x[ti] = np.array(
+            [
+                lvl_t / 10.0,
+                (lvl_t - min_wm_lvl) / 4.0,
+                float(max_enemy_lvls[ti] - lvl_t) / 4.0,
+                np.log1p(max(req_t, 0.0)) / 9.0,
+                frac_t,
+                prior_t,
+            ],
+            dtype=np.float32,
+        )
 
     spec_mask = np.zeros(1 + MAX_SPECIALIST_ID, dtype=bool)
     spec_mask[0] = True
@@ -420,16 +553,19 @@ def build_admiral_inputs(
     )
 
     return {
-        "star_x": star_x,                   # [S, 41]
-        "edge_x": edge_x,                   # [S, S, 5]
-        "player_x": player_x,               # [P, 15 + T + 10]
-        "owner_rel": owner_rel,             # [S] in {-1, 0..P-1}
-        "time_x": time_x,                   # [4]
-        "own_mask": own_mask,               # [S]
-        "non_own_mask": non_own_mask,       # [S]
-        "free_own_mask": free_own_star,     # [S]
-        "research_mask": research_mask,     # [1 + T]
-        "spec_mask": spec_mask,             # [1 + MAX_SPECIALIST_ID]
+        "star_x": star_x,                       # [S, 41]
+        "edge_x": edge_x,                       # [S, S, 5]
+        "player_x": player_x,                   # [P, 16 + T + 10]
+        "tech_x": tech_x,                       # [T, 6]
+        "owner_rel": owner_rel,                 # [S] in {-1, 0..P-1}
+        "time_x": time_x,                       # [4]
+        "own_mask": own_mask,                   # [S]
+        "non_own_mask": non_own_mask,           # [S]
+        "frontier_mask": frontier_mask,         # [S]
+        "free_own_mask": free_own_star,         # [S]
+        "alive_enemy_mask": alive_enemy_mask,   # [P]
+        "research_mask": research_mask,         # [1 + T]
+        "spec_mask": spec_mask,                 # [1 + MAX_SPECIALIST_ID]
     }
 
 
@@ -500,7 +636,6 @@ class HeterogeneousLayer(nn.Module):
         counts = onehot.sum(dim=1).clamp(min=1.0).unsqueeze(-1)  # [B, P, 1]
         s_mean = torch.einsum("bsp,bsd->bpd", onehot, h_s) / counts
         neg_inf = torch.full_like(h_s[:, :, :1], -1e4)
-        # Masked max pool per player
         expanded_mask = onehot.unsqueeze(-1) > 0.5  # [B, S, P, 1]
         s_max = torch.where(
             expanded_mask,
@@ -563,7 +698,6 @@ class HeterogeneousBackbone(nn.Module):
         t_emb = self.time_proj(time_x)  # [B, D]
         h_s = self.star_proj(star_x) + t_emb.unsqueeze(1)
         h_p = self.player_proj(player_x) + t_emb.unsqueeze(1)
-        # [B, S, S, H] -> [B, H, S, S]
         edge_bias = self.edge_proj(edge_x).permute(0, 3, 1, 2).contiguous()
 
         for layer in self.layers:
@@ -572,8 +706,6 @@ class HeterogeneousBackbone(nn.Module):
         h_s = self.out_norm_s(h_s)
         h_p = self.out_norm_p(h_p)
 
-        # Global representation pools self player + mean/max across ALL empires
-        # so the policy & critic understand overall galaxy balance of power.
         p_self = h_p[:, 0]
         p_mean = h_p.mean(dim=1)
         p_max = h_p.max(dim=1).values
@@ -616,32 +748,18 @@ class AdmiralNet(nn.Module):
         )
         g_dim = 4 * d
 
-        # --- Group 1: Spatial Pointer Heads (index 0 = broad algorithmic prior) ---
-        self.attack1_broad = mlp(g_dim, 1)
-        self.attack1_star = mlp(d + g_dim, 1)
-        self.attack2_broad = mlp(g_dim, 1)
-        self.attack2_star = mlp(d + g_dim, 1)
-
-        self.defend_broad = mlp(g_dim, 1)
-        self.defend_star = mlp(d + g_dim, 1)
-
-        self.ind_broad = mlp(g_dim, 1)
-        self.ind_star = mlp(d, 1)
-        self.sci_broad = mlp(g_dim, 1)
-        self.sci_star = mlp(d, 1)
-        self.wg_broad = mlp(g_dim, 1)
-        self.wg_star = mlp(d, 1)
+        # --- Group 1: Fine-Grained Per-Frontier-Star Scoring + Stance + Rival ---
+        self.frontier_head = mlp(d + g_dim, 1, hidden=128, zero_out=True)
+        self.frontier_log_std = nn.Parameter(
+            torch.tensor(math.log(INITIAL_FRONTIER_STD))
+        )
+        self.posture_head = mlp(g_dim, len(POSTURES))
+        self.target_none_head = mlp(g_dim, 1)
+        self.target_emp_head = mlp(d + g_dim, 1)
 
         with torch.no_grad():
-            for head in (
-                self.attack1_broad,
-                self.attack2_broad,
-                self.defend_broad,
-                self.ind_broad,
-                self.sci_broad,
-                self.wg_broad,
-            ):
-                head[-1].bias.fill_(1.5)
+            self.posture_head[-1].bias[0] = 1.8
+            self.target_none_head[-1].bias.fill_(1.6)
 
         # --- Group 2: Cycle Budget Dirichlet Head [5] ---
         self.budget_head = mlp(g_dim, 5)
@@ -655,89 +773,147 @@ class AdmiralNet(nn.Module):
             torch.full((len(TACTICAL_KNOBS),), math.log(INITIAL_KNOB_STD))
         )
 
-        # --- Group 4: Discrete Macro Heads (Research, Specialist, Diplomacy) ---
-        self.research_head = mlp(g_dim, 1 + n_techs)
+        # --- Group 4: Discrete Macro Heads (Feature-Conditioned Research + Specialist) ---
+        self.research_keep_head = mlp(g_dim, 1)
+        self.research_tech_head = mlp(g_dim + D_TECH_IN, 1, hidden=96)
         self.spec_head = mlp(g_dim, 1 + MAX_SPECIALIST_ID)
         self.spec_star_head = mlp(d, MAX_SPECIALIST_ID)
         with torch.no_grad():
-            self.research_head[-1].bias[0] = KEEP_BIAS
+            self.research_keep_head[-1].bias.fill_(0.5)
             self.spec_head[-1].bias[0] = KEEP_BIAS
 
         # Auxiliary conservation-constrained hidden belief head:
         # [ships_logit, eco_logit, ind_logit, sci_logit] per star
         self.belief_head = mlp(d, 4)
 
+        # Auxiliary dense representation heads trained during `.sbd` pre-training:
+        # - star tactical threat `[log1p(true_ships), log1p(threat_1c), log1p(incoming)]`
+        # - opponent hidden state `[log1p(credits)/8, log1p(spec_tokens)/4, researchingNow_logits...]`
+        # - privileged truth 2-cycle star ownership projection
+        self.aux_star_threat_head = zero_last(nn.Linear(d, 3))
+        self.aux_opp_state_head = zero_last(nn.Linear(d, 2 + n_techs))
+        self.aux_truth_expand_head = zero_last(nn.Linear(d, 1))
+
         # Dual Distributional Critics:
-        # - `fog_critic` evaluates fog observations (usable during search at test time!)
-        # - `truth_critic` evaluates privileged full-galaxy observations during RL
         self.fog_critic = DistributionalValueHead(g_dim)
         self.truth_critic = DistributionalValueHead(g_dim)
 
-    def _pointer_logits(
+    def trunk_parameters(self) -> list[nn.Parameter]:
+        """Parameters of the pre-trained fog Graph Transformer + belief head
+        (updated with a smaller learning rate during PPO so representations stay sharp)."""
+        return list(self.backbone.parameters()) + list(self.belief_head.parameters())
+
+    def forward_pretrain(
         self,
-        broad_head: nn.Module,
-        star_head: nn.Module,
-        h_s: torch.Tensor,
-        g: torch.Tensor,
-        valid_mask: torch.Tensor,
-        concat_global: bool = True,
-    ) -> torch.Tensor:
-        B, S, _ = h_s.shape
-        broad = broad_head(g)  # [B, 1]
-        if concat_global:
-            inp = torch.cat([h_s, g.unsqueeze(1).expand(B, S, -1)], dim=-1)
-        else:
-            inp = h_s
-        stars = star_head(inp).squeeze(-1)  # [B, S]
-        stars = stars.masked_fill(~valid_mask, -1e9)
-        return torch.cat([broad, stars], dim=-1)  # [B, 1 + S]
+        fog_batch: dict[str, torch.Tensor],
+        truth_batch: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Multi-task forward pass for offline `.sbd` supervised pre-training of
+        both `backbone` (fog) and `critic_backbone` (privileged truth)."""
+        P = fog_batch["player_x"].shape[1]
+        h_s_fog, h_p_fog, g_fog = self.backbone(
+            fog_batch["star_x"],
+            fog_batch["edge_x"],
+            fog_batch["player_x"],
+            fog_batch["owner_rel"],
+            fog_batch["time_x"],
+        )
+        belief_logits = self.belief_head(h_s_fog)
+        raw_threat = self.aux_star_threat_head(h_s_fog)
+        base_ships = fog_batch["star_x"][:, :, 10:11] * 1.2  # log1p(ships_est) / 5.0
+        base_in = fog_batch["star_x"][:, :, 18:19]           # log1p(seen_enemy_in) / 5.0
+        star_threat_pred = torch.cat(
+            [
+                raw_threat[:, :, 0:1] + base_ships,
+                raw_threat[:, :, 1:2] + base_ships,
+                raw_threat[:, :, 2:3] + base_in,
+            ],
+            dim=-1,
+        )
+        opp_state_pred = self.aux_opp_state_head(h_p_fog)
+        fog_rank_logits, fog_val, _ = self.fog_critic(g_fog, P)
+
+        h_s_truth, _, g_truth = self.critic_backbone(
+            truth_batch["star_x"],
+            truth_batch["edge_x"],
+            truth_batch["player_x"],
+            truth_batch["owner_rel"],
+            truth_batch["time_x"],
+        )
+        truth_rank_logits, truth_val, _ = self.truth_critic(g_truth, P)
+        truth_expand_logits = self.aux_truth_expand_head(h_s_truth).squeeze(-1)
+
+        return {
+            "belief_logits": belief_logits,
+            "star_threat_pred": star_threat_pred,
+            "opp_state_pred": opp_state_pred,
+            "fog_rank_logits": fog_rank_logits,
+            "fog_val": fog_val,
+            "truth_rank_logits": truth_rank_logits,
+            "truth_val": truth_val,
+            "truth_expand_logits": truth_expand_logits,
+        }
 
     def forward_policy(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         star_x = batch["star_x"]
         edge_x = batch["edge_x"]
         player_x = batch["player_x"]
+        tech_x = batch["tech_x"]
         owner_rel = batch["owner_rel"]
         time_x = batch["time_x"]
         own_mask = batch["own_mask"]
-        non_own_mask = batch["non_own_mask"]
+        frontier_mask = batch["frontier_mask"]
         free_own_mask = batch["free_own_mask"]
+        alive_enemy_mask = batch["alive_enemy_mask"]
         research_mask = batch["research_mask"]
         spec_mask = batch["spec_mask"]
 
         B, S, _ = star_x.shape
         P = player_x.shape[1]
+        T = tech_x.shape[1]
 
         h_s, h_p, g = self.backbone(star_x, edge_x, player_x, owner_rel, time_x)
 
-        att1_logits = self._pointer_logits(
-            self.attack1_broad, self.attack1_star, h_s, g, non_own_mask, True
-        )
-        att2_logits = self._pointer_logits(
-            self.attack2_broad, self.attack2_star, h_s, g, non_own_mask, True
-        )
-        def_logits = self._pointer_logits(
-            self.defend_broad, self.defend_star, h_s, g, own_mask, True
-        )
-        ind_logits = self._pointer_logits(
-            self.ind_broad, self.ind_star, h_s, g, own_mask, False
-        )
-        sci_logits = self._pointer_logits(
-            self.sci_broad, self.sci_star, h_s, g, own_mask, False
-        )
-        wg_logits = self._pointer_logits(
-            self.wg_broad, self.wg_star, h_s, g, own_mask, False
-        )
+        # 1. Per-Frontier-Star Continuous Scoring [B, S]
+        f_inp = torch.cat([h_s, g.unsqueeze(1).expand(B, S, -1)], dim=-1)
+        frontier_mu = torch.tanh(self.frontier_head(f_inp).squeeze(-1)) * 2.0
+        frontier_mu = torch.where(frontier_mask, frontier_mu, torch.zeros_like(frontier_mu))
+        frontier_std = self.frontier_log_std.clamp(-2.8, 0.2).exp().expand_as(frontier_mu)
 
-        # Dirichlet concentrations > 0.2; starts right at DEFAULT_BUDGET_ALPHA * 3
+        # 2. Strategic Posture [B, 5] & Target Empire [B, P]
+        posture_logits = self.posture_head(g)
+        t_none = self.target_none_head(g)
+        if P > 1:
+            emp_inp = torch.cat(
+                [h_p[:, 1:], g.unsqueeze(1).expand(B, P - 1, -1)], dim=-1
+            )
+            neighbor_prior = -0.85 * player_x[:, 1:, 15]
+            t_emps = self.target_emp_head(emp_inp).squeeze(-1) + neighbor_prior
+            target_logits = torch.cat([t_none, t_emps], dim=-1)
+        else:
+            target_logits = t_none
+        target_logits = target_logits.masked_fill(~alive_enemy_mask, -1e9)
+
+        # 3. Dirichlet Cycle Budget [B, 5]: [sci, ind, eco, wg, carrierCash]
         budget_raw = self.budget_head(g)
-        budget_alpha = F.softplus(budget_raw + torch.log(torch.expm1(self.default_alpha * 3.0))) + 0.2
+        budget_alpha = (
+            F.softplus(budget_raw + torch.log(torch.expm1(self.default_alpha * 3.0)))
+            + 0.2
+        )
 
+        # 4. Continuous Tactical Knobs [B, 3]
         knob_mean = torch.tanh(self.knob_head(g)) * 2.0
         knob_std = self.knob_log_std.clamp(-3.0, 0.5).exp().expand_as(knob_mean)
 
-        res_logits = self.research_head(g).masked_fill(~research_mask, -1e9)
+        # 5. Feature-Conditioned Research Head [B, 1 + T]
+        keep_logit = self.research_keep_head(g)
+        tech_inp = torch.cat([g.unsqueeze(1).expand(B, T, -1), tech_x], dim=-1)
+        tech_logits = self.research_tech_head(tech_inp).squeeze(-1) + tech_x[:, :, 5]
+        res_logits = torch.cat([keep_logit, tech_logits], dim=-1).masked_fill(
+            ~research_mask, -1e9
+        )
 
-        # Specialist logits + domain prior
+        # 6. Specialist + Star Pointer
         sp_logits = self.spec_head(g)
         sp_prior = torch.zeros_like(sp_logits)
         for sid, (boost, _) in SPECIALIST_PRIOR.items():
@@ -745,16 +921,29 @@ class AdmiralNet(nn.Module):
                 sp_prior[:, sid] = boost
         sp_logits = (sp_logits + sp_prior).masked_fill(~spec_mask, -1e9)
 
-        sp_star_logits = self.spec_star_head(h_s)  # [B, S, MAX_SPEC]
-        # Prefer stars with strong matching infra
-        infra_feats = star_x[:, :, 11:14]  # eco, ind, sci log1p features
+        sp_star_logits = self.spec_star_head(h_s)
         sp_star_prior = torch.zeros_like(sp_star_logits)
-        for sid, (_, ch) in SPECIALIST_PRIOR.items():
-            if sid <= MAX_SPECIALIST_ID:
-                sp_star_prior[:, :, sid - 1] = 2.5 * infra_feats[:, :, ch]
+        if 11 <= MAX_SPECIALIST_ID:
+            sp_star_prior[:, :, 10] = (
+                3.0 * star_x[:, :, 13]
+                + 2.5 * star_x[:, :, 34]
+                + 1.5 * star_x[:, :, 39]
+                - 1.5 * star_x[:, :, 31]
+            )
+        if 2 <= MAX_SPECIALIST_ID:
+            sp_star_prior[:, :, 1] = (
+                3.0 * star_x[:, :, 12]
+                + 2.5 * star_x[:, :, 33]
+                + 1.2 * star_x[:, :, 39]
+                + 0.5 * star_x[:, :, 31]
+            )
+        if 4 <= MAX_SPECIALIST_ID:
+            sp_star_prior[:, :, 3] = (
+                1.8 * (star_x[:, :, 11] + star_x[:, :, 12] + star_x[:, :, 13])
+                + 2.0 * star_x[:, :, 31]
+            )
         has_any_free = free_own_mask.any(dim=1, keepdim=True)
         eff_free = torch.where(has_any_free, free_own_mask, own_mask)
-        # Guard rare edge case when seat has 0 stars
         eff_free = torch.where(
             eff_free.any(dim=1, keepdim=True),
             eff_free,
@@ -768,12 +957,10 @@ class AdmiralNet(nn.Module):
         fog_rank_logits, fog_value, fog_place_val = self.fog_critic(g, P)
 
         return {
-            "att1_logits": att1_logits,
-            "att2_logits": att2_logits,
-            "def_logits": def_logits,
-            "ind_logits": ind_logits,
-            "sci_logits": sci_logits,
-            "wg_logits": wg_logits,
+            "frontier_mu": frontier_mu,
+            "frontier_std": frontier_std,
+            "posture_logits": posture_logits,
+            "target_logits": target_logits,
             "budget_alpha": budget_alpha,
             "knob_mean": knob_mean,
             "knob_std": knob_std,
@@ -804,66 +991,86 @@ class AdmiralNet(nn.Module):
         sample: bool = True,
         temperature: float = 1.0,
     ) -> dict[str, any]:
-        """Sample actions (when `actions is None` and `sample=True`), pick
-        greedy actions (`sample=False`), or evaluate exact factored per-group
-        `logp` & `entropy` of recorded `actions` for PPO."""
+        """Sample actions, pick greedy mode, or evaluate exact per-part `logp_parts`
+        (`PART_NAMES`) + `part_masks` for independent per-column PPO clipping."""
         out = self.forward_policy(batch)
         temp = max(float(temperature), 1e-3)
-
-        pointer_keys = (
-            ("att1", out["att1_logits"]),
-            ("att2", out["att2_logits"]),
-            ("def", out["def_logits"]),
-            ("ind", out["ind_logits"]),
-            ("sci", out["sci_logits"]),
-            ("wg", out["wg_logits"]),
-        )
+        B = batch["star_x"].shape[0]
+        dtype = batch["star_x"].dtype
+        dev = batch["star_x"].device
+        f_mask = batch["frontier_mask"]  # [B, S] bool
+        f_mask_f = f_mask.to(dtype)
 
         chosen: dict[str, torch.Tensor] = {} if actions is None else dict(actions)
-        logp_spatial = torch.zeros(batch["star_x"].shape[0], device=batch["star_x"].device)
-        ent_spatial = torch.zeros_like(logp_spatial)
 
-        for name, logits in pointer_keys:
-            scaled = logits / temp if (actions is None and sample) else logits
-            dist = Categorical(logits=scaled)
-            if actions is None:
-                a = dist.sample() if sample else logits.argmax(dim=-1)
-                chosen[name] = a
-            else:
-                a = actions[name]
-            # Evaluate logp under true unscaled policy distribution (or temp if desired)
-            eval_dist = Categorical(logits=logits)
-            logp_spatial = logp_spatial + eval_dist.log_prob(a)
-            ent_spatial = ent_spatial + eval_dist.entropy()
+        # 1. Per-Frontier-Star Normal [B, S]
+        f_dist = Normal(out["frontier_mu"], out["frontier_std"] * (temp if (actions is None and sample) else 1.0))
+        eval_f_dist = Normal(out["frontier_mu"], out["frontier_std"])
+        if actions is None:
+            f_raw = f_dist.rsample() if sample else out["frontier_mu"]
+            f_act = (f_raw * f_mask_f).clamp(-3.0, 3.0)
+            chosen["frontier"] = f_act
+        else:
+            f_act = actions["frontier"]
+        lp_frontier_cols = eval_f_dist.log_prob(f_act) * f_mask_f  # [B, S]
+        ent_frontier = (eval_f_dist.entropy() * f_mask_f).sum(dim=-1)
 
-        # Budget Dirichlet [B, 5]
+        # 2. Posture & Target Empire
+        p_logits = out["posture_logits"]
+        t_logits = out["target_logits"]
+        if actions is None:
+            p_act = (
+                Categorical(logits=p_logits / temp).sample()
+                if sample
+                else p_logits.argmax(dim=-1)
+            )
+            t_act = (
+                Categorical(logits=t_logits / temp).sample()
+                if sample
+                else t_logits.argmax(dim=-1)
+            )
+            chosen["posture"] = p_act
+            chosen["target_player"] = t_act
+        else:
+            p_act = actions["posture"]
+            t_act = actions["target_player"]
+
+        eval_p_dist = Categorical(logits=p_logits)
+        eval_t_dist = Categorical(logits=t_logits)
+        lp_posture = eval_p_dist.log_prob(p_act)
+        lp_target = eval_t_dist.log_prob(t_act)
+        ent_posture = eval_p_dist.entropy()
+        ent_target = eval_t_dist.entropy()
+
+        logp_spatial = lp_frontier_cols.sum(dim=-1) + lp_posture + lp_target
+        ent_spatial = ent_frontier + ent_posture + ent_target
+
+        # 3. Budget Dirichlet [B, 5]
         alpha = out["budget_alpha"]
         dir_dist = Dirichlet(alpha)
         if actions is None:
-            if sample:
-                b = dir_dist.rsample()
-            else:
-                b = alpha / alpha.sum(dim=-1, keepdim=True)
+            b = dir_dist.rsample() if sample else alpha / alpha.sum(dim=-1, keepdim=True)
             b = b.clamp(min=1e-4)
             b = b / b.sum(dim=-1, keepdim=True)
             chosen["budget"] = b
         else:
             b = actions["budget"].clamp(min=1e-4)
             b = b / b.sum(dim=-1, keepdim=True)
-        logp_budget = dir_dist.log_prob(b)
+        lp_budget = dir_dist.log_prob(b)
         ent_budget = dir_dist.entropy()
 
-        # Tactical continuous knobs [B, 3]
+        # 4. Tactical Continuous Knobs [B, 3]
         knob_dist = Normal(out["knob_mean"], out["knob_std"])
         if actions is None:
             k_act = knob_dist.rsample() if sample else out["knob_mean"]
             chosen["knobs"] = k_act
         else:
             k_act = actions["knobs"]
-        logp_knobs = knob_dist.log_prob(k_act).sum(dim=-1)
+        lp_knobs_cols = knob_dist.log_prob(k_act)  # [B, 3]
+        logp_knobs = lp_knobs_cols.sum(dim=-1)
         ent_knobs = knob_dist.entropy().sum(dim=-1)
 
-        # Macro discrete: research & specialist + specialist star
+        # 5. Macro Discrete: Research + Specialist + Star
         res_dist = Categorical(logits=out["res_logits"])
         sp_dist = Categorical(logits=out["sp_logits"])
         if actions is None:
@@ -875,11 +1082,10 @@ class AdmiralNet(nn.Module):
             r_act = actions["research"]
             s_act = actions["spec"]
 
-        # Gather star logits for selected specialist (when s_act > 0)
         s_idx = (s_act.clamp(min=1) - 1).view(-1, 1, 1).expand(
             -1, out["sp_star_logits"].shape[1], 1
         )
-        sel_star_logits = out["sp_star_logits"].gather(2, s_idx).squeeze(-1)  # [B, S]
+        sel_star_logits = out["sp_star_logits"].gather(2, s_idx).squeeze(-1)
         sp_star_dist = Categorical(logits=sel_star_logits)
         if actions is None:
             st_act = (
@@ -891,21 +1097,45 @@ class AdmiralNet(nn.Module):
         else:
             st_act = actions["spec_star"]
 
-        hired_mask = (s_act > 0).to(out["res_logits"].dtype)
-        logp_macro = (
-            res_dist.log_prob(r_act)
-            + sp_dist.log_prob(s_act)
-            + hired_mask * sp_star_dist.log_prob(st_act)
-        )
+        hired_mask = s_act > 0
+        hired_f = hired_mask.to(dtype)
+        lp_res = res_dist.log_prob(r_act)
+        lp_spec = sp_dist.log_prob(s_act)
+        lp_spec_star = sp_star_dist.log_prob(st_act) * hired_f
+
+        logp_macro = lp_res + lp_spec + lp_spec_star
         ent_macro = (
             res_dist.entropy()
             + sp_dist.entropy()
-            + hired_mask * sp_star_dist.entropy()
+            + hired_f * sp_star_dist.entropy()
         )
+
+        ones_1 = torch.ones((B, 1), dtype=torch.bool, device=dev)
+        ones_3 = torch.ones((B, len(TACTICAL_KNOBS)), dtype=torch.bool, device=dev)
+        logp_parts = {
+            "frontier": lp_frontier_cols,             # [B, S]
+            "posture": lp_posture.unsqueeze(-1),      # [B, 1]
+            "target_player": lp_target.unsqueeze(-1), # [B, 1]
+            "budget": lp_budget.unsqueeze(-1),        # [B, 1]
+            "knobs": lp_knobs_cols,                   # [B, 3]
+            "research": lp_res.unsqueeze(-1),         # [B, 1]
+            "spec": lp_spec.unsqueeze(-1),            # [B, 1]
+            "spec_star": lp_spec_star.unsqueeze(-1),  # [B, 1]
+        }
+        part_masks = {
+            "frontier": f_mask,
+            "posture": ones_1,
+            "target_player": ones_1,
+            "budget": ones_1,
+            "knobs": ones_3,
+            "research": ones_1,
+            "spec": ones_1,
+            "spec_star": hired_mask.unsqueeze(-1),
+        }
 
         logp_groups = {
             "spatial": logp_spatial,
-            "budget": logp_budget,
+            "budget": lp_budget,
             "knobs": logp_knobs,
             "macro": logp_macro,
         }
@@ -915,13 +1145,15 @@ class AdmiralNet(nn.Module):
             "knobs": ent_knobs,
             "macro": ent_macro,
         }
-        total_logp = logp_spatial + logp_budget + logp_knobs + logp_macro
+        total_logp = logp_spatial + lp_budget + logp_knobs + logp_macro
         total_ent = ent_spatial + ent_budget + ent_knobs + ent_macro
 
         return {
             "actions": chosen,
             "logp": total_logp,
             "logp_groups": logp_groups,
+            "logp_parts": logp_parts,
+            "part_masks": part_masks,
             "entropy_groups": ent_groups,
             "entropy": total_ent,
             "policy_out": out,

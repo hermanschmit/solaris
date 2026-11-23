@@ -94,6 +94,7 @@ def load_admiral_model(
 ) -> AdmiralNet:
     if checkpoint is None:
         model = AdmiralNet(n_techs, d=d, n_layers=n_layers)
+        model._admiral_iter = 0
         model.eval()
         return model
 
@@ -107,6 +108,7 @@ def load_admiral_model(
     )
     state = saved["model"] if "model" in saved else saved
     model.load_state_dict(state, strict=True)
+    model._admiral_iter = int(saved.get("iteration", 0)) if isinstance(saved, dict) else 0
     model.eval()
     return model
 
@@ -125,7 +127,7 @@ def load_any_checkpoint_cached(path: str | Path, n_techs: int) -> tuple[str, any
         _MODEL_CACHE.clear()
 
     saved = torch.load(p_str, map_location="cpu", weights_only=False)
-    if isinstance(saved, dict) and saved.get("arch") == "admiral":
+    if isinstance(saved, dict) and str(saved.get("arch", "")).startswith("admiral"):
         cfg = saved.get("config", {})
         model = AdmiralNet(
             n_techs=cfg.get("n_techs", n_techs),
@@ -134,6 +136,7 @@ def load_any_checkpoint_cached(path: str | Path, n_techs: int) -> tuple[str, any
             n_heads=cfg.get("n_heads", 4),
         )
         model.load_state_dict(saved["model"], strict=True)
+        model._admiral_iter = int(saved.get("iteration", 0))
         model.eval()
         entry = ("admiral", model)
     else:
@@ -206,7 +209,8 @@ def play_admiral_game(
             hdr_peek = torch.load(p_str, map_location="cpu", weights_only=False)
             opp_kinds[s] = (
                 "admiral"
-                if isinstance(hdr_peek, dict) and hdr_peek.get("arch") == "admiral"
+                if isinstance(hdr_peek, dict)
+                and str(hdr_peek.get("arch", "")).startswith("admiral")
                 else "commander"
             )
 
@@ -320,7 +324,10 @@ def play_admiral_game(
             env.close()
 
     place = placements(standings)
-    return pack_admiral_rollout(steps, place, learner_seats, int(seed), standings)
+    policy_iter = int(getattr(learner_model, "_admiral_iter", 0))
+    return pack_admiral_rollout(
+        steps, place, learner_seats, int(seed), standings, policy_iter=policy_iter
+    )
 
 
 def pack_admiral_rollout(
@@ -329,6 +336,7 @@ def pack_admiral_rollout(
     learner_seats: list[int],
     seed: int,
     standings: dict,
+    policy_iter: int = 0,
 ) -> dict[str, np.ndarray]:
     out = {
         "seat": [],
@@ -341,7 +349,10 @@ def pack_admiral_rollout(
 
     inputs: dict[str, list[np.ndarray]] = {}
     acts: dict[str, list[np.ndarray]] = {}
+    parts: dict[str, list[np.ndarray]] = {}
     truths: dict[str, list[np.ndarray]] = {}
+    edge_table: list[np.ndarray] = []
+    step_edge_idx: list[int] = []
     aux: dict[str, list[np.ndarray]] = {
         "aux_owner": [],
         "aux_vis": [],
@@ -356,11 +367,28 @@ def pack_admiral_rollout(
         out["bonus"].append(bonus)
         for g in HEAD_GROUPS:
             out[f"logp_{g}"].append(rec["logp_groups"][g])
+
+        # Deduplicate static/range channels 0..2 of edge_x per game (~225x smaller .npz!)
+        e3 = rec["inputs"]["edge_x"][:, :, :3].astype(np.float16)
+        found_idx = -1
+        for tbl_i, prev_e3 in enumerate(edge_table):
+            if np.array_equal(e3[:, :, 2], prev_e3[:, :, 2]):
+                found_idx = tbl_i
+                break
+        if found_idx < 0:
+            found_idx = len(edge_table)
+            edge_table.append(e3)
+        step_edge_idx.append(found_idx)
+
         for k, v in rec["inputs"].items():
+            if k == "edge_x":
+                continue
             inputs.setdefault(k, []).append(v)
         for k, v in rec["act"].items():
             acts.setdefault(k, []).append(np.asarray(v))
-        for k in ("star_x", "edge_x", "player_x", "owner_rel", "time_x"):
+        for k, v in rec.get("logp_parts", {}).items():
+            parts.setdefault(k, []).append(np.asarray(v, dtype=np.float32))
+        for k in ("star_x", "player_x", "owner_rel", "time_x"):
             truths.setdefault(k, []).append(truth_in[k])
         aux["aux_owner"].append(aux_b["owner"])
         aux["aux_vis"].append(aux_b["vis"])
@@ -371,8 +399,11 @@ def pack_admiral_rollout(
     if steps:
         arrays.update({"in_" + k: np.stack(v, axis=0) for k, v in inputs.items()})
         arrays.update({"act_" + k: np.stack(v, axis=0) for k, v in acts.items()})
+        arrays.update({"lp_" + k: np.stack(v, axis=0) for k, v in parts.items()})
         arrays.update({"truth_" + k: np.stack(v, axis=0) for k, v in truths.items()})
         arrays.update({k: np.stack(v, axis=0) for k, v in aux.items()})
+        arrays["edge_static"] = np.stack(edge_table, axis=0)  # [K, S, S, 3] float16
+        arrays["step_edge_idx"] = np.asarray(step_edge_idx, dtype=np.int16)
 
     n_players = len(standings["players"])
     arrays["agents"] = np.asarray(learner_seats, dtype=np.int32)
@@ -395,6 +426,7 @@ def pack_admiral_rollout(
     arrays["n_players"] = np.asarray(n_players, dtype=np.int32)
     arrays["seed"] = np.asarray(seed, dtype=np.int32)
     arrays["ticks"] = np.asarray(standings["tick"], dtype=np.int32)
+    arrays["policy_iter"] = np.asarray(policy_iter, dtype=np.int32)
     return arrays
 
 
@@ -443,7 +475,7 @@ def play_eval_game(
         hdr = torch.load(opponent, map_location="cpu", weights_only=False)
         opp_kind = (
             "admiral"
-            if isinstance(hdr, dict) and hdr.get("arch") == "admiral"
+            if isinstance(hdr, dict) and str(hdr.get("arch", "")).startswith("admiral")
             else "commander"
         )
 
@@ -527,17 +559,32 @@ def play_eval_game(
 
 
 def _rollout_worker(args):
-    (
-        out_dir,
-        seed,
-        seats,
-        checkpoint,
-        max_ticks,
-        opponents,
-        record_path,
-        ai_configs,
-        cycle_only,
-    ) = args
+    if len(args) == 10:
+        (
+            out_dir,
+            seed,
+            seats,
+            checkpoint,
+            max_ticks,
+            learner_seats,
+            opponents,
+            record_path,
+            ai_configs,
+            cycle_only,
+        ) = args
+    else:
+        (
+            out_dir,
+            seed,
+            seats,
+            checkpoint,
+            max_ticks,
+            opponents,
+            record_path,
+            ai_configs,
+            cycle_only,
+        ) = args
+        learner_seats = None
     path = Path(out_dir) / f"r{seed}.npz"
     if path.exists():
         return seed, None
@@ -546,15 +593,55 @@ def _rollout_worker(args):
         seats=seats,
         checkpoint=checkpoint,
         max_ticks=max_ticks,
+        learner_seats=learner_seats,
         opponents=opponents,
         record=record_path,
         ai_configs=ai_configs,
         cycle_only=cycle_only,
     )
     tmp = str(path) + ".tmp.npz"
-    np.savez_compressed(tmp, **arrays)
+    np.savez(tmp, **arrays)
     os.replace(tmp, path)
     return seed, arrays["place"].tolist()
+
+
+def _async_rollout_worker(args):
+    """Continuous async rollout worker: loads `checkpoint` (typically
+    `ckpt_latest.pt`, reloaded automatically whenever its mtime changes), plays
+    one game, writes `<out_dir>/r<seed>.npz`, and returns metadata."""
+    (
+        out_dir,
+        seed,
+        seats,
+        checkpoint,
+        max_ticks,
+        learner_seats,
+        opponents,
+        record_path,
+        ai_configs,
+        cycle_only,
+    ) = args
+    path = Path(out_dir) / f"r{seed}.npz"
+    arrays = play_admiral_game(
+        seed=seed,
+        seats=seats,
+        checkpoint=checkpoint,
+        max_ticks=max_ticks,
+        learner_seats=learner_seats,
+        opponents=opponents,
+        record=record_path,
+        ai_configs=ai_configs,
+        cycle_only=cycle_only,
+    )
+    tmp = str(path) + ".tmp.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+    return (
+        int(seed),
+        str(path),
+        int(arrays["policy_iter"]),
+        arrays["place"].tolist(),
+    )
 
 
 def _eval_worker(args):

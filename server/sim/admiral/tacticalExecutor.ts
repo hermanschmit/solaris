@@ -23,6 +23,7 @@
 
 import mongoose from "mongoose";
 import { CarrierWaypointBase, ValidationError } from "@solaris/common";
+import { VISIBLE } from "../beliefData";
 import { Game } from "../../services/types/Game";
 import { Player } from "../../services/types/Player";
 import { Star, InfrastructureType } from "../../services/types/Star";
@@ -83,6 +84,9 @@ export class TacticalExecutor {
 
     // Cached static pairwise Euclidean distances per game (non-orbital).
     private distCache = new WeakMap<Game, Float64Array>();
+    // Policy-controlled credits held across the cycle for `isLastTick` Economy
+    // compounding (replacing AIService's rigid `totalEconomy * 5` rule).
+    private cycleEcoHold = new WeakMap<Player, number>();
 
     constructor(container: DependencyContainer) {
         this.container = container;
@@ -282,6 +286,7 @@ export class TacticalExecutor {
         player: Player,
         decision: AdmiralDecision,
         believedIndustry?: (starIndex: number) => number | undefined,
+        starVisibility?: Uint8Array | null,
     ) {
         if (player.defeated) return;
         const pid = player._id.toString();
@@ -304,12 +309,14 @@ export class TacticalExecutor {
 
         // 1. Pool ships on idle orbiting own carriers back onto their stars so
         //    garrison/attack/defense allocation sees one unified ship pool.
-        //    Carriers with waypoints (including synchronized `delayTicks > 0`
-        //    carriers waiting to launch) are left untouched.
+        //    Also track active outbound AND returning logistics ferries so
+        //    interior stars wait for their returning ferry instead of spamming
+        //    new $25 carriers every cycle.
         const idleCarriersAt = new Map<number, Carrier[]>();
         let ownCarrierCount = 0;
         const committedTargets = new Map<number, number>(); // starIdx -> own ships en route
-        const outboundLogistics = new Set<string>();
+        const activeLogisticsRoutes = new Set<string>();
+        const busyLogisticsStars = new Set<number>();
 
         for (const c of game.galaxy.carriers) {
             if (c.ownedByPlayerId?.toString() !== pid) continue;
@@ -336,20 +343,59 @@ export class TacticalExecutor {
                     list.push(c);
                 }
             } else if (c.waypoints && c.waypoints.length > 0) {
-                const destIdx = starIndexById.get(
-                    c.waypoints[0].destination.toString(),
+                const w0 = c.waypoints[0];
+                const wLast = c.waypoints[c.waypoints.length - 1];
+                const srcIdx = starIndexById.get(w0.source.toString());
+                const destIdx = starIndexById.get(w0.destination.toString());
+                const lastDestIdx = starIndexById.get(
+                    wLast.destination.toString(),
                 );
+                const cShips = c.ships ?? 0;
+
                 if (destIdx !== undefined) {
                     committedTargets.set(
                         destIdx,
-                        (committedTargets.get(destIdx) ?? 0) + (c.ships ?? 0),
+                        (committedTargets.get(destIdx) ?? 0) + cShips,
                     );
                 }
-                const srcIdx = starIndexById.get(
-                    c.waypoints[0].source.toString(),
-                );
                 if (srcIdx !== undefined && destIdx !== undefined) {
-                    outboundLogistics.add(`${srcIdx}->${destIdx}`);
+                    activeLogisticsRoutes.add(`${srcIdx}->${destIdx}`);
+                    activeLogisticsRoutes.add(`${destIdx}->${srcIdx}`);
+                }
+                if (
+                    lastDestIdx !== undefined &&
+                    stars[lastDestIdx].ownedByPlayerId?.toString() === pid
+                ) {
+                    busyLogisticsStars.add(lastDestIdx);
+                }
+
+                // Track multi-hop claim chains, dropAll sinks, collectAll sweeps,
+                // and multi-hop enemy invasion endpoints.
+                for (let wi = 0; wi < c.waypoints.length; wi++) {
+                    const wp = c.waypoints[wi];
+                    const dIdx = starIndexById.get(wp.destination.toString());
+                    if (dIdx === undefined) continue;
+                    if (wp.action === "collectAll") {
+                        busyLogisticsStars.add(dIdx);
+                    }
+                    if (dIdx !== destIdx) {
+                        if (
+                            !stars[dIdx].ownedByPlayerId ||
+                            wp.action === "dropAll" ||
+                            (wi === c.waypoints.length - 1 &&
+                                this._isEnemy(
+                                    game,
+                                    player,
+                                    stars[dIdx].ownedByPlayerId,
+                                ))
+                        ) {
+                            committedTargets.set(
+                                dIdx,
+                                (committedTargets.get(dIdx) ?? 0) +
+                                    Math.max(1, cShips),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -374,31 +420,36 @@ export class TacticalExecutor {
             true,
         );
 
-        // Compute baseline per-star garrison targets (proactive border defense)
-        // if not overridden by the policy.
-        const maxEnemyRange = Math.max(
-            hsDist,
-            ...game.galaxy.players
-                .filter((p) => !p.defeated && p._id.toString() !== pid)
-                .map((p) =>
+        // Compute per-opponent hyperspace jump reach so border threat & Economy
+        // safety reflect which stars each enemy can ACTUALLY jump to (rather
+        // than marking our deep interior unsafe when our own hyperspace is high).
+        const enemyRangeByPid = new Map<string, number>();
+        for (const p of game.galaxy.players) {
+            if (!p.defeated && p._id.toString() !== pid) {
+                enemyRangeByPid.set(
+                    p._id.toString(),
                     this.container.distanceService.getHyperspaceDistance(
                         game,
                         p.research.hyperspace.level,
                     ),
-                ),
-        );
+                );
+            }
+        }
         const hostileBorder = new Uint8Array(S);
+        const nearbyEnemyShipsAt = new Float32Array(S);
         const baselineGarrison = new Float32Array(S);
         for (const i of ownStarIndices) {
             let nearbyEnemyShips = 0;
             for (let j = 0; j < S; j++) {
-                if (!this._isEnemy(game, player, stars[j].ownedByPlayerId))
-                    continue;
-                if (distMatrix[i * S + j] <= maxEnemyRange) {
+                const ownerId = stars[j].ownedByPlayerId;
+                if (!this._isEnemy(game, player, ownerId)) continue;
+                const eRange = enemyRangeByPid.get(ownerId!.toString()) ?? 0;
+                if (distMatrix[i * S + j] <= eRange) {
                     hostileBorder[i] = 1;
                     nearbyEnemyShips += stars[j].ships ?? 0;
                 }
             }
+            nearbyEnemyShipsAt[i] = nearbyEnemyShips;
             if (hostileBorder[i]) {
                 baselineGarrison[i] = Math.min(
                     40,
@@ -415,15 +466,16 @@ export class TacticalExecutor {
                     : baselineGarrison[i];
         }
 
-        // Budget & reserve setup.
-        const rawSplit = decision.budgetSplit ?? [0.22, 0.33, 0.3, 0.05, 0.1];
+        // Budget & reserve setup: [science, industry, economy, warpGate, save]
+        const rawSplit = decision.budgetSplit ?? [
+            0.2, 0.28, 0.45, 0.04, 0.03,
+        ];
         const splitSum =
             rawSplit.reduce((a, b) => a + Math.max(0, b), 0) || 1.0;
         const normSplit = rawSplit.map((x) => Math.max(0, x) / splitSum);
-        const carrierReserve = Math.max(
-            this._carrierCost(game),
-            Math.floor((player.credits ?? 0) * normSplit[4]),
-        );
+        while (normSplit.length < 5) normSplit.push(0);
+
+        const maxAttackTicks = decision.maxAttackTicks ?? prodTicks * 2;
 
         // 2. Detect incoming enemy waves, triage doomed stars vs holdable stars,
         //    reinforce holdable stars, and evacuate doomed stars just before impact.
@@ -451,7 +503,6 @@ export class TacticalExecutor {
             );
 
             if (neededExtra <= 0) {
-                // Current garrison + arriving ships already hold; lock them!
                 lockedShips[defIdx] = Math.max(
                     lockedShips[defIdx],
                     defStar.ships ?? 0,
@@ -459,7 +510,6 @@ export class TacticalExecutor {
                 continue;
             }
 
-            // Gather own stars that can reach defIdx within wave.ticksUntil.
             const helpers: { src: number; eta: number; avail: number }[] = [];
             let totalReachable = 0;
             for (const u of ownStarIndices) {
@@ -488,12 +538,25 @@ export class TacticalExecutor {
             }
 
             if (totalReachable < neededExtra * triageThreshold) {
-                // Star is doomed! Freeze upgrades here and evacuate garrison
-                // right before impact (ticksUntil <= 3) so we keep producing
-                // ships until the last safe tick without feeding reinforcements.
                 doomedStars.add(defIdx);
                 garrisonTarget[defIdx] = 0;
-                if (wave.ticksUntil <= 3) {
+                const standAndBleed = this._shouldStandAndBleed(
+                    game,
+                    player,
+                    wave,
+                    ownStarIndices,
+                    doomedStars,
+                    distMatrix,
+                    hsDist,
+                    idleCarriersAt,
+                    lockedShips,
+                );
+                if (standAndBleed) {
+                    lockedShips[defIdx] = Math.max(
+                        lockedShips[defIdx],
+                        defStar.ships ?? 0,
+                    );
+                } else if (wave.ticksUntil <= 3) {
                     ownCarrierCount = await this._evacuateStar(
                         game,
                         player,
@@ -504,12 +567,11 @@ export class TacticalExecutor {
                         idleCarriersAt,
                         ownCarrierCount,
                     );
+                    lockedShips[defIdx] = Math.max(lockedShips[defIdx], 1);
                 }
                 continue;
             }
 
-            // Star is holdable: lock its own garrison and dispatch reinforcements
-            // from nearest helpers once slack time <= 1 tick.
             lockedShips[defIdx] = Math.max(
                 lockedShips[defIdx],
                 defStar.ships ?? 0,
@@ -522,7 +584,6 @@ export class TacticalExecutor {
                 if (send <= 0) continue;
 
                 if (wave.ticksUntil - h.eta > 1) {
-                    // Hold ships in reserve until launch window arrives.
                     lockedShips[h.src] += send;
                     remainingNeed -= send;
                 } else {
@@ -557,8 +618,38 @@ export class TacticalExecutor {
             }
         }
 
-        // 3. Targeted infrastructure & Warp Gate spending (skipping doomed stars).
+        // 3. Targeted cycle infrastructure & Warp Gate spending FIRST (skipping
+        //    doomed stars) right when cycle payouts arrive (`isFirstTick` for
+        //    Science/Industry/WarpGates, `isLastTick` for Economy compounding),
+        //    while reserving carrier cash for immediate reachable neutral claims.
         if (isFirstTick || isLastTick) {
+            let reachableUnclaimed = 0;
+            let totalIdleCarriers = 0;
+            for (const u of ownStarIndices) {
+                totalIdleCarriers += idleCarriersAt.get(u)?.length ?? 0;
+            }
+            if (isFirstTick) {
+                const sds = this.container.starDataService;
+                for (let t = 0; t < S; t++) {
+                    if (
+                        stars[t].ownedByPlayerId ||
+                        sds.isDeadStar(stars[t]) ||
+                        (committedTargets.get(t) ?? 0) > 0
+                    ) {
+                        continue;
+                    }
+                    for (const u of ownStarIndices) {
+                        if (claimGraph.ticks[u * S + t] <= maxAttackTicks) {
+                            reachableUnclaimed++;
+                            break;
+                        }
+                    }
+                }
+            }
+            const claimReserve =
+                Math.min(6, Math.max(0, reachableUnclaimed - totalIdleCarriers)) *
+                this._carrierCost(game);
+
             this._spendCycleCredits(
                 game,
                 player,
@@ -567,14 +658,34 @@ export class TacticalExecutor {
                 hostileBorder,
                 decision,
                 normSplit,
-                carrierReserve,
+                claimReserve,
                 isFirstTick,
                 isLastTick,
             );
         }
 
-        // 4. Claim neutral stars (multi-hop + Explorer outreach).
-        const maxAttackTicks = decision.maxAttackTicks ?? prodTicks * 2;
+        // Policy-driven Economy hold:
+        // - On tick % prodTicks === 0 (just after payout, 1 tick before isFirstTick),
+        //   hold the non-carrier-cash share `(1 - normSplit[4])` for 1 tick.
+        // - During ticks 1..18, hold the exact `ecoTargetHold` recorded on
+        //   `isFirstTick` from `normSplit[2]` so `normSplit[4]` (`carrierCash`)
+        //   is 100% liquid for carrier surges whenever the policy wants them!
+        const upgradeReserve =
+            game.state.tick % prodTicks === 0
+                ? Math.floor(
+                      (player.credits ?? 0) *
+                          Math.min(0.95, Math.max(0, 1.0 - normSplit[4])),
+                  )
+                : Math.min(
+                      player.credits ?? 0,
+                      this.cycleEcoHold.get(player) ??
+                          Math.floor((player.credits ?? 0) * normSplit[2]),
+                  );
+        const claimCarrierReserve =
+            game.state.tick <= prodTicks ? 0 : upgradeReserve;
+
+        // 4. Claim neutral stars (Cycle 0 uses $0 reserve for fast initial
+        //    land-grab; later cycles respect the policy's `cycleEcoHold`).
         ownCarrierCount = await this._executeClaims(
             game,
             player,
@@ -589,11 +700,12 @@ export class TacticalExecutor {
             decision,
             idleCarriersAt,
             ownCarrierCount,
-            carrierReserve,
+            claimCarrierReserve,
             maxAttackTicks,
         );
 
-        // 5. Synchronized Time-on-Target (ToT) multi-star invasions.
+        // 5. Hybrid Invasions: Multi-Star Synchronized Time-on-Target (ToT)
+        //    strikes + Single-Armada Multi-Hop Warp-Gate strikes.
         ownCarrierCount = await this._executeCoordinatedInvasions(
             game,
             player,
@@ -602,17 +714,21 @@ export class TacticalExecutor {
             lockedShips,
             garrisonTarget,
             committedTargets,
+            ownGraph,
             distMatrix,
             hsDist,
+            enemyRangeByPid,
             decision,
             believedIndustry,
+            starVisibility,
             idleCarriersAt,
             ownCarrierCount,
-            carrierReserve,
+            upgradeReserve,
             maxAttackTicks,
         );
 
-        // 6. Proactive border garrisoning & Warp-Gate logistics.
+        // 6. Proactive front-line staging & Warp-Gate logistics (with Economy
+        //    credit reserve, returning-ferry tracking, and collectAll sweeps).
         ownCarrierCount = await this._executeLogistics(
             game,
             player,
@@ -620,15 +736,19 @@ export class TacticalExecutor {
             doomedStars,
             lockedShips,
             garrisonTarget,
+            hostileBorder,
+            nearbyEnemyShipsAt,
             committedTargets,
-            outboundLogistics,
+            activeLogisticsRoutes,
+            busyLogisticsStars,
             ownGraph,
             distMatrix,
             hsDist,
+            enemyRangeByPid,
             decision,
             idleCarriersAt,
             ownCarrierCount,
-            carrierReserve,
+            upgradeReserve,
         );
     }
 
@@ -742,6 +862,143 @@ export class TacticalExecutor {
         }
     }
 
+    private _shouldStandAndBleed(
+        game: Game,
+        player: Player,
+        wave: IncomingWave,
+        ownStarIndices: number[],
+        doomedStars: Set<number>,
+        distMatrix: Float64Array,
+        hsDist: number,
+        idleCarriersAt: Map<number, Carrier[]>,
+        lockedShips: Float32Array,
+    ): boolean {
+        const pid = player._id.toString();
+        const defIdx = wave.starIndex;
+        const defStar = wave.star;
+        const S = game.galaxy.stars.length;
+
+        const orbitingFriendly = game.galaxy.carriers.filter(
+            (c) =>
+                c.orbiting?.toString() === defStar._id.toString() &&
+                c.ownedByPlayerId?.toString() === pid,
+        );
+        const techs =
+            this.container.technologyService.getStarEffectiveTechnologyLevels(
+                game,
+                defStar,
+                true,
+            );
+        const produced = Math.floor(
+            this.container.shipService.calculateStarShipsByTicks(
+                techs.manufacturing,
+                defStar.infrastructure?.industry ?? 0,
+                wave.ticksUntil,
+                game.settings.galaxy.productionTicks,
+            ),
+        );
+
+        const origShips = defStar.ships;
+        const origActual = defStar.shipsActual;
+        const projected =
+            Math.floor(defStar.shipsActual ?? defStar.ships ?? 0) + produced;
+        defStar.ships = projected;
+        defStar.shipsActual = projected;
+
+        let defBefore = 0;
+        let attBefore = 0;
+        let attAfter = 0;
+        let strikeRatio = 0;
+        let maxEnemyWep = 1;
+
+        try {
+            const result = this.container.combatService.computeStar(
+                game,
+                defStar,
+                wave.carriers.concat(orbitingFriendly),
+            );
+            if (!result) return false;
+            const groups = result.combatGroups;
+            const resById = new Map(result.groups.map((rg) => [rg.id, rg]));
+            const dGroupIdx = groups.findIndex((g) => g.isDefender);
+            if (dGroupIdx < 0) return false;
+            const dGroup = groups[dGroupIdx];
+            defBefore = resById.get(dGroup.id)?.shipsBefore ?? dGroup.originalShips;
+            if (defBefore <= 1) return false;
+
+            let bestAStrike = 1;
+            let bestDStrike = 1;
+            for (let i = 0; i < groups.length; i++) {
+                if (i === dGroupIdx) continue;
+                const g = groups[i];
+                const rg = resById.get(g.id);
+                attBefore += rg ? rg.shipsBefore : g.originalShips;
+                attAfter += rg ? rg.shipsAfter : 0;
+                const dW = dGroup.attackAgainst.get(i)?.total ?? 1;
+                const aW = g.attackAgainst.get(dGroupIdx)?.total ?? 1;
+                if (aW >= bestAStrike) {
+                    bestAStrike = aW;
+                    bestDStrike = dW;
+                }
+                for (const p of g.players) {
+                    if (p.research.weapons.level > maxEnemyWep) {
+                        maxEnemyWep = p.research.weapons.level;
+                    }
+                }
+            }
+            strikeRatio = bestDStrike / Math.max(1, bestAStrike);
+        } finally {
+            defStar.ships = origShips;
+            defStar.shipsActual = origActual;
+        }
+
+        const attKilled = Math.max(0, attBefore - attAfter);
+        const tradeRatio = attKilled / Math.max(1, defBefore);
+        if (strikeRatio < 1.25 || tradeRatio < 1.25) {
+            return false;
+        }
+
+        // Only burn the garrison if a nearby non-doomed friendly star can
+        // immediately counter-capture the weakened enemy spearhead!
+        const defBonusAfterCapture =
+            game.settings.specialGalaxy.defenderBonus === "enabled"
+                ? 1 + (defStar.isAsteroidField ? 1 : 0)
+                : 0;
+        const ownWep = Math.max(1, player.research.weapons.level);
+
+        for (const v of ownStarIndices) {
+            if (v === defIdx || doomedStars.has(v)) continue;
+            if (distMatrix[v * S + defIdx] > hsDist) continue;
+            const starV = game.galaxy.stars[v];
+            const availV = this._availableShipsAt(
+                starV,
+                idleCarriersAt.get(v),
+                lockedShips[v],
+            );
+            if (availV <= attAfter) continue;
+            const hasCarrierOrCash =
+                (idleCarriersAt.get(v)?.length ?? 0) > 0 ||
+                (player.credits ?? 0) >= this._carrierCost(game);
+            if (!hasCarrierOrCash) continue;
+
+            // Simulate counter-capture against `attAfter` enemy survivors
+            let eRem = Math.ceil(attAfter * 1.15);
+            let oRem = availV;
+            const eTotal = maxEnemyWep + defBonusAfterCapture;
+            while (eRem > 0 && oRem > 0) {
+                const fromE =
+                    eRem < eTotal ? eRem + defBonusAfterCapture : eTotal;
+                const fromO = oRem < ownWep ? oRem : ownWep;
+                eRem = Math.max(0, eRem - fromO);
+                oRem = Math.max(0, oRem - fromE);
+            }
+            if (eRem === 0 && oRem >= 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private async _evacuateStar(
         game: Game,
         player: Player,
@@ -754,12 +1011,23 @@ export class TacticalExecutor {
     ): Promise<number> {
         const S = game.galaxy.stars.length;
         const star = game.galaxy.stars[doomedIdx];
-        const avail = this._availableShipsAt(
-            star,
-            idleCarriersAt.get(doomedIdx),
-            0,
-        );
-        if (avail < 2) return ownCarrierCount;
+        const idle = idleCarriersAt.get(doomedIdx);
+        const hasOrbitingCarrier = (idle?.length ?? 0) > 0;
+        const poolWithFirstCarrier =
+            Math.floor(star.shipsActual ?? star.ships ?? 0) +
+            (idle?.[0]?.ships ?? 0);
+
+        // Rule 1 (Rear Guard): Always leave 1 ship on the doomed star so the
+        // attacker never gets a 0-casualty walk-in and takes the `1 + B` hit.
+        const evacShips = poolWithFirstCarrier - 1;
+        if (evacShips < 1) return ownCarrierCount;
+
+        // Rule 2 ($25 Carrier Gate): Do not spend $25 building a new carrier
+        // for tiny stacks (< 10 ships), while evacuating already-orbiting
+        // carriers freely (saving both the carrier and its ships for $0).
+        if (!hasOrbitingCarrier && evacShips < 10) {
+            return ownCarrierCount;
+        }
 
         let bestSafe = -1;
         let bestTicks = Infinity;
@@ -789,7 +1057,7 @@ export class TacticalExecutor {
             game,
             player,
             doomedIdx,
-            avail,
+            evacShips,
             waypoints,
             idleCarriersAt,
             ownCarrierCount,
@@ -1072,7 +1340,7 @@ export class TacticalExecutor {
         hostileBorder: Uint8Array,
         decision: AdmiralDecision,
         normSplit: number[],
-        carrierReserve: number,
+        claimReserve: number,
         isFirstTick: boolean,
         isLastTick: boolean,
     ) {
@@ -1081,18 +1349,28 @@ export class TacticalExecutor {
         const stars = game.galaxy.stars;
 
         if (isFirstTick) {
-            const spendable = Math.max(
-                0,
-                (player.credits ?? 0) - carrierReserve,
+            const totalCredits = player.credits ?? 0;
+            this.cycleEcoHold.set(
+                player,
+                Math.floor(totalCredits * normSplit[2]),
             );
+            const maxFirstSpend = Math.max(0, totalCredits - claimReserve);
             const firstShare = normSplit[0] + normSplit[1] + normSplit[3];
-            if (spendable <= 0 || firstShare <= 0) return;
+            if (maxFirstSpend <= 0 || firstShare <= 0) return;
 
-            const sciBudget = Math.floor(spendable * normSplit[0]);
-            const indBudget = Math.floor(spendable * normSplit[1]);
-            const wgBudget = Math.floor(spendable * normSplit[3]);
+            let sciBudget = Math.floor(totalCredits * normSplit[0]);
+            let indBudget = Math.floor(totalCredits * normSplit[1]);
+            let wgBudget = Math.floor(totalCredits * normSplit[3]);
+            const plannedFirst = sciBudget + indBudget + wgBudget;
+            if (plannedFirst > maxFirstSpend && plannedFirst > 0) {
+                const scale = maxFirstSpend / plannedFirst;
+                sciBudget = Math.floor(sciBudget * scale);
+                indBudget = Math.floor(indBudget * scale);
+                wgBudget = Math.floor(wgBudget * scale);
+            }
 
-            // Science: prefer core stars, Research Stations (11) & Binary Stars.
+            // Science: strongly prefer Research Stations (2x multiplier!),
+            // Binary Stars, and safe interior core stars.
             this._spendPoolOnInfra(
                 game,
                 player,
@@ -1101,9 +1379,10 @@ export class TacticalExecutor {
                 safeOwn,
                 (i) => {
                     const base = decision.sciencePriority?.[i] ?? 1.0;
-                    const specBoost = stars[i].specialistId === 11 ? 1.8 : 1.0;
-                    const borderPenalty = hostileBorder[i] ? 0.65 : 1.0;
-                    return base * specBoost * borderPenalty;
+                    const specBoost = stars[i].specialistId === 11 ? 2.2 : 1.0;
+                    const binBoost = stars[i].isBinaryStar ? 1.15 : 1.0;
+                    const borderPenalty = hostileBorder[i] ? 0.5 : 1.0;
+                    return base * specBoost * binBoost * borderPenalty;
                 },
             );
 
@@ -1119,7 +1398,7 @@ export class TacticalExecutor {
                     const specBoost =
                         stars[i].specialistId === 2 ||
                         stars[i].specialistId === 7
-                            ? 1.8
+                            ? 2.2
                             : 1.0;
                     const borderBoost = hostileBorder[i] ? 1.25 : 1.0;
                     return base * specBoost * borderBoost;
@@ -1127,7 +1406,10 @@ export class TacticalExecutor {
             );
 
             // Warp Gates: connect high-industry hubs and frontier staging stars.
-            let wgRem = Math.min(wgBudget, player.credits ?? 0);
+            let wgRem = Math.min(
+                wgBudget,
+                Math.max(0, (player.credits ?? 0) - claimReserve),
+            );
             while (wgRem > 0) {
                 let bestIdx = -1;
                 let bestScore = 0;
@@ -1137,7 +1419,7 @@ export class TacticalExecutor {
                     if (cost == null || cost <= 0 || cost > wgRem) continue;
                     const w =
                         (decision.warpGatePriority?.[i] ?? 1.0) *
-                        (1 + 0.25 * (stars[i].infrastructure?.industry ?? 0));
+                        (1 + 0.3 * (stars[i].infrastructure?.industry ?? 0));
                     const score = w / cost;
                     if (score > bestScore) {
                         bestScore = score;
@@ -1150,30 +1432,59 @@ export class TacticalExecutor {
                 player.credits -= bestCost;
                 wgRem -= bestCost;
             }
+
+            // Roll 60% of unspent Warp-Gate budget into Industry now and leave
+            // 40% to compound into Economy on `isLastTick`.
+            const rollInd = Math.floor(wgRem * 0.6);
+            if (rollInd > 0 && (player.credits ?? 0) > claimReserve) {
+                this._spendPoolOnInfra(
+                    game,
+                    player,
+                    Math.min(rollInd, (player.credits ?? 0) - claimReserve),
+                    "industry",
+                    safeOwn,
+                    (i) => {
+                        const base = decision.industryPriority?.[i] ?? 1.0;
+                        const specBoost =
+                            stars[i].specialistId === 2 ||
+                            stars[i].specialistId === 7
+                                ? 2.2
+                                : 1.0;
+                        return base * specBoost;
+                    },
+                );
+            }
         }
 
         if (isLastTick) {
-            // Right before production, invest remaining credits (keeping a small
-            // emergency carrier reserve) into Economy on safe stars.
-            const emergencyReserve = Math.floor(this._carrierCost(game));
-            const ecoBudget = Math.max(
-                0,
-                (player.credits ?? 0) - emergencyReserve,
+            // Right before Tick 20's production payout (1 tick away!), compound
+            // remaining credits into Economy on safe interior stars unless the
+            // policy explicitly holds a large cross-cycle war chest (`normSplit[4] > 0.05`).
+            const saveFrac =
+                normSplit[4] <= 0.05
+                    ? 0
+                    : normSplit[4] /
+                      Math.max(1e-6, normSplit[2] + normSplit[4]);
+            const lastReserve = Math.floor(
+                (player.credits ?? 0) * Math.min(0.5, saveFrac),
             );
-            const ecoFraction =
-                normSplit[2] / Math.max(normSplit[2] + normSplit[4], 1e-6);
+            const ecoBudget = Math.max(0, (player.credits ?? 0) - lastReserve);
+            const hasInteriorSafe = safeOwn.some((i) => !hostileBorder[i]);
+
             this._spendPoolOnInfra(
                 game,
                 player,
-                Math.floor(ecoBudget * Math.max(0.5, ecoFraction)),
+                ecoBudget,
                 "economy",
                 safeOwn,
                 (i) => {
                     const base = decision.economyPriority?.[i] ?? 1.0;
-                    const borderPenalty = hostileBorder[i] ? 0.25 : 1.0;
+                    const borderPenalty =
+                        hostileBorder[i] && hasInteriorSafe ? 0.08 : 1.0;
                     return base * borderPenalty;
                 },
             );
+            this.cycleEcoHold.set(player, 0);
         }
     }
 
@@ -1254,11 +1565,12 @@ export class TacticalExecutor {
                 if (doomedStars.has(u)) continue;
                 const eta = claimGraph.ticks[u * S + target];
                 if (eta > maxAttackTicks || eta >= bestEta) continue;
-                const reserve = Math.max(lockedShips[u], garrisonTarget[u]);
+                // Neutral claims take 1 ship; never block expansion behind passive
+                // border garrisonTarget — only hold active incoming-attack locks.
                 const surplus = this._availableShipsAt(
                     stars[u],
                     idleCarriersAt.get(u),
-                    reserve,
+                    lockedShips[u],
                 );
                 const canCarry =
                     (idleCarriersAt.get(u)?.length ?? 0) > 0 ||
@@ -1267,7 +1579,7 @@ export class TacticalExecutor {
                         player,
                         stars[u],
                         ownCarrierCount,
-                        0,
+                        carrierReserve,
                     );
                 if (surplus >= 1 && canCarry) {
                     bestEta = eta;
@@ -1286,17 +1598,13 @@ export class TacticalExecutor {
             );
             if (!wps.length) continue;
 
-            // Send a small scouting detachment (or more if passing through multi-hop free stars).
-            const reserve = Math.max(
-                lockedShips[bestSrc],
-                garrisonTarget[bestSrc],
-            );
+            // Send a small scouting detachment (1 ship, or hop-count for multi-hop chains).
             const surplus = this._availableShipsAt(
                 stars[bestSrc],
                 idleCarriersAt.get(bestSrc),
-                reserve,
+                lockedShips[bestSrc],
             );
-            const send = Math.min(surplus, Math.max(1, wps.length));
+            const send = Math.min(surplus, Math.min(3, Math.max(1, wps.length)));
             const res = await this._launchShips(
                 game,
                 player,
@@ -1305,7 +1613,7 @@ export class TacticalExecutor {
                 wps,
                 idleCarriersAt,
                 ownCarrierCount,
-                0,
+                carrierReserve,
             );
             if (res.launched) {
                 ownCarrierCount = res.ownCarrierCount;
@@ -1319,16 +1627,20 @@ export class TacticalExecutor {
         }
 
         // Optional Explorer specialist outreach for stars beyond normal hyperspace range.
+        // Conserves initial 5 specialist tokens for Research Station (id: 11)
+        // unless zero normal claims are reachable (stranded) or tokens >= 8.
         if (decision.autoCarrierSpecialist !== false) {
             ownCarrierCount = await this._dispatchExplorers(
                 game,
                 player,
                 ownStarIndices,
+                doomedStars,
                 committedTargets,
                 distMatrix,
                 hsDist,
                 idleCarriersAt,
                 ownCarrierCount,
+                candidates.length > 0,
             );
         }
 
@@ -1339,11 +1651,13 @@ export class TacticalExecutor {
         game: Game,
         player: Player,
         ownStarIndices: number[],
+        doomedStars: Set<number>,
         committedTargets: Map<number, number>,
         distMatrix: Float64Array,
         nearDist: number,
         idleCarriersAt: Map<number, Carrier[]>,
         ownCarrierCount: number,
+        hasNormalCandidates = false,
     ): Promise<number> {
         const c = this.container;
         const pid = player._id.toString();
@@ -1420,12 +1734,22 @@ export class TacticalExecutor {
 
         if (explorers.length > 0) return ownCarrierCount;
 
+        // Protect starting 5 specialist tokens for Research Station (id: 11):
+        // only buy an Explorer (3 tokens) when genuinely stranded with zero
+        // normal reachable neutral stars, OR when specialist tokens >= 8.
+        const specCurrency = game.settings.specialGalaxy.specialistsCurrency;
+        const curSpecBudget = (player as any)[specCurrency] ?? 0;
+        if (hasNormalCandidates && curSpecBudget < 8) {
+            return ownCarrierCount;
+        }
+
         // Hire one Explorer if an unclaimed star sits exclusively in (nearDist, farDist].
         let bestPair: { src: number; dst: number; d: number } | null = null;
         for (const t of freeIndices) {
             let minOwnD = Infinity;
             let closestOwn = -1;
             for (const u of ownStarIndices) {
+                if (doomedStars.has(u)) continue;
                 const d = distMatrix[u * S + t];
                 if (d < minOwnD) {
                     minOwnD = d;
@@ -1598,10 +1922,11 @@ export class TacticalExecutor {
         return Math.max(1, Math.ceil(needed * attackMargin));
     }
 
-    // Synchronized Time-on-Target (ToT) multi-star invasions:
-    // Gathers surplus ships from 1..K own stars within direct jump range of an
-    // enemy star and sets `delayTicks = T_sync - eta_i` on closer carriers so
-    // every attacking fleet lands on the exact same tick and fights together!
+    // Hybrid Coordinated Invasions:
+    // - Mode A: 1..3 direct border stars with synchronized Time-on-Target
+    //   (`delayTicks <= 8` ticks) to crack fortified targets together.
+    // - Mode B: Single-armada multi-hop strike along `ownGraph` (e.g. across
+    //   Warp-Gate highways) when a single rear shipyard holds `>= req` ships.
     private async _executeCoordinatedInvasions(
         game: Game,
         player: Player,
@@ -1610,23 +1935,29 @@ export class TacticalExecutor {
         lockedShips: Float32Array,
         garrisonTarget: Float32Array,
         committedTargets: Map<number, number>,
+        ownGraph: { ticks: Float32Array; nextHop: Int16Array },
         distMatrix: Float64Array,
         hsDist: number,
+        enemyRangeByPid: Map<string, number>,
         decision: AdmiralDecision,
-        believedIndustry: ((starIndex: number) => number | undefined) | undefined,
+        believedIndustry:
+            | ((starIndex: number) => number | undefined)
+            | undefined,
+        starVisibility: Uint8Array | null | undefined,
         idleCarriersAt: Map<number, Carrier[]>,
         ownCarrierCount: number,
-        carrierReserve: number,
+        upgradeReserve: number,
         maxAttackTicks: number,
     ): Promise<number> {
         const stars = game.galaxy.stars;
         const S = stars.length;
-        const attackMargin = decision.attackMargin ?? 1.35;
+        const baseMargin = decision.attackMargin ?? 3.2;
+        const directTickCap = Math.min(maxAttackTicks, 26);
 
-        // Score reachable enemy border stars.
         const targets: {
             target: number;
             score: number;
+            effMargin: number;
             launchers: { src: number; eta: number }[];
         }[] = [];
 
@@ -1641,7 +1972,7 @@ export class TacticalExecutor {
             for (const u of ownStarIndices) {
                 if (doomedStars.has(u)) continue;
                 if (distMatrix[u * S + t] <= hsDist) {
-                    const eta = this._hopTicks(
+                    const hopEta = this._hopTicks(
                         game,
                         player,
                         distMatrix,
@@ -1649,14 +1980,21 @@ export class TacticalExecutor {
                         u,
                         t,
                     );
-                    if (eta <= maxAttackTicks) {
-                        launchers.push({ src: u, eta });
-                        if (eta < minEta) minEta = eta;
+                    if (hopEta <= directTickCap) {
+                        launchers.push({ src: u, eta: hopEta });
+                        if (hopEta < minEta) minEta = hopEta;
                     }
                 }
             }
             if (!launchers.length) continue;
             launchers.sort((a, b) => a.eta - b.eta);
+
+            const effMargin =
+                starVisibility == null
+                    ? baseMargin
+                    : starVisibility[t] === VISIBLE
+                      ? Math.min(baseMargin, Math.max(1.3, 0.65 * baseMargin))
+                      : baseMargin;
 
             const baseRequired = this._requiredShipsForTarget(
                 game,
@@ -1667,17 +2005,21 @@ export class TacticalExecutor {
                 1.0,
                 believedIndustry,
             );
-            // Skip if an existing invasion fleet is already large enough.
             if ((committedTargets.get(t) ?? 0) >= baseRequired) continue;
 
             const value = this._starStrategicValue(stars[t]) * desire;
             const costFactor = Math.max(5, baseRequired) * Math.sqrt(minEta);
-            targets.push({ target: t, score: value / costFactor, launchers });
+            targets.push({
+                target: t,
+                score: value / costFactor,
+                effMargin,
+                launchers,
+            });
         }
 
         targets.sort((a, b) => b.score - a.score);
 
-        for (const { target, launchers } of targets) {
+        for (const { target, effMargin, launchers } of targets) {
             const availLaunchers: {
                 src: number;
                 eta: number;
@@ -1686,10 +2028,27 @@ export class TacticalExecutor {
             }[] = [];
 
             for (const l of launchers) {
-                const reserve = Math.max(
-                    lockedShips[l.src],
-                    garrisonTarget[l.src],
-                );
+                let guard = 0;
+                if (decision.garrisonTarget?.[l.src] != null) {
+                    guard = decision.garrisonTarget[l.src] * 0.5;
+                } else {
+                    // Hold a modest local guard if OTHER enemy stars (excluding `target`)
+                    // can actually jump onto `l.src` so a neighbor cannot backstab `l.src`.
+                    let otherEnemyShips = 0;
+                    for (let e = 0; e < S; e++) {
+                        const eOwner = stars[e].ownedByPlayerId;
+                        if (e === target || !this._isEnemy(game, player, eOwner)) {
+                            continue;
+                        }
+                        const eRange =
+                            enemyRangeByPid.get(eOwner!.toString()) ?? 0;
+                        if (distMatrix[l.src * S + e] <= eRange) {
+                            otherEnemyShips += stars[e].ships ?? 0;
+                        }
+                    }
+                    guard = Math.min(22, Math.ceil(otherEnemyShips * 0.15));
+                }
+                const reserve = Math.max(lockedShips[l.src], guard);
                 const surplus = this._availableShipsAt(
                     stars[l.src],
                     idleCarriersAt.get(l.src),
@@ -1706,8 +2065,11 @@ export class TacticalExecutor {
             }
             if (!availLaunchers.length) continue;
 
-            // Find minimal prefix k (sorted by eta ascending) whose combined
-            // surplus meets the required ship count at synchronized T_sync = eta_k.
+            // Coordinate at most 3 close border stars (`eta_k - eta_0 <= 8` ticks)
+            // so ships aren't locked in long `delayTicks` orbits.
+            const maxK = Math.min(availLaunchers.length, 3);
+            const firstEta = availLaunchers[0].eta;
+
             let cumShips = committedTargets.get(target) ?? 0;
             let carriersToBuy = 0;
             let chosenK = -1;
@@ -1726,13 +2088,14 @@ export class TacticalExecutor {
                     game.settings.specialGalaxy.specialistsCurrency
                 ] ?? 0) >= 6;
 
-            for (let k = 0; k < availLaunchers.length; k++) {
+            for (let k = 0; k < maxK; k++) {
                 const item = availLaunchers[k];
+                if (k > 0 && item.eta - firstEta > 8) break;
                 if (item.needsBuy) carriersToBuy++;
                 const buyCost = carriersToBuy * this._carrierCost(game);
                 if (
                     carriersToBuy > 0 &&
-                    ((player.credits ?? 0) < buyCost ||
+                    ((player.credits ?? 0) - upgradeReserve < buyCost ||
                         ownCarrierCount + carriersToBuy >
                             this.container.carrierService.getCarrierLimit(
                                 game,
@@ -1750,13 +2113,11 @@ export class TacticalExecutor {
                     stars[target],
                     target,
                     tSync,
-                    attackMargin,
+                    effMargin,
                     believedIndustry,
                     0,
                 );
 
-                // For heavily fortified targets reachable within 14 ticks (Siege Breaker
-                // expires after 15 ticks!), check if +4 weapons lets us crack it cleanly.
                 let withSiege = false;
                 if (cumShips < req && canSiege && tSync <= 14 && req >= 50) {
                     const siegeReq = this._requiredShipsForTarget(
@@ -1765,7 +2126,7 @@ export class TacticalExecutor {
                         stars[target],
                         target,
                         tSync,
-                        attackMargin,
+                        effMargin,
                         believedIndustry,
                         4,
                     );
@@ -1787,9 +2148,113 @@ export class TacticalExecutor {
                 }
             }
 
-            if (chosenK < 0) continue;
+            if (chosenK < 0) {
+                // Mode B fallback: check if a SINGLE rear shipyard `u` can strike
+                // through a border jump star along `ownGraph` within `maxAttackTicks`
+                // without locking up border garrisons!
+                const directSet = new Set(launchers.map((l) => l.src));
+                let bestRear = -1;
+                let bestBorder = -1;
+                let bestRearEta = Infinity;
+                let bestRearReq = 0;
 
-            // Launch synchronized strike from availLaunchers[0..chosenK]!
+                for (const u of ownStarIndices) {
+                    if (doomedStars.has(u) || directSet.has(u)) continue;
+                    const hasIdle = (idleCarriersAt.get(u)?.length ?? 0) > 0;
+                    if (
+                        !hasIdle &&
+                        !this._canBuildCarrier(
+                            game,
+                            player,
+                            stars[u],
+                            ownCarrierCount,
+                            upgradeReserve,
+                        )
+                    ) {
+                        continue;
+                    }
+                    const guard =
+                        decision.garrisonTarget?.[u] != null
+                            ? decision.garrisonTarget[u] * 0.5
+                            : 0;
+                    const surplus = this._availableShipsAt(
+                        stars[u],
+                        idleCarriersAt.get(u),
+                        Math.max(lockedShips[u], guard),
+                    );
+                    if (surplus < 10) continue;
+
+                    for (const b of launchers) {
+                        const pTicks = ownGraph.ticks[u * S + b.src];
+                        if (!Number.isFinite(pTicks)) continue;
+                        const totEta = pTicks + b.eta;
+                        if (totEta > maxAttackTicks || totEta >= bestRearEta) {
+                            continue;
+                        }
+                        const req = this._requiredShipsForTarget(
+                            game,
+                            player,
+                            stars[target],
+                            target,
+                            totEta,
+                            effMargin,
+                            believedIndustry,
+                            0,
+                        );
+                        const need = Math.max(
+                            1,
+                            req - (committedTargets.get(target) ?? 0),
+                        );
+                        if (surplus >= need) {
+                            bestRear = u;
+                            bestBorder = b.src;
+                            bestRearEta = totEta;
+                            bestRearReq = need;
+                        }
+                    }
+                }
+
+                if (bestRear >= 0 && bestBorder >= 0) {
+                    const prefix = this._buildPathWaypoints(
+                        game,
+                        bestRear,
+                        bestBorder,
+                        ownGraph.nextHop,
+                        "nothing",
+                        false,
+                        0,
+                    );
+                    if (prefix.length > 0 && prefix.length < 28) {
+                        prefix.push({
+                            source: stars[bestBorder]._id,
+                            destination: stars[target]._id,
+                            action: "nothing",
+                            actionShips: 0,
+                            delayTicks: 0,
+                        });
+                        const res = await this._launchShips(
+                            game,
+                            player,
+                            bestRear,
+                            bestRearReq,
+                            prefix,
+                            idleCarriersAt,
+                            ownCarrierCount,
+                            upgradeReserve,
+                        );
+                        if (res.launched) {
+                            ownCarrierCount = res.ownCarrierCount;
+                            committedTargets.set(
+                                target,
+                                (committedTargets.get(target) ?? 0) +
+                                    res.shipsSent,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
             let shipsRemaining = neededAtSync;
             let largestCarrier: Carrier | null = null;
             let largestSent = 0;
@@ -1817,7 +2282,7 @@ export class TacticalExecutor {
                     wps,
                     idleCarriersAt,
                     ownCarrierCount,
-                    0,
+                    upgradeReserve,
                 );
                 if (res.launched && res.carrier) {
                     ownCarrierCount = res.ownCarrierCount;
@@ -1836,7 +2301,6 @@ export class TacticalExecutor {
                 }
             }
 
-            // Attach Siege Breaker or Infiltrator on major assaults when token-rich.
             if (largestCarrier && decision.autoCarrierSpecialist !== false) {
                 const specId = useSiegeBreaker
                     ? SPEC_SIEGE_BREAKER
@@ -1873,9 +2337,79 @@ export class TacticalExecutor {
         return ownCarrierCount;
     }
 
+    private _starShipsPerCycle(game: Game, star: Star): number {
+        const ind = star.infrastructure?.industry ?? 0;
+        if (ind <= 0) return 0;
+        const techs =
+            this.container.technologyService.getStarEffectiveTechnologyLevels(
+                game,
+                star,
+                true,
+            );
+        const prodTicks = game.settings.galaxy.productionTicks;
+        return this.container.shipService.calculateStarShipsByTicks(
+            techs.manufacturing,
+            ind,
+            prodTicks,
+            prodTicks,
+        );
+    }
+
+    private _buildLogisticsWaypoints(
+        game: Game,
+        srcIdx: number,
+        dstIdx: number,
+        nextHop: Int16Array,
+        canSweepStar: (idx: number) => boolean,
+    ): { waypoints: CarrierWaypointBase<DBObjectId>[]; sweptIndices: number[] } {
+        const stars = game.galaxy.stars;
+        const S = stars.length;
+        const path: number[] = [srcIdx];
+        let cur = srcIdx;
+        let guard = 0;
+        while (cur !== dstIdx && guard++ < 14) {
+            const nxt = nextHop[cur * S + dstIdx];
+            if (nxt < 0) return { waypoints: [], sweptIndices: [] };
+            path.push(nxt);
+            cur = nxt;
+        }
+        if (cur !== dstIdx || path.length < 2) {
+            return { waypoints: [], sweptIndices: [] };
+        }
+
+        const wps: CarrierWaypointBase<DBObjectId>[] = [];
+        const sweptIndices: number[] = [];
+        for (let i = 1; i < path.length; i++) {
+            const node = path[i];
+            const isLast = i === path.length - 1;
+            const sweep = !isLast && canSweepStar(node);
+            if (sweep) sweptIndices.push(node);
+            wps.push({
+                source: stars[path[i - 1]]._id,
+                destination: stars[node]._id,
+                action: isLast ? "dropAll" : sweep ? "collectAll" : "nothing",
+                actionShips: 0,
+                delayTicks: 0,
+            });
+        }
+        if (wps.length * 2 <= 30) {
+            for (let i = path.length - 1; i >= 1; i--) {
+                wps.push({
+                    source: stars[path[i]]._id,
+                    destination: stars[path[i - 1]]._id,
+                    action: "nothing",
+                    actionShips: 0,
+                    delayTicks: 0,
+                });
+            }
+        }
+        return { waypoints: wps, sweptIndices };
+    }
+
     // Routes surplus ships from interior stars along shortest tick-cost paths
     // (using Warp Gates & Wormholes) toward frontier stars that are below their
-    // `garrisonTarget` or staging for high-`attackDesire` targets.
+    // `garrisonTarget` or staging for enemy fronts, while strictly protecting
+    // cycle upgrade cash (`totalEconomy * 5`) and reusing returning ferries.
     private async _executeLogistics(
         game: Game,
         player: Player,
@@ -1883,21 +2417,39 @@ export class TacticalExecutor {
         doomedStars: Set<number>,
         lockedShips: Float32Array,
         garrisonTarget: Float32Array,
+        hostileBorder: Uint8Array,
+        nearbyEnemyShipsAt: Float32Array,
         committedTargets: Map<number, number>,
-        outboundLogistics: Set<string>,
+        activeLogisticsRoutes: Set<string>,
+        busyLogisticsStars: Set<number>,
         ownGraph: { ticks: Float32Array; nextHop: Int16Array },
         distMatrix: Float64Array,
         hsDist: number,
+        enemyRangeByPid: Map<string, number>,
         decision: AdmiralDecision,
         idleCarriersAt: Map<number, Carrier[]>,
         ownCarrierCount: number,
-        carrierReserve: number,
+        logisticsCreditReserve: number,
     ): Promise<number> {
         const stars = game.galaxy.stars;
         const S = stars.length;
 
-        // Compute demand at each safe own star: unmet garrisonTarget + offensive
-        // staging demand from adjacent high-desire enemy stars.
+        // Compute distance from every own star to the nearest enemy star so
+        // front-facing perimeter stars ("advance hubs" with no own neighbor
+        // closer to an enemy) stage ships forward even before range contact.
+        const minEnemyDist = new Float32Array(S).fill(Infinity);
+        let anyEnemy = false;
+        for (const u of ownStarIndices) {
+            for (let t = 0; t < S; t++) {
+                if (!this._isEnemy(game, player, stars[t].ownedByPlayerId))
+                    continue;
+                anyEnemy = true;
+                const d = distMatrix[u * S + t];
+                if (d < minEnemyDist[u]) minEnemyDist[u] = d;
+            }
+        }
+
+        const isFrontSink = new Uint8Array(S);
         const demand = new Float32Array(S);
         for (const u of ownStarIndices) {
             if (doomedStars.has(u)) continue;
@@ -1906,30 +2458,57 @@ export class TacticalExecutor {
                 (committedTargets.get(u) ?? 0);
             let want = garrisonTarget[u];
 
-            for (let t = 0; t < S; t++) {
-                if (!this._isEnemy(game, player, stars[t].ownedByPlayerId))
-                    continue;
-                if (distMatrix[u * S + t] <= hsDist) {
-                    const desire = decision.attackDesire?.[t] ?? 1.0;
-                    want += Math.min(60, 12 * desire);
+            if (hostileBorder[u] || minEnemyDist[u] <= hsDist) {
+                isFrontSink[u] = 1;
+                let maxDesire = 0;
+                let strikeShips = nearbyEnemyShipsAt[u];
+                for (let t = 0; t < S; t++) {
+                    const eOwner = stars[t].ownedByPlayerId;
+                    if (!this._isEnemy(game, player, eOwner)) continue;
+                    const eRange = enemyRangeByPid.get(eOwner!.toString()) ?? 0;
+                    const reach = Math.max(hsDist, eRange);
+                    if (distMatrix[u * S + t] <= reach) {
+                        const d = decision.attackDesire?.[t] ?? 1.0;
+                        if (d > maxDesire) maxDesire = d;
+                        if (distMatrix[u * S + t] > eRange) {
+                            strikeShips += stars[t].ships ?? 0;
+                        }
+                    }
+                }
+                want = Math.max(
+                    want,
+                    20 + strikeShips * 0.65 + 25 * maxDesire,
+                );
+            } else if (anyEnemy && Number.isFinite(minEnemyDist[u])) {
+                // Advance perimeter hub: no 1-hop safe own neighbor sits closer to the enemy.
+                let hasCloserOwnNeighbor = false;
+                for (const v of ownStarIndices) {
+                    if (v === u || doomedStars.has(v)) continue;
+                    if (
+                        distMatrix[u * S + v] <= hsDist &&
+                        minEnemyDist[v] < minEnemyDist[u] - 0.5
+                    ) {
+                        hasCloserOwnNeighbor = true;
+                        break;
+                    }
+                }
+                if (!hasCloserOwnNeighbor) {
+                    isFrontSink[u] = 1;
+                    want = Math.max(want, 40);
                 }
             }
             demand[u] = Math.max(0, want - current);
         }
 
         const sinks = ownStarIndices.filter(
-            (u) => !doomedStars.has(u) && demand[u] >= 4,
+            (u) => !doomedStars.has(u) && demand[u] >= 5,
         );
         if (!sinks.length) return ownCarrierCount;
 
-        // Sources: safe own stars with meaningful surplus above garrisonTarget + lockedShips.
-        const minStockpile = Math.max(
-            6,
-            Math.floor(game.settings.galaxy.productionTicks * 0.4),
-        );
-        const sources: { src: number; surplus: number }[] = [];
+        // Sources: safe interior own stars (not front sinks) with surplus.
+        const sources: { src: number; surplus: number; hasIdle: boolean }[] = [];
         for (const u of ownStarIndices) {
-            if (doomedStars.has(u) || demand[u] > 0) continue;
+            if (doomedStars.has(u) || demand[u] > 0 || isFrontSink[u]) continue;
             const reserve = Math.max(lockedShips[u], garrisonTarget[u]);
             const surplus = this._availableShipsAt(
                 stars[u],
@@ -1937,17 +2516,35 @@ export class TacticalExecutor {
                 reserve,
             );
             const hasIdle = (idleCarriersAt.get(u)?.length ?? 0) > 0;
-            if (surplus >= (hasIdle ? 4 : minStockpile)) {
-                sources.push({ src: u, surplus });
+            if (!hasIdle) {
+                if (busyLogisticsStars.has(u)) continue;
+                const prodCycle = this._starShipsPerCycle(game, stars[u]);
+                const minBuyStockpile = Math.max(
+                    8,
+                    Math.ceil(prodCycle * 0.7),
+                );
+                if (surplus < minBuyStockpile) continue;
+            } else if (surplus < 4) {
+                continue;
             }
+            sources.push({ src: u, surplus, hasIdle });
         }
         sources.sort((a, b) => b.surplus - a.surplus);
 
-        for (const { src, surplus } of sources) {
+        const canSweepStar = (m: number) =>
+            !isFrontSink[m] &&
+            !doomedStars.has(m) &&
+            lockedShips[m] <= 0 &&
+            garrisonTarget[m] <= 0 &&
+            demand[m] <= 0;
+
+        for (const { src, surplus, hasIdle } of sources) {
+            if (!hasIdle && busyLogisticsStars.has(src)) continue;
+
             let bestSink = -1;
             let bestScore = 0;
             for (const dst of sinks) {
-                if (dst === src) continue;
+                if (dst === src || demand[dst] < 2) continue;
                 const eta = ownGraph.ticks[src * S + dst];
                 if (!Number.isFinite(eta) || eta <= 0) continue;
                 const score = demand[dst] / (eta * eta);
@@ -1959,32 +2556,36 @@ export class TacticalExecutor {
             if (bestSink < 0) continue;
 
             const hop = ownGraph.nextHop[src * S + bestSink];
-            if (hop < 0 || outboundLogistics.has(`${src}->${hop}`)) continue;
+            if (hop < 0 || activeLogisticsRoutes.has(`${src}->${hop}`)) continue;
 
-            const wps = this._buildPathWaypoints(
+            const { waypoints, sweptIndices } = this._buildLogisticsWaypoints(
                 game,
                 src,
                 bestSink,
                 ownGraph.nextHop,
-                "dropAll",
-                true,
+                canSweepStar,
             );
-            if (!wps.length) continue;
+            if (!waypoints.length) continue;
 
             const res = await this._launchShips(
                 game,
                 player,
                 src,
                 surplus,
-                wps,
+                waypoints,
                 idleCarriersAt,
                 ownCarrierCount,
-                0,
+                logisticsCreditReserve,
             );
             if (res.launched) {
                 ownCarrierCount = res.ownCarrierCount;
                 demand[bestSink] = Math.max(0, demand[bestSink] - res.shipsSent);
-                outboundLogistics.add(`${src}->${hop}`);
+                activeLogisticsRoutes.add(`${src}->${hop}`);
+                activeLogisticsRoutes.add(`${hop}->${src}`);
+                busyLogisticsStars.add(src);
+                for (const m of sweptIndices) {
+                    busyLogisticsStars.add(m);
+                }
             }
         }
 

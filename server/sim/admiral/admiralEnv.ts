@@ -140,6 +140,9 @@ export class AdmiralEnv extends AgentEnv {
                     const restore = this._fog(seat, true);
                     try {
                         const indVec = dec.beliefs?.industry;
+                        const starVis = this.fog
+                            ? (seat.memory.view?.stars ?? null)
+                            : null;
                         await this.tacticalExecutor.executeTick(
                             game,
                             seat.player,
@@ -147,6 +150,7 @@ export class AdmiralEnv extends AgentEnv {
                             indVec
                                 ? (i: number) => indVec[i] ?? undefined
                                 : undefined,
+                            starVis,
                         );
                     } finally {
                         restore();
@@ -481,7 +485,7 @@ export class AdmiralEnv extends AgentEnv {
             if (technology.isTechnologyResearchable(this.game, tech)) {
                 seat.player.researchingNow = tech;
                 seat.player.researchingNext = (decision.researchNext ??
-                    tech) as any;
+                    "random") as any;
             }
         }
     }

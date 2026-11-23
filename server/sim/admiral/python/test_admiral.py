@@ -24,8 +24,13 @@ import belief_data as bd  # noqa: E402
 from admiral_agent import AdmiralAgent, AdmiralSearchPlanner  # noqa: E402
 from admiral_env import AdmiralEnv  # noqa: E402
 from admiral_net import AdmiralNet, build_admiral_inputs  # noqa: E402
+from admiral_pretrain import pretrain_admiral_from_sbd  # noqa: E402
 from admiral_rollout import play_admiral_game  # noqa: E402
-from admiral_train import build_dataset_from_rollouts, ppo_update  # noqa: E402
+from admiral_train import (  # noqa: E402
+    build_dataset_from_rollouts,
+    load_pretrained_backbone,
+    ppo_update,
+)
 from belief_tracker import VISIBLE, BeliefTracker  # noqa: E402
 
 
@@ -225,6 +230,149 @@ class TestAdmiralStack(unittest.TestCase):
             self.assertTrue((Path(tmpdir) / "log.jsonl").exists())
             sbd_files = list((Path(tmpdir) / "belief").glob("*.sbd"))
             self.assertGreaterEqual(len(sbd_files), 1)
+
+    def test_06_async_rollouts_and_resume(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_cmd = [
+                sys.executable,
+                str(_THIS_DIR / "admiral_train.py"),
+                "--run-dir",
+                tmpdir,
+                "--games-per-iter",
+                "3",
+                "--workers",
+                "2",
+                "--max-ticks",
+                "35",
+                "--d-model",
+                "64",
+                "--n-layers",
+                "2",
+                "--snapshot-every",
+                "1",
+                "--record-every",
+                "2",
+                "--eval-every",
+                "2",
+                "--eval-games",
+                "2",
+                "--eval-workers",
+                "1",
+                "--async-rollouts",
+            ]
+            # First run: 2 async iterations + background async eval at iter 2
+            p1 = subprocess.run(
+                base_cmd + ["--iters", "2"],
+                cwd=str(_SERVER_DIR),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                p1.returncode,
+                0,
+                f"async run 1 failed:\nSTDOUT:\n{p1.stdout}\nSTDERR:\n{p1.stderr}",
+            )
+            self.assertTrue((Path(tmpdir) / "ckpt_2.pt").exists())
+            self.assertTrue((Path(tmpdir) / "latest_policy.pt").exists())
+            self.assertTrue((Path(tmpdir) / "eval.jsonl").exists())
+
+            # Resume run: 1 more async iteration starting from ckpt_2.pt -> ckpt_3.pt
+            p2 = subprocess.run(
+                base_cmd + ["--iters", "1"],
+                cwd=str(_SERVER_DIR),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                p2.returncode,
+                0,
+                f"async resume failed:\nSTDOUT:\n{p2.stdout}\nSTDERR:\n{p2.stderr}",
+            )
+            self.assertTrue((Path(tmpdir) / "ckpt_3.pt").exists())
+            lines = [
+                json.loads(line)
+                for line in (Path(tmpdir) / "log.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([row["iter"] for row in lines], [1, 2, 3])
+            for row in lines:
+                self.assertIn("mean_staleness", row)
+                self.assertIn("gpu_sec", row)
+
+    def test_07_sbd_pretrain_and_ppo_init(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sbd_path = Path(tmpdir) / "sample.sbd"
+            pre_pt = Path(tmpdir) / "admiral_belief.pt"
+            run_dir = Path(tmpdir) / "ppo_from_pre"
+
+            play_admiral_game(
+                seed=303,
+                seats=2,
+                checkpoint=None,
+                max_ticks=45,
+                learner_seats=[0, 1],
+                record=str(sbd_path),
+                cycle_only=True,
+            )
+            self.assertTrue(sbd_path.exists())
+
+            res = pretrain_admiral_from_sbd(
+                sbd_dirs=[sbd_path],
+                out_path=pre_pt,
+                max_games=1,
+                samples_per_game=16,
+                epochs=3,
+                batch_size=8,
+                workers=1,
+                d_model=64,
+                n_layers=2,
+                n_heads=4,
+            )
+            self.assertTrue(pre_pt.exists())
+            self.assertLessEqual(res["val_best"]["loss"], res["val_init"]["loss"])
+
+            # Policy heads remain zero-initialized while trunks/critics/belief load
+            fresh = AdmiralNet(8, d=64, n_layers=2)
+            loaded_keys = load_pretrained_backbone(fresh, pre_pt)
+            self.assertGreater(len(loaded_keys), 20)
+            self.assertTrue(torch.all(fresh.frontier_head[-1].weight == 0))
+            self.assertTrue(torch.all(fresh.budget_head[-1].weight == 0))
+
+            # Verify admiral_train.py --pretrain initializes cleanly and trains
+            p_run = subprocess.run(
+                [
+                    sys.executable,
+                    str(_THIS_DIR / "admiral_train.py"),
+                    "--run-dir",
+                    str(run_dir),
+                    "--pretrain",
+                    str(pre_pt),
+                    "--iters",
+                    "1",
+                    "--games-per-iter",
+                    "1",
+                    "--workers",
+                    "1",
+                    "--max-ticks",
+                    "30",
+                    "--d-model",
+                    "64",
+                    "--n-layers",
+                    "2",
+                    "--eval-every",
+                    "0",
+                ],
+                cwd=str(_SERVER_DIR),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                p_run.returncode,
+                0,
+                f"--pretrain failed:\nSTDOUT:\n{p_run.stdout}\nSTDERR:\n{p_run.stderr}",
+            )
+            self.assertIn("pre-trained backbone", p_run.stdout)
+            self.assertTrue((run_dir / "ckpt_1.pt").exists())
 
 
 if __name__ == "__main__":
