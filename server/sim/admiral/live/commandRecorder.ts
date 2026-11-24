@@ -58,7 +58,7 @@ export function createShadowEngine(): {
  * all diplomatic, treasury, research, and shared-seat constraints, and records a
  * coalesced, dependency-ordered `LiveAction[]` list:
  *
- * 1. `SetResearchNow` / `SetResearchNext`
+ * 1. `SetResearchNow` / `SetResearchQueue`
  * 2. Pre-execution Invariant 2 peace/alliance waypoint cancellations
  * 3. `HireStarSpecialist` -> `UpgradeStar` / `BuildWarpGate`
  * 4. Coalesced star ship pool unloads (`TransferShips` where `after < before`)
@@ -140,8 +140,8 @@ export async function recordShadowTickActions(params: {
     for (const rAct of params.researchActions) {
         if (rAct.type === "SetResearchNow") {
             player.researchingNow = rAct.preference as any;
-        } else if (rAct.type === "SetResearchNext") {
-            player.researchingNext = rAct.preference as any;
+        } else if (rAct.type === "SetResearchQueue") {
+            player.researchQueue = [...rAct.queue] as any;
         }
     }
 
@@ -550,7 +550,7 @@ export async function dispatchLiveActions(params: {
                 actionsToRun = actionsToRun.filter(
                     (a) =>
                         a.type === "SetResearchNow" ||
-                        a.type === "SetResearchNext" ||
+                        a.type === "SetResearchQueue" ||
                         (a.type === "SaveWaypoints" && a.isDefense),
                 );
                 params.onAlert?.({
@@ -611,10 +611,10 @@ export async function dispatchLiveActions(params: {
                         idemKey,
                     );
                     break;
-                case "SetResearchNext":
-                    await client.updateResearchNext(
+                case "SetResearchQueue":
+                    await client.updateResearchQueue(
                         gameId,
-                        action.preference,
+                        action.queue,
                         idemKey,
                     );
                     break;

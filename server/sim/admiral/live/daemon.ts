@@ -414,7 +414,7 @@ export class LiveAdmiralDaemon {
 
     /**
      * Immediate mid-tick reaction to `playerTechnologyReceived`:
-     * re-evaluates `researchingNow` / `researchingNext` within seconds of an
+     * re-evaluates `researchingNow` / `researchQueue` within seconds of an
      * ally sending us a technology so science is never wasted on a wiped tech.
      */
     async handleRealtimeTechReceived(): Promise<LiveAction[]> {
@@ -540,6 +540,7 @@ export class LiveAdmiralDaemon {
                 this.persisted.human.lastAiResearch = {
                     now: resCoord.desiredNow,
                     next: resCoord.desiredNext,
+                    queue: resCoord.desiredQueue,
                     tick,
                 };
             }
@@ -782,7 +783,7 @@ export class LiveAdmiralDaemon {
             this.persisted.beliefTracker = pyOut.trackerState;
         }
 
-        // 7. Coordinate Research (`SetResearchNow` / `SetResearchNext`).
+        // 7. Coordinate Research (`SetResearchNow` / `SetResearchQueue`).
         const resCoord = coordinateResearch({
             engine: this.shadow.engine,
             game: hyd.shadowGame,
@@ -875,6 +876,7 @@ export class LiveAdmiralDaemon {
                 this.persisted.human.lastAiResearch = {
                     now: resCoord.desiredNow,
                     next: resCoord.desiredNext,
+                    queue: resCoord.desiredQueue,
                     tick,
                 };
                 const builtTempIds = new Set(

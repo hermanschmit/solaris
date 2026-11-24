@@ -578,7 +578,7 @@ describe("Live Diplomatic Admiral stack", () => {
 
             // Case A: Mid-cycle received technology (`weapons` jumped 1 -> 2, progress wiped to 0)!
             me.researchingNow = "weapons";
-            me.researchingNext = "random";
+            me.researchQueue = ["random"];
             me.research.weapons.level = 2;
             me.research.weapons.progress = 0;
 
@@ -629,7 +629,11 @@ describe("Live Diplomatic Admiral stack", () => {
 
             expect(coord1.desiredNow).toBe("hyperspace");
             expect(coord1.desiredNext).toBe("terraforming");
-            expect(coord1.desiredNext).not.toBe("random");
+            expect(coord1.desiredQueue[0]).toBe("terraforming");
+            expect(coord1.desiredQueue.includes("random")).toBeFalse();
+            expect(
+                coord1.actions.some((a) => a.type === "SetResearchQueue"),
+            ).toBeTrue();
             expect(
                 alerts.some((a) => a.code === "TRADE_OPPORTUNITY"),
             ).toBeTrue();
@@ -637,12 +641,13 @@ describe("Live Diplomatic Admiral stack", () => {
             human.lastAiResearch = {
                 now: coord1.desiredNow,
                 next: coord1.desiredNext,
+                queue: coord1.desiredQueue,
                 tick: 5,
             };
 
             // Case B: Human manually changes `researchingNow` to `banking` in GUI!
             me.researchingNow = "banking";
-            me.researchingNext = "terraforming";
+            me.researchQueue = ["terraforming"];
             const coord2 = coordinateResearch({
                 engine,
                 game,

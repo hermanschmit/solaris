@@ -221,6 +221,10 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
         const log = logger("admiral-e2e");
         const baseConfig: Config = {
             port: "0",
+            http: {
+                keepAliveTimeout: 120000,
+                headersTimeout: 125000,
+            },
             sessionSecret: "admiral-two-hybrid-e2e-secret",
             sessionSecureCookies: false,
             connectionString: `mongodb://127.0.0.1:${MONGO_HOST_PORT}/solaris_admiral_e2e`,
@@ -417,32 +421,50 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
         // Place one Alpha star, one Beta star, one unclaimed star, and one Enemy star
         // along the Alpha-Beta / Alpha-Enemy midpoints (~1.2 LY apart) so trade, gifting,
         // covert ToT attacks, and hostile combat are deterministically exercisable.
+        const alphaHomeId = fullGame.galaxy.players[0].homeStarId?.toString();
+        const betaHomeId = fullGame.galaxy.players[1].homeStarId?.toString();
+        const enemyHomeId = fullGame.galaxy.players
+            .find((p) => p._id.toString() === enemyAlphaId)
+            ?.homeStarId?.toString();
         const alphaStars = fullGame.galaxy.stars.filter(
-            (s) => s.ownedByPlayerId?.toString() === alphaPlayerId,
+            (s) =>
+                s.ownedByPlayerId?.toString() === alphaPlayerId &&
+                s._id.toString() !== alphaHomeId,
         );
         const betaStars = fullGame.galaxy.stars.filter(
-            (s) => s.ownedByPlayerId?.toString() === betaPlayerId,
+            (s) =>
+                s.ownedByPlayerId?.toString() === betaPlayerId &&
+                s._id.toString() !== betaHomeId,
         );
         const enemyAStars = fullGame.galaxy.stars.filter(
-            (s) => s.ownedByPlayerId?.toString() === enemyAlphaId,
+            (s) =>
+                s.ownedByPlayerId?.toString() === enemyAlphaId &&
+                s._id.toString() !== enemyHomeId,
         );
         const unownedStars = fullGame.galaxy.stars.filter(
             (s) => s.ownedByPlayerId == null,
         );
-        const anchorA = alphaStars[0].location;
-        const anchorB = betaStars[0].location;
-        const midAB = {
-            x: (anchorA.x + anchorB.x) / 2,
-            y: (anchorA.y + anchorB.y) / 2,
-        };
-        const alphaBorderStar = alphaStars[1];
-        const alphaSecondStar = alphaStars[2];
-        const betaBorderStar = betaStars[1];
-        const enemyBorderStar = enemyAStars[1];
-        const sharedUnownedStar = unownedStars[0];
-        const ignoredStar = alphaStars[3];
-
+        const anchorA =
+            fullGame.galaxy.stars.find((s) => s._id.toString() === alphaHomeId)
+                ?.location ?? alphaStars[0].location;
         const ly = fullGame.constants?.distances?.lightYear || 50;
+        const maxGalaxyX = Math.max(
+            ...fullGame.galaxy.stars.map((s) => s.location.x),
+        );
+        // Place the Alpha-Beta diplomatic border pocket 10 LY outside `maxGalaxyX`
+        // so random 10-player seat shuffles never drop a third-party AI home cluster
+        // on top of `alphaBorderStar` / `betaBorderStar` during Ticks 1..25:
+        const midAB = {
+            x: maxGalaxyX + 10 * ly,
+            y: 0,
+        };
+        const alphaBorderStar = alphaStars[0];
+        const alphaSecondStar = alphaStars[1];
+        const betaBorderStar = betaStars[0];
+        const enemyBorderStar = enemyAStars[0];
+        const sharedUnownedStar = unownedStars[0];
+        const ignoredStar = alphaStars[2];
+
         alphaBorderStar.location = { x: midAB.x - 0.6 * ly, y: midAB.y };
         alphaBorderStar.warpGate = false;
         alphaBorderStar.wormHoleToStarId = null;
@@ -450,6 +472,8 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
             x: midAB.x - 1.0 * ly,
             y: midAB.y + 0.6 * ly,
         };
+        alphaSecondStar.warpGate = false;
+        alphaSecondStar.wormHoleToStarId = null;
         betaBorderStar.location = { x: midAB.x + 0.6 * ly, y: midAB.y };
         betaBorderStar.warpGate = false;
         betaBorderStar.wormHoleToStarId = null;
@@ -457,10 +481,22 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
             x: midAB.x,
             y: midAB.y + 0.8 * ly,
         };
+        sharedUnownedStar.warpGate = false;
+        sharedUnownedStar.wormHoleToStarId = null;
         enemyBorderStar.location = {
             x: anchorA.x - 1.2 * ly,
             y: anchorA.y - 0.4 * ly,
         };
+        ignoredStar.shipsActual = 150;
+        ignoredStar.ships = 150;
+        for (const c of fullGame.galaxy.carriers) {
+            if (c.orbiting) {
+                const st = fullGame.galaxy.stars.find(
+                    (s) => s._id.toString() === c.orbiting!.toString(),
+                );
+                if (st) c.location = { ...st.location };
+            }
+        }
         await fullGame.save();
         await container.historyService.log(fullGame);
 
@@ -624,6 +660,12 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
         const s1GalA = await browserA.request(
             "GET",
             `/api/game/${gameId}/galaxy`,
+        );
+        assert(
+            Array.isArray(s1GalA.galaxy.players[0].researchQueue) &&
+                s1GalA.galaxy.players[0].researchQueue.length > 0 &&
+                !s1GalA.galaxy.players[0].researchQueue.includes("random"),
+            `Expected non-random researchQueue on live server after update/258 sync, got ${JSON.stringify(s1GalA.galaxy.players[0].researchQueue)}`,
         );
         const starOwnerMap = new Map<string, string | null>();
         for (const s of s1GalA.galaxy.stars) {
@@ -1237,37 +1279,59 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
             bStar.naturalResources = { economy: 30, industry: 30, science: 30 };
             bStar.shipsActual = 60;
             bStar.ships = 60;
-            const alphaStarIdSet = new Set(
+            const alphaOwnedStarIds = new Set(
                 dbGame.galaxy.stars
                     .filter(
                         (s) => s.ownedByPlayerId?.toString() === alphaPlayerId,
                     )
                     .map((s) => s._id.toString()),
             );
-            const betaStarIdSet = new Set(
+            const betaOwnedStarIds = new Set(
                 dbGame.galaxy.stars
                     .filter(
                         (s) => s.ownedByPlayerId?.toString() === betaPlayerId,
                     )
                     .map((s) => s._id.toString()),
             );
-            // Park any leftover 7a Alpha/Beta carriers targeting each other's stars so an
-            // earlier covert carrier landing doesn't trigger Solaris server auto-war (`reputation.ts:167`)!
+            // Park any leftover in-flight or former-ally co-orbiting Alpha/Beta carriers
+            // (allies can co-orbit each other's stars during Scenarios 2-6, which triggers
+            // star combat + `reputation.ts:167` auto-war once neutral ticks advance!):
             for (const c of dbGame.galaxy.carriers) {
                 const owner = c.ownedByPlayerId?.toString();
+                const orb = c.orbiting?.toString();
                 const dst = c.waypoints[0]?.destination?.toString();
-                if (owner === alphaPlayerId && dst && betaStarIdSet.has(dst)) {
-                    c.orbiting = aStar._id;
-                    c.location = { ...aStar.location };
-                    c.waypoints = [];
+                if (owner === alphaPlayerId) {
+                    if (
+                        !orb ||
+                        !alphaOwnedStarIds.has(orb) ||
+                        c.waypoints.length > 0
+                    ) {
+                        c.orbiting = aStar._id;
+                        c.location = { ...aStar.location };
+                        c.waypoints = [];
+                    }
+                } else if (owner === betaPlayerId) {
+                    if (
+                        !orb ||
+                        !betaOwnedStarIds.has(orb) ||
+                        c.waypoints.length > 0
+                    ) {
+                        c.orbiting = bStar._id;
+                        c.location = { ...bStar.location };
+                        c.waypoints = [];
+                    }
                 } else if (
-                    owner === betaPlayerId &&
-                    dst &&
-                    alphaStarIdSet.has(dst)
+                    dst === alphaBorderStarId ||
+                    dst === betaBorderStarId
                 ) {
-                    c.orbiting = bStar._id;
-                    c.location = { ...bStar.location };
-                    c.waypoints = [];
+                    const homeStar = dbGame.galaxy.stars.find(
+                        (s) => s.ownedByPlayerId?.toString() === owner,
+                    );
+                    if (homeStar) {
+                        c.orbiting = homeStar._id;
+                        c.location = { ...homeStar.location };
+                        c.waypoints = [];
+                    }
                 }
             }
             await dbGame.save();
@@ -1515,8 +1579,8 @@ export async function runTwoHybridE2eValidation(): Promise<TwoHybridValidationSu
 
         // Verify `Idempotency-Key` deduplication prevents duplicate execution of an already-sent action!
         const dupAction: LiveAction = {
-            type: "SetResearchNext",
-            preference: "weapons",
+            type: "SetResearchQueue",
+            queue: ["weapons", "hyperspace"],
         };
         const dupKey = buildIdempotencyKey(
             gameId,

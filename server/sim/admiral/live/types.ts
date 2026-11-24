@@ -45,8 +45,8 @@ export type LiveAction =
           reason?: string;
       }
     | {
-          type: "SetResearchNext";
-          preference: string;
+          type: "SetResearchQueue";
+          queue: string[];
           reason?: string;
       }
     | {
@@ -179,6 +179,7 @@ export interface HumanState {
     lastAiResearch: {
         now: string | null;
         next: string | null;
+        queue?: string[] | null;
         tick: number;
     };
     humanResearchPin: HumanResearchPin | null;

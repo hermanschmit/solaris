@@ -131,7 +131,7 @@ export const determinize = (
             player.research[tech].progress ??= 0;
         }
         player.researchingNow ??= "weapons";
-        player.researchingNext ??= "weapons";
+        player.researchQueue ??= ["weapons"];
         player.credits ??= 0;
         player.creditsSpecialists ??= 0;
         player.renownToGive ??= 0;
