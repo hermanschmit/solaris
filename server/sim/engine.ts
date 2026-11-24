@@ -277,15 +277,34 @@ export class SimEngine {
         // from the clock and random bytes, so the same seed played
         // differently each time. Number them from the seed instead, in
         // creation order as before.
-        const ObjectId = mongoose.Types.ObjectId as any;
+        const BsonObjectId = mongoose.mongo.BSON.ObjectId as any;
         let count = 0;
-        ObjectId.generate = () => {
+        const nextBytes = () => {
             const buffer = Buffer.alloc(12);
             buffer.writeUInt32BE(0x60000000, 0);
             buffer.writeUInt32BE(seed >>> 0, 4);
             buffer.writeUInt32BE(count++, 8);
             return buffer;
         };
+        class SeededObjectId extends BsonObjectId {
+            constructor(inputId?: any, offset?: number) {
+                super(
+                    inputId == null && offset === undefined
+                        ? nextBytes()
+                        : inputId,
+                    offset,
+                );
+            }
+        }
+        (mongoose.Types as any).ObjectId = SeededObjectId;
+        BsonObjectId.PROCESS_UNIQUE = Buffer.from([
+            (seed >>> 24) & 0xff,
+            (seed >>> 16) & 0xff,
+            (seed >>> 8) & 0xff,
+            seed & 0xff,
+            0,
+        ]);
+        BsonObjectId.index = 0;
     }
 
     loadSettings(name: string) {

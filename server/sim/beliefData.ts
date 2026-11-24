@@ -321,7 +321,9 @@ export class BeliefRecorder {
                     Math.floor(p.credits ?? 0),
                     Math.floor(p.creditsSpecialists ?? 0),
                     this.technologies.indexOf(p.researchingNow),
-                    this.technologies.indexOf(p.researchingNext),
+                    this.technologies.indexOf(
+                        (p.researchQueue?.[0] ?? "") as string,
+                    ),
                     p.defeated ? 1 : 0,
                     ...this.technologies.map((t) => p.research[t]?.level ?? 0),
                 ],

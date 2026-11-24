@@ -892,7 +892,7 @@ export class AgentEnv {
             }
 
             seat.player.researchingNow = tech;
-            seat.player.researchingNext = tech;
+            seat.player.researchQueue = [tech];
         }
     }
 

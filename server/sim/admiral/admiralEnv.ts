@@ -406,7 +406,9 @@ export class AdmiralEnv extends AgentEnv {
             specialistBudget: budget,
             carrierCost,
             researchingNow: this.technologies.indexOf(player.researchingNow),
-            researchingNext: this.technologies.indexOf(player.researchingNext),
+            researchingNext: this.technologies.indexOf(
+                (player.researchQueue?.[0] ?? "") as string,
+            ),
             researchProgress,
             researchRequired,
             affordableStarSpecialists,
@@ -500,8 +502,9 @@ export class AdmiralEnv extends AgentEnv {
             const technology = this.engine.container.technologyService;
             if (technology.isTechnologyResearchable(this.game, tech)) {
                 seat.player.researchingNow = tech;
-                seat.player.researchingNext = (decision.researchNext ??
-                    "random") as any;
+                seat.player.researchQueue = [
+                    (decision.researchNext ?? "random") as any,
+                ];
             }
         }
     }

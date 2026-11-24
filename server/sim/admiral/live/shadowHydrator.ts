@@ -196,7 +196,9 @@ export function hydrateShadowFromGalaxy(params: {
             p.research[tech].progress ??= 0;
         }
         p.researchingNow ??= "weapons";
-        p.researchingNext ??= "weapons";
+        p.researchQueue ??= p.researchingNext
+            ? [p.researchingNext]
+            : ["weapons"];
         p.credits ??= 0;
         p.creditsSpecialists ??= 0;
         p.renownToGive ??= 0;
@@ -584,7 +586,9 @@ export function computeLiveOwnFacts(params: {
         specialistBudget: specBudget,
         carrierCost,
         researchingNow: technologies.indexOf(player.researchingNow),
-        researchingNext: technologies.indexOf(player.researchingNext),
+        researchingNext: technologies.indexOf(
+            (player.researchQueue?.[0] ?? "") as string,
+        ),
         researchProgress,
         researchRequired,
         affordableStarSpecialists,

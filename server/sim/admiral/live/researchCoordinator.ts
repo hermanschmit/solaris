@@ -25,6 +25,7 @@ export interface ResearchMaskPlan {
 export interface ResearchCoordinationResult {
     desiredNow: string;
     desiredNext: string;
+    desiredQueue: string[];
     actions: LiveAction[];
     receivedTechs: ReceivedTechRecord[];
     humanPinned: boolean;
@@ -227,12 +228,12 @@ export function computeResearchMasks(params: {
 }
 
 /**
- * Coordinates `researchingNow` and `researchingNext` across:
+ * Coordinates `researchingNow` and `researchQueue` across:
  * 1. Manual GUI research pin detection (`me.researchingNow !== lastAiResearch.now`),
  * 2. Instant reaction to received technologies (invalidating stale pins & progress wipes),
  * 3. `expect_tech` & ally already-holds deprioritization (+ trade-opportunity alerts),
  * 4. >=50% sunk-cost protection on `researchingNow`, and
- * 5. Policy `res_logits` ranking (#1 -> `researchingNow`, #2 -> `researchingNext`, never `"random"`).
+ * 5. Policy `res_logits` ranking (#1 -> `researchingNow`, #2..#4 -> `researchQueue`, never `"random"`).
  */
 export function coordinateResearch(params: {
     engine: SimEngine;
@@ -275,19 +276,25 @@ export function coordinateResearch(params: {
             t as any,
         ),
     );
+    const curQueue: string[] = Array.isArray(me.researchQueue)
+        ? me.researchQueue.map((x: any) => String(x))
+        : me.researchingNext
+          ? [String(me.researchingNext)]
+          : [];
+    const curNow: string = me.researchingNow;
+    const curNext: string = curQueue[0] ?? "random";
+
     if (researchable.length === 0) {
         return {
-            desiredNow: me.researchingNow,
-            desiredNext: me.researchingNext,
+            desiredNow: curNow,
+            desiredNext: curNext,
+            desiredQueue: curQueue,
             actions: [],
             receivedTechs,
             humanPinned: false,
             sunkCostProtected: false,
         };
     }
-
-    const curNow: string = me.researchingNow;
-    const curNext: string = me.researchingNext;
 
     // 1. Update / detect Manual GUI Research Pin!
     if (
@@ -363,21 +370,36 @@ export function coordinateResearch(params: {
         (a, b) => scoreTech(b) - scoreTech(a),
     );
 
-    const pickBestNext = (chosenNow: string): string => {
-        // Respect manual GUI `researchingNext` if human explicitly set a non-random
-        // next tech that isn't equal to `chosenNow`, expected, or ally-held.
+    const pickDesiredQueue = (chosenNow: string): string[] => {
+        // Respect manual GUI `researchQueue` if human explicitly configured a valid
+        // non-random queue that differs from our last AI-set queue!
+        const lastQueueJson = human.lastAiResearch.queue
+            ? JSON.stringify(human.lastAiResearch.queue)
+            : human.lastAiResearch.next
+              ? JSON.stringify([human.lastAiResearch.next])
+              : null;
+        const curQueueValid =
+            curQueue.length > 0 &&
+            curQueue.every(
+                (t) =>
+                    t !== "random" &&
+                    researchable.includes(t) &&
+                    !expectSet.has(t.toLowerCase()) &&
+                    !receivedMap.has(t),
+            ) &&
+            curQueue[0] !== chosenNow;
+
         if (
-            human.lastAiResearch.next != null &&
-            curNext !== human.lastAiResearch.next &&
-            curNext !== "random" &&
-            curNext !== chosenNow &&
-            researchable.includes(curNext) &&
-            !expectSet.has(curNext.toLowerCase())
+            lastQueueJson != null &&
+            JSON.stringify(curQueue) !== lastQueueJson &&
+            curQueueValid
         ) {
-            return curNext;
+            return curQueue;
         }
-        const second = ranked.find((t) => t !== chosenNow);
-        return second ?? chosenNow;
+
+        const candidates = ranked.filter((t) => t !== chosenNow);
+        if (candidates.length === 0) return [chosenNow];
+        return candidates.slice(0, Math.min(3, candidates.length));
     };
 
     let desiredNow = curNow;
@@ -389,7 +411,8 @@ export function coordinateResearch(params: {
         params.forceReevaluate ||
         receivedTechs.length > 0 ||
         human.lastAiResearch.now == null ||
-        curNext === "random";
+        curQueue.length === 0 ||
+        curQueue.includes("random");
 
     if (human.humanResearchPin) {
         desiredNow = human.humanResearchPin.tech;
@@ -429,7 +452,8 @@ export function coordinateResearch(params: {
         }
     }
 
-    const desiredNext = pickBestNext(desiredNow);
+    const desiredQueue = pickDesiredQueue(desiredNow);
+    const desiredNext = desiredQueue[0] ?? desiredNow;
 
     // Update known tech levels snapshot for future tick diff detection.
     for (const t of technologies) {
@@ -444,17 +468,18 @@ export function coordinateResearch(params: {
             reason: receivedTechs.length > 0 ? "tech_received" : "policy",
         });
     }
-    if (desiredNext !== curNext) {
+    if (JSON.stringify(desiredQueue) !== JSON.stringify(curQueue)) {
         actions.push({
-            type: "SetResearchNext",
-            preference: desiredNext,
-            reason: "policy_next",
+            type: "SetResearchQueue",
+            queue: desiredQueue,
+            reason: "policy_queue",
         });
     }
 
     return {
         desiredNow,
         desiredNext,
+        desiredQueue,
         actions,
         receivedTechs,
         humanPinned,

@@ -286,15 +286,15 @@ export class SolarisLiveClient {
         );
     }
 
-    async updateResearchNext(
+    async updateResearchQueue(
         gameId: string,
-        preference: string,
+        queue: string[],
         idempotencyKey: string,
     ): Promise<any> {
         return this.request(
             "PUT",
-            `/api/game/${gameId}/research/next`,
-            { preference },
+            `/api/game/${gameId}/research/queue`,
+            { queue },
             idempotencyKey,
         );
     }

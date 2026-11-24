@@ -24,6 +24,7 @@ import PlayerColourService from "./playerColour";
 import { MathRandomGen } from "../utils/randomGen";
 import InitialGameStateService from "./initialGameState";
 import { logger } from "../utils/logging";
+import ConversationService from "./conversation";
 
 const log = logger("Player Service");
 
@@ -41,6 +42,7 @@ export default class PlayerService extends EventEmitter {
     teamService: TeamService;
     playerColourService: PlayerColourService;
     initialGameStateService: InitialGameStateService;
+    conversationService: ConversationService;
 
     constructor(
         gameRepo: Repository<Game>,
@@ -56,6 +58,7 @@ export default class PlayerService extends EventEmitter {
         teamService: TeamService,
         playerColourService: PlayerColourService,
         initialGameStateService: InitialGameStateService,
+        conversationService: ConversationService,
     ) {
         super();
 
@@ -72,6 +75,7 @@ export default class PlayerService extends EventEmitter {
         this.teamService = teamService;
         this.playerColourService = playerColourService;
         this.initialGameStateService = initialGameStateService;
+        this.conversationService = conversationService;
     }
 
     getById(game: Game, playerId: DBObjectId) {
@@ -102,7 +106,6 @@ export default class PlayerService extends EventEmitter {
     ): Player {
         const defaultTech = this.technologyService.getDefaultTechnology(game);
         const researchingNow: ResearchTypeNotRandom = defaultTech;
-        const researchingNext: ResearchTypeNotRandom = defaultTech;
 
         let player: Player = {
             _id: new mongoose.Types.ObjectId(),
@@ -116,7 +119,7 @@ export default class PlayerService extends EventEmitter {
             lastSeen: null,
             lastSeenIP: null,
             researchingNow,
-            researchingNext,
+            researchQueue: ["terraforming"],
             credits: game.settings.player.startingCredits,
             creditsSpecialists: game.settings.player.startingCreditsSpecialists,
             isOpenSlot: true,
@@ -438,7 +441,7 @@ export default class PlayerService extends EventEmitter {
         player.credits = initialPlayer.credits;
         player.creditsSpecialists = initialPlayer.creditsSpecialists;
         player.researchingNow = initialPlayer.researchingNow;
-        player.researchingNext = initialPlayer.researchingNext;
+        player.researchQueue = initialPlayer.researchQueue;
         player.research = initialPlayer.research;
         player.diplomacy = initialPlayer.diplomacy;
 
@@ -507,6 +510,8 @@ export default class PlayerService extends EventEmitter {
 
             game.galaxy.carriers.push(newCarrier);
         }
+
+        this.conversationService.leaveAll(game, player._id);
     }
 
     _getNewPlayerHomeStar(
@@ -785,7 +790,7 @@ export default class PlayerService extends EventEmitter {
         player.defeated = true;
         player.defeatedDate = DateTime.utc().toJSDate();
 
-        player.researchingNext = "random"; // Set up the AI for random research.
+        player.researchQueue = ["random"]; // Set up the AI for random research.
 
         // Auto-ready the player so they don't hold up the game.
         if (game.settings.gameTime.gameType === "turnBased") {

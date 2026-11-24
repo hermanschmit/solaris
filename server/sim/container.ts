@@ -10,6 +10,10 @@ import { DependencyContainer } from "../services/types/DependencyContainer";
 import { logger } from "../utils/logging";
 
 const simConfig: Config = {
+    http: {
+        keepAliveTimeout: 120000,
+        headersTimeout: 125000,
+    },
     sessionSecret: "sim",
     sessionSecureCookies: false,
     connectionString: "",
@@ -70,6 +74,7 @@ export const createSimContainer = (): DependencyContainer => {
     silence(c.statisticsService);
     silence(c.emailService);
     silence(c.broadcastService);
+    c.tradeEventService.listTradeEventsBetweenPlayers = async () => [];
 
     c.gameLockService.isLockedInDatabase = async () => true;
     c.historyService.log = async () => {};

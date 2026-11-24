@@ -431,7 +431,6 @@ export class TacticalExecutor {
 
                     if (
                         c2cEnabled &&
-                        !c.isGift &&
                         dip.isProtected(ownerStr) &&
                         srcIdx !== undefined &&
                         dstIdx !== undefined
