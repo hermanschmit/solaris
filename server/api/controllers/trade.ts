@@ -1,7 +1,7 @@
 import { DependencyContainer } from "../../services/types/DependencyContainer";
 import {
-    mapToTradeSendTechnologyToPlayerRequest,
-    mapToTradeSendToPlayerRequest,
+    parseTradeSendTechnologyToPlayerRequest,
+    parseTradeSendToPlayerRequest,
 } from "../requests/trade";
 import { objectIdFromString } from "../../services/types/DBObjectId";
 
@@ -9,7 +9,7 @@ export default (container: DependencyContainer) => {
     return {
         sendCredits: async (req, res, next) => {
             try {
-                const reqObj = mapToTradeSendToPlayerRequest(
+                const reqObj = parseTradeSendToPlayerRequest(
                     req.body,
                     req.session.userId,
                 );
@@ -42,7 +42,7 @@ export default (container: DependencyContainer) => {
         },
         sendCreditsSpecialists: async (req, res, next) => {
             try {
-                const reqObj = mapToTradeSendToPlayerRequest(
+                const reqObj = parseTradeSendToPlayerRequest(
                     req.body,
                     req.session.userId,
                 );
@@ -75,7 +75,7 @@ export default (container: DependencyContainer) => {
         },
         sendRenown: async (req, res, next) => {
             try {
-                const reqObj = mapToTradeSendToPlayerRequest(
+                const reqObj = parseTradeSendToPlayerRequest(
                     req.body,
                     req.session.userId,
                 );
@@ -105,7 +105,7 @@ export default (container: DependencyContainer) => {
         },
         sendTechnology: async (req, res, next) => {
             try {
-                const reqObj = mapToTradeSendTechnologyToPlayerRequest(
+                const reqObj = parseTradeSendTechnologyToPlayerRequest(
                     req.body,
                 );
 
@@ -138,7 +138,7 @@ export default (container: DependencyContainer) => {
         },
         listTradeableTechnologies: async (req, res, next) => {
             try {
-                let techs =
+                const techs =
                     await container.tradeService.listTradeableTechnologies(
                         req.game,
                         req.player,
@@ -153,8 +153,8 @@ export default (container: DependencyContainer) => {
         },
         listTradeEvents: async (req, res, next) => {
             try {
-                let events =
-                    await container.tradeService.listTradeEventsBetweenPlayers(
+                const events =
+                    await container.tradeEventService.listTradeEventsBetweenPlayers(
                         req.game,
                         req.player._id,
                         [
