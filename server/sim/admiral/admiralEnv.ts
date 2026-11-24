@@ -212,13 +212,31 @@ export class AdmiralEnv extends AgentEnv {
         return super._needsDecision(seat);
     }
 
+    private _isFriendlyInboundCarrier(player: Player, car: any): boolean {
+        if (car.isGift) return true;
+        if (!car.ownedByPlayerId) return false;
+        const pid = player._id.toString();
+        if (car.ownedByPlayerId.toString() === pid) return true;
+        const dip = this.engine.container.diplomacyService;
+        if (dip.isFormalAlliancesEnabled(this.game)) {
+            return (
+                dip.getDiplomaticStatusToPlayer(
+                    this.game,
+                    player._id,
+                    car.ownedByPlayerId,
+                ).actualStatus === "allies"
+            );
+        }
+        return false;
+    }
+
     private _visibleAttackKeys(seat: any): string {
         const pid = seat.player._id.toString();
         const view = seat.memory.view;
         const keys = new Set<string>();
         for (const c of this.game.galaxy.carriers) {
             if (c.orbiting != null || !c.waypoints?.length) continue;
-            if (c.ownedByPlayerId?.toString() === pid) continue;
+            if (this._isFriendlyInboundCarrier(seat.player, c)) continue;
             if (this.fog && view && !view.carriers.has(c)) continue;
             const destId = c.waypoints[0].destination.toString();
             const star = this.game.galaxy.stars.find(
@@ -318,9 +336,7 @@ export class AdmiralEnv extends AgentEnv {
             if (!c.technologyService.isTechnologyResearchable(game, t as any)) {
                 return 0;
             }
-            return (
-                rps.getRequiredResearchProgress(game, t as any, level) ?? 0
-            );
+            return rps.getRequiredResearchProgress(game, t as any, level) ?? 0;
         });
 
         const budget = this._specialistBudget(player);
@@ -351,10 +367,13 @@ export class AdmiralEnv extends AgentEnv {
             }));
 
         const view = seat.memory.view;
-        const attackMap = new Map<string, { starIndex: number; ticksUntil: number; ships: number }>();
+        const attackMap = new Map<
+            string,
+            { starIndex: number; ticksUntil: number; ships: number }
+        >();
         for (const car of game.galaxy.carriers) {
             if (car.orbiting != null || !car.waypoints?.length) continue;
-            if (car.ownedByPlayerId?.toString() === pid) continue;
+            if (this._isFriendlyInboundCarrier(player, car)) continue;
             if (this.fog && view && !view.carriers.has(car)) continue;
             const wp = car.waypoints[0];
             const dstIdx = starIndexById.get(wp.destination.toString());
@@ -369,7 +388,8 @@ export class AdmiralEnv extends AgentEnv {
             const k = `${dstIdx}:${eta}`;
             const prev = attackMap.get(k);
             if (prev) prev.ships += ships;
-            else attackMap.set(k, { starIndex: dstIdx, ticksUntil: eta, ships });
+            else
+                attackMap.set(k, { starIndex: dstIdx, ticksUntil: eta, ships });
         }
 
         const carrierMult =
@@ -429,11 +449,7 @@ export class AdmiralEnv extends AgentEnv {
                 seat.player,
                 fullView(this.game),
             );
-            obs.truthFrame = seatFrame(
-                this.game,
-                truthMem,
-                this.technologies,
-            );
+            obs.truthFrame = seatFrame(this.game, truthMem, this.technologies);
             obs.truthFacts = {
                 playerCredits: this.game.galaxy.players.map(
                     (p) => p.credits ?? 0,
@@ -541,7 +557,10 @@ export class AdmiralEnv extends AgentEnv {
                     s.specialistId = null;
                 }
             }
-            if (origStars[i].isNebula && s.ownedByPlayerId?.toString() !== pid) {
+            if (
+                origStars[i].isNebula &&
+                s.ownedByPlayerId?.toString() !== pid
+            ) {
                 // Nebulas hide natural resources unless owned.
                 s.naturalResources = { economy: 25, industry: 25, science: 25 };
             }

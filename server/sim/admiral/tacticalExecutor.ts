@@ -79,6 +79,38 @@ interface IncomingWave {
     carriers: Carrier[];
 }
 
+export interface TacticalAlertEvent {
+    kind: "surprise_attack" | "emergency_reserve_dip";
+    starIndex: number;
+    starId: string;
+    starName: string;
+    attackerPlayerId?: string;
+    ships: number;
+    ticksUntil?: number;
+    carrierIds?: string[];
+    message: string;
+}
+
+export interface TacticalDiplomacyHooks {
+    isHostile: (playerId: string) => boolean;
+    isAllied: (playerId: string) => boolean;
+    isProtected: (playerId: string) => boolean;
+    neutralBorderPosture?: "defend" | "open";
+    alliedBorderPosture?: "open" | "watch";
+    allowAlliedStarTransit?: boolean;
+    allowContestedNeutralClaims?: boolean;
+}
+
+export interface TacticalExecutionOptions {
+    diplomacy?: TacticalDiplomacyHooks;
+    pinnedCarrierIds?: ReadonlySet<string>;
+    respectIgnoreBulkUpgrade?: boolean;
+    cashReserveCredits?: number;
+    scheduledActionCredits?: number;
+    allowEmergencyDefenseReserveDip?: boolean;
+    onAlert?: (alert: TacticalAlertEvent) => void;
+}
+
 export class TacticalExecutor {
     container: DependencyContainer;
 
@@ -87,6 +119,9 @@ export class TacticalExecutor {
     // Policy-controlled credits held across the cycle for `isLastTick` Economy
     // compounding (replacing AIService's rigid `totalEconomy * 5` rule).
     private cycleEcoHold = new WeakMap<Player, number>();
+    private activeOptions?: TacticalExecutionOptions;
+    private activeBlockedEdges?: Set<string>;
+    private activeContestedStars?: Set<number>;
 
     constructor(container: DependencyContainer) {
         this.container = container;
@@ -125,7 +160,11 @@ export class TacticalExecutor {
         otherId: DBObjectId | null | undefined,
     ): boolean {
         if (!otherId) return false;
-        if (otherId.toString() === player._id.toString()) return false;
+        const otherStr = otherId.toString();
+        if (otherStr === player._id.toString()) return false;
+        if (this.activeOptions?.diplomacy) {
+            return this.activeOptions.diplomacy.isHostile(otherStr);
+        }
         if (this.container.diplomacyService.isFormalAlliancesEnabled(game)) {
             return (
                 this.container.diplomacyService.getDiplomaticStatusToPlayer(
@@ -138,6 +177,38 @@ export class TacticalExecutor {
         return true;
     }
 
+    private _isAllied(
+        game: Game,
+        player: Player,
+        otherId: DBObjectId | null | undefined,
+    ): boolean {
+        if (!otherId) return false;
+        const otherStr = otherId.toString();
+        if (otherStr === player._id.toString()) return true;
+        if (this.activeOptions?.diplomacy) {
+            return this.activeOptions.diplomacy.isAllied(otherStr);
+        }
+        if (this.container.diplomacyService.isFormalAlliancesEnabled(game)) {
+            return (
+                this.container.diplomacyService.getDiplomaticStatusToPlayer(
+                    game,
+                    player._id,
+                    otherId,
+                ).actualStatus === "allies"
+            );
+        }
+        return false;
+    }
+
+    private _isCarrierPinned(carrier: Carrier): boolean {
+        if (!this.activeOptions) return false;
+        return Boolean(
+            carrier.isGift ||
+            carrier.waypointsLooped ||
+            this.activeOptions.pinnedCarrierIds?.has(carrier._id.toString()),
+        );
+    }
+
     private _canWarpBetween(
         game: Game,
         player: Player,
@@ -146,6 +217,12 @@ export class TacticalExecutor {
     ): boolean {
         if (!a.warpGate || !b.warpGate) return false;
         if (!a.ownedByPlayerId || !b.ownedByPlayerId) return false;
+        if (this.activeOptions?.diplomacy) {
+            return (
+                this._isAllied(game, player, a.ownedByPlayerId) &&
+                this._isAllied(game, player, b.ownedByPlayerId)
+            );
+        }
         const pid = player._id.toString();
         const aOk =
             a.ownedByPlayerId.toString() === pid ||
@@ -165,7 +242,12 @@ export class TacticalExecutor {
         j: number,
     ): number {
         const stars = game.galaxy.stars;
-        if (this.container.starDataService.isStarPairWormHole(stars[i], stars[j])) {
+        if (
+            this.container.starDataService.isStarPairWormHole(
+                stars[i],
+                stars[j],
+            )
+        ) {
             return 1; // Wormholes arrive on the next movement tick
         }
         const d = distMatrix[i * S + j];
@@ -190,10 +272,22 @@ export class TacticalExecutor {
         const stars = game.galaxy.stars;
         const S = stars.length;
         const pid = player._id.toString();
+        const allowAllyTransit = Boolean(
+            !allowUnownedIntermediate &&
+            this.activeOptions?.diplomacy?.allowAlliedStarTransit,
+        );
         const canTraverse = new Uint8Array(S);
         for (let i = 0; i < S; i++) {
             const owner = stars[i].ownedByPlayerId?.toString();
-            if (owner === pid || (allowUnownedIntermediate && !owner)) {
+            if (
+                owner === pid ||
+                (allowUnownedIntermediate &&
+                    !owner &&
+                    !this.activeContestedStars?.has(i)) ||
+                (allowAllyTransit &&
+                    owner != null &&
+                    this.activeOptions!.diplomacy!.isAllied(owner))
+            ) {
                 canTraverse[i] = 1;
             }
         }
@@ -207,6 +301,7 @@ export class TacticalExecutor {
         for (let i = 0; i < S; i++) {
             for (let j = 0; j < S; j++) {
                 if (i === j) continue;
+                if (this.activeBlockedEdges?.has(`${i}->${j}`)) continue;
                 if (distMatrix[i * S + j] <= hyperspaceDist) {
                     adj[i].push(j);
                     edgeCost[i].push(
@@ -287,469 +382,656 @@ export class TacticalExecutor {
         decision: AdmiralDecision,
         believedIndustry?: (starIndex: number) => number | undefined,
         starVisibility?: Uint8Array | null,
+        options?: TacticalExecutionOptions,
     ) {
         if (player.defeated) return;
-        const pid = player._id.toString();
-        const stars = game.galaxy.stars;
-        const S = stars.length;
-        const starIndexById = new Map<string, number>();
-        const ownStarIndices: number[] = [];
+        const prevOptions = this.activeOptions;
+        const prevBlocked = this.activeBlockedEdges;
+        const prevContested = this.activeContestedStars;
+        this.activeOptions = options;
 
-        for (let i = 0; i < S; i++) {
-            starIndexById.set(stars[i]._id.toString(), i);
-            if (stars[i].ownedByPlayerId?.toString() === pid) {
-                ownStarIndices.push(i);
-            }
-        }
-        if (!ownStarIndices.length) return;
+        try {
+            const pid = player._id.toString();
+            const stars = game.galaxy.stars;
+            const S = stars.length;
+            const starIndexById = new Map<string, number>();
+            const ownStarIndices: number[] = [];
 
-        const prodTicks = game.settings.galaxy.productionTicks;
-        const isFirstTick = game.state.tick % prodTicks === 1;
-        const isLastTick = game.state.tick % prodTicks === prodTicks - 1;
-
-        // 1. Pool ships on idle orbiting own carriers back onto their stars so
-        //    garrison/attack/defense allocation sees one unified ship pool.
-        //    Also track active outbound AND returning logistics ferries so
-        //    interior stars wait for their returning ferry instead of spamming
-        //    new $25 carriers every cycle.
-        const idleCarriersAt = new Map<number, Carrier[]>();
-        let ownCarrierCount = 0;
-        const committedTargets = new Map<number, number>(); // starIdx -> own ships en route
-        const activeLogisticsRoutes = new Set<string>();
-        const busyLogisticsStars = new Set<number>();
-
-        for (const c of game.galaxy.carriers) {
-            if (c.ownedByPlayerId?.toString() !== pid) continue;
-            ownCarrierCount++;
-            if (c.orbiting && (!c.waypoints || c.waypoints.length === 0)) {
-                const idx = starIndexById.get(c.orbiting.toString());
-                if (
-                    idx !== undefined &&
-                    stars[idx].ownedByPlayerId?.toString() === pid
-                ) {
-                    if ((c.ships ?? 0) > 1) {
-                        const add = c.ships! - 1;
-                        c.ships = 1;
-                        stars[idx].shipsActual =
-                            (stars[idx].shipsActual ?? stars[idx].ships ?? 0) +
-                            add;
-                        stars[idx].ships = Math.floor(stars[idx].shipsActual!);
-                    }
-                    let list = idleCarriersAt.get(idx);
-                    if (!list) {
-                        list = [];
-                        idleCarriersAt.set(idx, list);
-                    }
-                    list.push(c);
+            for (let i = 0; i < S; i++) {
+                starIndexById.set(stars[i]._id.toString(), i);
+                if (stars[i].ownedByPlayerId?.toString() === pid) {
+                    ownStarIndices.push(i);
                 }
-            } else if (c.waypoints && c.waypoints.length > 0) {
-                const w0 = c.waypoints[0];
-                const wLast = c.waypoints[c.waypoints.length - 1];
-                const srcIdx = starIndexById.get(w0.source.toString());
-                const destIdx = starIndexById.get(w0.destination.toString());
-                const lastDestIdx = starIndexById.get(
-                    wLast.destination.toString(),
-                );
-                const cShips = c.ships ?? 0;
+            }
+            if (!ownStarIndices.length) return;
 
-                if (destIdx !== undefined) {
-                    committedTargets.set(
-                        destIdx,
-                        (committedTargets.get(destIdx) ?? 0) + cShips,
+            if (options?.diplomacy) {
+                const dip = options.diplomacy;
+                const blocked = new Set<string>();
+                const contested = new Set<number>();
+                const c2cEnabled =
+                    game.settings.specialGalaxy.carrierToCarrierCombat ===
+                    "enabled";
+
+                for (const c of game.galaxy.carriers) {
+                    if (
+                        c.orbiting != null ||
+                        !c.waypoints?.length ||
+                        !c.ownedByPlayerId
+                    ) {
+                        continue;
+                    }
+                    const ownerStr = c.ownedByPlayerId.toString();
+                    if (ownerStr === pid) continue;
+                    const wp0 = c.waypoints[0];
+                    const srcIdx = starIndexById.get(wp0.source.toString());
+                    const dstIdx = starIndexById.get(
+                        wp0.destination.toString(),
+                    );
+
+                    if (
+                        c2cEnabled &&
+                        !c.isGift &&
+                        dip.isProtected(ownerStr) &&
+                        srcIdx !== undefined &&
+                        dstIdx !== undefined
+                    ) {
+                        blocked.add(`${dstIdx}->${srcIdx}`);
+                    }
+                    if (
+                        !dip.allowContestedNeutralClaims &&
+                        dstIdx !== undefined &&
+                        !stars[dstIdx].ownedByPlayerId &&
+                        (dip.isAllied(ownerStr) || dip.isProtected(ownerStr))
+                    ) {
+                        contested.add(dstIdx);
+                    }
+                }
+                this.activeBlockedEdges = blocked;
+                this.activeContestedStars = contested;
+            } else {
+                this.activeBlockedEdges = undefined;
+                this.activeContestedStars = undefined;
+            }
+
+            const prodTicks = game.settings.galaxy.productionTicks;
+            const isFirstTick = game.state.tick % prodTicks === 1;
+            const isLastTick = game.state.tick % prodTicks === prodTicks - 1;
+
+            // 1. Pool ships on idle orbiting own carriers back onto their stars so
+            //    garrison/attack/defense allocation sees one unified ship pool.
+            //    Also track active outbound AND returning logistics ferries so
+            //    interior stars wait for their returning ferry instead of spamming
+            //    new $25 carriers every cycle.
+            const idleCarriersAt = new Map<number, Carrier[]>();
+            let ownCarrierCount = 0;
+            const committedTargets = new Map<number, number>(); // starIdx -> own ships en route
+            const activeLogisticsRoutes = new Set<string>();
+            const busyLogisticsStars = new Set<number>();
+
+            for (const c of game.galaxy.carriers) {
+                if (c.ownedByPlayerId?.toString() !== pid) continue;
+                ownCarrierCount++;
+                const pinned = this._isCarrierPinned(c);
+
+                if (c.orbiting && (!c.waypoints || c.waypoints.length === 0)) {
+                    if (pinned) continue;
+                    const idx = starIndexById.get(c.orbiting.toString());
+                    if (
+                        idx !== undefined &&
+                        stars[idx].ownedByPlayerId?.toString() === pid
+                    ) {
+                        if ((c.ships ?? 0) > 1) {
+                            const add = c.ships! - 1;
+                            c.ships = 1;
+                            stars[idx].shipsActual =
+                                (stars[idx].shipsActual ??
+                                    stars[idx].ships ??
+                                    0) + add;
+                            stars[idx].ships = Math.floor(
+                                stars[idx].shipsActual!,
+                            );
+                        }
+                        let list = idleCarriersAt.get(idx);
+                        if (!list) {
+                            list = [];
+                            idleCarriersAt.set(idx, list);
+                        }
+                        list.push(c);
+                    }
+                } else if (c.waypoints && c.waypoints.length > 0) {
+                    if (c.isGift) continue;
+                    const w0 = c.waypoints[0];
+                    const wLast = c.waypoints[c.waypoints.length - 1];
+                    const srcIdx = starIndexById.get(w0.source.toString());
+                    const destIdx = starIndexById.get(
+                        w0.destination.toString(),
+                    );
+                    const lastDestIdx = starIndexById.get(
+                        wLast.destination.toString(),
+                    );
+                    const cShips = c.ships ?? 0;
+
+                    if (destIdx !== undefined) {
+                        committedTargets.set(
+                            destIdx,
+                            (committedTargets.get(destIdx) ?? 0) + cShips,
+                        );
+                    }
+                    if (
+                        !pinned &&
+                        srcIdx !== undefined &&
+                        destIdx !== undefined
+                    ) {
+                        activeLogisticsRoutes.add(`${srcIdx}->${destIdx}`);
+                        activeLogisticsRoutes.add(`${destIdx}->${srcIdx}`);
+                    }
+                    if (
+                        !pinned &&
+                        lastDestIdx !== undefined &&
+                        stars[lastDestIdx].ownedByPlayerId?.toString() === pid
+                    ) {
+                        busyLogisticsStars.add(lastDestIdx);
+                    }
+
+                    // Track multi-hop claim chains, dropAll sinks, collectAll sweeps,
+                    // and multi-hop enemy invasion endpoints.
+                    for (let wi = 0; wi < c.waypoints.length; wi++) {
+                        const wp = c.waypoints[wi];
+                        const dIdx = starIndexById.get(
+                            wp.destination.toString(),
+                        );
+                        if (dIdx === undefined) continue;
+                        if (!pinned && wp.action === "collectAll") {
+                            busyLogisticsStars.add(dIdx);
+                        }
+                        if (dIdx !== destIdx) {
+                            if (
+                                !stars[dIdx].ownedByPlayerId ||
+                                wp.action === "dropAll" ||
+                                (wi === c.waypoints.length - 1 &&
+                                    this._isEnemy(
+                                        game,
+                                        player,
+                                        stars[dIdx].ownedByPlayerId,
+                                    ))
+                            ) {
+                                committedTargets.set(
+                                    dIdx,
+                                    (committedTargets.get(dIdx) ?? 0) +
+                                        Math.max(1, cShips),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            const distMatrix = this._pairDistances(game);
+            const hsDist = this.container.distanceService.getHyperspaceDistance(
+                game,
+                player.research.hyperspace.level,
+            );
+            const ownGraph = this._shortestPathsFromOwn(
+                game,
+                player,
+                distMatrix,
+                hsDist,
+                false,
+            );
+            const claimGraph = this._shortestPathsFromOwn(
+                game,
+                player,
+                distMatrix,
+                hsDist,
+                true,
+            );
+
+            // Compute per-opponent hyperspace jump reach so border threat & Economy
+            // safety reflect which stars each enemy can ACTUALLY jump to (rather
+            // than marking our deep interior unsafe when our own hyperspace is high).
+            const enemyRangeByPid = new Map<string, number>();
+            for (const p of game.galaxy.players) {
+                if (!p.defeated && p._id.toString() !== pid) {
+                    enemyRangeByPid.set(
+                        p._id.toString(),
+                        this.container.distanceService.getHyperspaceDistance(
+                            game,
+                            p.research.hyperspace.level,
+                        ),
                     );
                 }
-                if (srcIdx !== undefined && destIdx !== undefined) {
-                    activeLogisticsRoutes.add(`${srcIdx}->${destIdx}`);
-                    activeLogisticsRoutes.add(`${destIdx}->${srcIdx}`);
+            }
+            const hostileBorder = new Uint8Array(S);
+            const nearbyEnemyShipsAt = new Float32Array(S);
+            const baselineGarrison = new Float32Array(S);
+            const dip = options?.diplomacy;
+            const deterNeutral =
+                dip != null && dip.neutralBorderPosture !== "open";
+            const watchAllied =
+                dip != null && dip.alliedBorderPosture === "watch";
+
+            for (const i of ownStarIndices) {
+                let nearbyEnemyShips = 0;
+                let nearbyDeterShips = 0;
+                for (let j = 0; j < S; j++) {
+                    const ownerId = stars[j].ownedByPlayerId;
+                    if (!ownerId) continue;
+                    const ownerStr = ownerId.toString();
+                    if (ownerStr === pid) continue;
+                    const eRange = enemyRangeByPid.get(ownerStr) ?? 0;
+                    if (distMatrix[i * S + j] > eRange) continue;
+
+                    if (this._isEnemy(game, player, ownerId)) {
+                        hostileBorder[i] = 1;
+                        nearbyEnemyShips += stars[j].ships ?? 0;
+                    } else if (
+                        (deterNeutral && dip!.isProtected(ownerStr)) ||
+                        (watchAllied && dip!.isAllied(ownerStr))
+                    ) {
+                        nearbyDeterShips += stars[j].ships ?? 0;
+                    }
                 }
-                if (
-                    lastDestIdx !== undefined &&
-                    stars[lastDestIdx].ownedByPlayerId?.toString() === pid
-                ) {
-                    busyLogisticsStars.add(lastDestIdx);
+                nearbyEnemyShipsAt[i] = nearbyEnemyShips;
+                if (hostileBorder[i]) {
+                    baselineGarrison[i] = Math.min(
+                        40,
+                        Math.ceil(nearbyEnemyShips * 0.2),
+                    );
+                }
+                if (nearbyDeterShips > 0) {
+                    baselineGarrison[i] = Math.max(
+                        baselineGarrison[i],
+                        Math.min(20, Math.ceil(nearbyDeterShips * 0.12)),
+                    );
+                }
+            }
+
+            const garrisonTarget = new Float32Array(S);
+            for (const i of ownStarIndices) {
+                garrisonTarget[i] =
+                    decision.garrisonTarget?.[i] != null
+                        ? Math.max(0, decision.garrisonTarget[i])
+                        : baselineGarrison[i];
+            }
+
+            // Budget & reserve setup: [science, industry, economy, warpGate, save]
+            const rawSplit = decision.budgetSplit ?? [
+                0.2, 0.28, 0.45, 0.04, 0.03,
+            ];
+            const splitSum =
+                rawSplit.reduce((a, b) => a + Math.max(0, b), 0) || 1.0;
+            const normSplit = rawSplit.map((x) => Math.max(0, x) / splitSum);
+            while (normSplit.length < 5) normSplit.push(0);
+
+            const maxAttackTicks = decision.maxAttackTicks ?? prodTicks * 2;
+            const protectedCash = Math.max(
+                0,
+                Math.floor(
+                    (options?.cashReserveCredits ?? 0) +
+                        (options?.scheduledActionCredits ?? 0),
+                ),
+            );
+            const scheduledOnlyCash = Math.max(
+                0,
+                Math.floor(options?.scheduledActionCredits ?? 0),
+            );
+            const allowEmergencyDip =
+                options != null &&
+                options.allowEmergencyDefenseReserveDip !== false;
+            let emergencyDipUsed = false;
+
+            // 2. Detect incoming enemy waves, triage doomed stars vs holdable stars,
+            //    reinforce holdable stars, and evacuate doomed stars just before impact.
+            const doomedStars = new Set<number>();
+            const lockedShips = new Float32Array(S);
+
+            const incomingWaves = this._findIncomingAttacks(
+                game,
+                player,
+                starIndexById,
+            );
+            const triageThreshold = decision.triageThreshold ?? 0.85;
+
+            for (const wave of incomingWaves) {
+                const defIdx = wave.starIndex;
+                const defStar = wave.star;
+                const neededExtra = this._shipsNeededToHold(
+                    game,
+                    player,
+                    defStar,
+                    defIdx,
+                    wave.ticksUntil,
+                    wave.carriers,
+                    committedTargets.get(defIdx) ?? 0,
+                );
+
+                if (neededExtra <= 0) {
+                    lockedShips[defIdx] = Math.max(
+                        lockedShips[defIdx],
+                        defStar.ships ?? 0,
+                    );
+                    continue;
                 }
 
-                // Track multi-hop claim chains, dropAll sinks, collectAll sweeps,
-                // and multi-hop enemy invasion endpoints.
-                for (let wi = 0; wi < c.waypoints.length; wi++) {
-                    const wp = c.waypoints[wi];
-                    const dIdx = starIndexById.get(wp.destination.toString());
-                    if (dIdx === undefined) continue;
-                    if (wp.action === "collectAll") {
-                        busyLogisticsStars.add(dIdx);
+                const defReserveFloor =
+                    allowEmergencyDip && !emergencyDipUsed
+                        ? scheduledOnlyCash
+                        : protectedCash;
+
+                const helpers: { src: number; eta: number; avail: number }[] =
+                    [];
+                let totalReachable = 0;
+                for (const u of ownStarIndices) {
+                    if (u === defIdx || doomedStars.has(u)) continue;
+                    const eta = ownGraph.ticks[u * S + defIdx];
+                    if (eta <= wave.ticksUntil) {
+                        const free = this._availableShipsAt(
+                            stars[u],
+                            idleCarriersAt.get(u),
+                            lockedShips[u],
+                        );
+                        const canCarry =
+                            (idleCarriersAt.get(u)?.length ?? 0) > 0 ||
+                            this._canBuildCarrier(
+                                game,
+                                player,
+                                stars[u],
+                                ownCarrierCount,
+                                defReserveFloor,
+                            );
+                        if (free > 1 && canCarry) {
+                            helpers.push({ src: u, eta, avail: free });
+                            totalReachable += free;
+                        }
                     }
-                    if (dIdx !== destIdx) {
+                }
+
+                if (totalReachable < neededExtra * triageThreshold) {
+                    doomedStars.add(defIdx);
+                    garrisonTarget[defIdx] = 0;
+                    const standAndBleed = this._shouldStandAndBleed(
+                        game,
+                        player,
+                        wave,
+                        ownStarIndices,
+                        doomedStars,
+                        distMatrix,
+                        hsDist,
+                        idleCarriersAt,
+                        lockedShips,
+                    );
+                    if (standAndBleed) {
+                        lockedShips[defIdx] = Math.max(
+                            lockedShips[defIdx],
+                            defStar.ships ?? 0,
+                        );
+                    } else if (wave.ticksUntil <= 3) {
+                        ownCarrierCount = await this._evacuateStar(
+                            game,
+                            player,
+                            defIdx,
+                            ownStarIndices,
+                            doomedStars,
+                            ownGraph,
+                            idleCarriersAt,
+                            ownCarrierCount,
+                            protectedCash,
+                        );
+                        lockedShips[defIdx] = Math.max(lockedShips[defIdx], 1);
+                    }
+                    continue;
+                }
+
+                lockedShips[defIdx] = Math.max(
+                    lockedShips[defIdx],
+                    defStar.ships ?? 0,
+                );
+                helpers.sort((a, b) => a.eta - b.eta);
+                let remainingNeed = neededExtra;
+                for (const h of helpers) {
+                    if (remainingNeed <= 0) break;
+                    const send = Math.min(remainingNeed, h.avail);
+                    if (send <= 0) continue;
+
+                    if (wave.ticksUntil - h.eta > 1) {
+                        lockedShips[h.src] += send;
+                        remainingNeed -= send;
+                    } else {
+                        const waypoints = this._buildPathWaypoints(
+                            game,
+                            h.src,
+                            defIdx,
+                            ownGraph.nextHop,
+                            "dropAll",
+                            true,
+                        );
+                        const hadIdle =
+                            (idleCarriersAt.get(h.src)?.length ?? 0) > 0;
+                        let launchReserve = protectedCash;
+                        let dippingNow = false;
                         if (
-                            !stars[dIdx].ownedByPlayerId ||
-                            wp.action === "dropAll" ||
-                            (wi === c.waypoints.length - 1 &&
-                                this._isEnemy(
-                                    game,
-                                    player,
-                                    stars[dIdx].ownedByPlayerId,
-                                ))
+                            !hadIdle &&
+                            allowEmergencyDip &&
+                            !emergencyDipUsed &&
+                            !this._canBuildCarrier(
+                                game,
+                                player,
+                                stars[h.src],
+                                ownCarrierCount,
+                                protectedCash,
+                            ) &&
+                            this._canBuildCarrier(
+                                game,
+                                player,
+                                stars[h.src],
+                                ownCarrierCount,
+                                scheduledOnlyCash,
+                            )
                         ) {
+                            launchReserve = scheduledOnlyCash;
+                            dippingNow = true;
+                        }
+                        const launched = await this._launchShips(
+                            game,
+                            player,
+                            h.src,
+                            send,
+                            waypoints,
+                            idleCarriersAt,
+                            ownCarrierCount,
+                            launchReserve,
+                        );
+                        if (launched.launched) {
+                            if (dippingNow) {
+                                emergencyDipUsed = true;
+                                options?.onAlert?.({
+                                    kind: "emergency_reserve_dip",
+                                    starIndex: defIdx,
+                                    starId: defStar._id.toString(),
+                                    starName: defStar.name,
+                                    ships: launched.shipsSent,
+                                    ticksUntil: wave.ticksUntil,
+                                    message: `Emergency defense carrier purchased at ${stars[h.src].name} dipping into cash reserve to defend ${defStar.name}.`,
+                                });
+                            }
+                            ownCarrierCount = launched.ownCarrierCount;
+                            remainingNeed -= launched.shipsSent;
                             committedTargets.set(
-                                dIdx,
-                                (committedTargets.get(dIdx) ?? 0) +
-                                    Math.max(1, cShips),
+                                defIdx,
+                                (committedTargets.get(defIdx) ?? 0) +
+                                    launched.shipsSent,
                             );
                         }
                     }
                 }
             }
-        }
 
-        const distMatrix = this._pairDistances(game);
-        const hsDist = this.container.distanceService.getHyperspaceDistance(
-            game,
-            player.research.hyperspace.level,
-        );
-        const ownGraph = this._shortestPathsFromOwn(
-            game,
-            player,
-            distMatrix,
-            hsDist,
-            false,
-        );
-        const claimGraph = this._shortestPathsFromOwn(
-            game,
-            player,
-            distMatrix,
-            hsDist,
-            true,
-        );
-
-        // Compute per-opponent hyperspace jump reach so border threat & Economy
-        // safety reflect which stars each enemy can ACTUALLY jump to (rather
-        // than marking our deep interior unsafe when our own hyperspace is high).
-        const enemyRangeByPid = new Map<string, number>();
-        for (const p of game.galaxy.players) {
-            if (!p.defeated && p._id.toString() !== pid) {
-                enemyRangeByPid.set(
-                    p._id.toString(),
-                    this.container.distanceService.getHyperspaceDistance(
-                        game,
-                        p.research.hyperspace.level,
-                    ),
-                );
-            }
-        }
-        const hostileBorder = new Uint8Array(S);
-        const nearbyEnemyShipsAt = new Float32Array(S);
-        const baselineGarrison = new Float32Array(S);
-        for (const i of ownStarIndices) {
-            let nearbyEnemyShips = 0;
-            for (let j = 0; j < S; j++) {
-                const ownerId = stars[j].ownedByPlayerId;
-                if (!this._isEnemy(game, player, ownerId)) continue;
-                const eRange = enemyRangeByPid.get(ownerId!.toString()) ?? 0;
-                if (distMatrix[i * S + j] <= eRange) {
-                    hostileBorder[i] = 1;
-                    nearbyEnemyShips += stars[j].ships ?? 0;
-                }
-            }
-            nearbyEnemyShipsAt[i] = nearbyEnemyShips;
-            if (hostileBorder[i]) {
-                baselineGarrison[i] = Math.min(
-                    40,
-                    Math.ceil(nearbyEnemyShips * 0.2),
-                );
-            }
-        }
-
-        const garrisonTarget = new Float32Array(S);
-        for (const i of ownStarIndices) {
-            garrisonTarget[i] =
-                decision.garrisonTarget?.[i] != null
-                    ? Math.max(0, decision.garrisonTarget[i])
-                    : baselineGarrison[i];
-        }
-
-        // Budget & reserve setup: [science, industry, economy, warpGate, save]
-        const rawSplit = decision.budgetSplit ?? [
-            0.2, 0.28, 0.45, 0.04, 0.03,
-        ];
-        const splitSum =
-            rawSplit.reduce((a, b) => a + Math.max(0, b), 0) || 1.0;
-        const normSplit = rawSplit.map((x) => Math.max(0, x) / splitSum);
-        while (normSplit.length < 5) normSplit.push(0);
-
-        const maxAttackTicks = decision.maxAttackTicks ?? prodTicks * 2;
-
-        // 2. Detect incoming enemy waves, triage doomed stars vs holdable stars,
-        //    reinforce holdable stars, and evacuate doomed stars just before impact.
-        const doomedStars = new Set<number>();
-        const lockedShips = new Float32Array(S);
-
-        const incomingWaves = this._findIncomingAttacks(
-            game,
-            player,
-            starIndexById,
-        );
-        const triageThreshold = decision.triageThreshold ?? 0.85;
-
-        for (const wave of incomingWaves) {
-            const defIdx = wave.starIndex;
-            const defStar = wave.star;
-            const neededExtra = this._shipsNeededToHold(
-                game,
-                player,
-                defStar,
-                defIdx,
-                wave.ticksUntil,
-                wave.carriers,
-                committedTargets.get(defIdx) ?? 0,
-            );
-
-            if (neededExtra <= 0) {
-                lockedShips[defIdx] = Math.max(
-                    lockedShips[defIdx],
-                    defStar.ships ?? 0,
-                );
-                continue;
+            // Shield `protectedCash` (`cashReserveCredits + scheduledActionCredits`)
+            // across Steps 3..6 so Admiral never spends reserved credits on upgrades,
+            // claims, invasions, or logistics.
+            const heldCash =
+                protectedCash > 0
+                    ? Math.min(Math.max(0, player.credits ?? 0), protectedCash)
+                    : 0;
+            if (heldCash > 0) {
+                player.credits = (player.credits ?? 0) - heldCash;
             }
 
-            const helpers: { src: number; eta: number; avail: number }[] = [];
-            let totalReachable = 0;
-            for (const u of ownStarIndices) {
-                if (u === defIdx || doomedStars.has(u)) continue;
-                const eta = ownGraph.ticks[u * S + defIdx];
-                if (eta <= wave.ticksUntil) {
-                    const free = this._availableShipsAt(
-                        stars[u],
-                        idleCarriersAt.get(u),
-                        lockedShips[u],
-                    );
-                    const canCarry =
-                        (idleCarriersAt.get(u)?.length ?? 0) > 0 ||
-                        this._canBuildCarrier(
-                            game,
-                            player,
-                            stars[u],
-                            ownCarrierCount,
-                            0,
-                        );
-                    if (free > 1 && canCarry) {
-                        helpers.push({ src: u, eta, avail: free });
-                        totalReachable += free;
-                    }
-                }
-            }
-
-            if (totalReachable < neededExtra * triageThreshold) {
-                doomedStars.add(defIdx);
-                garrisonTarget[defIdx] = 0;
-                const standAndBleed = this._shouldStandAndBleed(
-                    game,
-                    player,
-                    wave,
-                    ownStarIndices,
-                    doomedStars,
-                    distMatrix,
-                    hsDist,
-                    idleCarriersAt,
-                    lockedShips,
-                );
-                if (standAndBleed) {
-                    lockedShips[defIdx] = Math.max(
-                        lockedShips[defIdx],
-                        defStar.ships ?? 0,
-                    );
-                } else if (wave.ticksUntil <= 3) {
-                    ownCarrierCount = await this._evacuateStar(
-                        game,
-                        player,
-                        defIdx,
-                        ownStarIndices,
-                        doomedStars,
-                        ownGraph,
-                        idleCarriersAt,
-                        ownCarrierCount,
-                    );
-                    lockedShips[defIdx] = Math.max(lockedShips[defIdx], 1);
-                }
-                continue;
-            }
-
-            lockedShips[defIdx] = Math.max(
-                lockedShips[defIdx],
-                defStar.ships ?? 0,
-            );
-            helpers.sort((a, b) => a.eta - b.eta);
-            let remainingNeed = neededExtra;
-            for (const h of helpers) {
-                if (remainingNeed <= 0) break;
-                const send = Math.min(remainingNeed, h.avail);
-                if (send <= 0) continue;
-
-                if (wave.ticksUntil - h.eta > 1) {
-                    lockedShips[h.src] += send;
-                    remainingNeed -= send;
-                } else {
-                    const waypoints = this._buildPathWaypoints(
-                        game,
-                        h.src,
-                        defIdx,
-                        ownGraph.nextHop,
-                        "dropAll",
-                        true,
-                    );
-                    const launched = await this._launchShips(
-                        game,
-                        player,
-                        h.src,
-                        send,
-                        waypoints,
-                        idleCarriersAt,
-                        ownCarrierCount,
-                        0,
-                    );
-                    if (launched.launched) {
-                        ownCarrierCount = launched.ownCarrierCount;
-                        remainingNeed -= launched.shipsSent;
-                        committedTargets.set(
-                            defIdx,
-                            (committedTargets.get(defIdx) ?? 0) +
-                                launched.shipsSent,
-                        );
-                    }
-                }
-            }
-        }
-
-        // 3. Targeted cycle infrastructure & Warp Gate spending FIRST (skipping
-        //    doomed stars) right when cycle payouts arrive (`isFirstTick` for
-        //    Science/Industry/WarpGates, `isLastTick` for Economy compounding),
-        //    while reserving carrier cash for immediate reachable neutral claims.
-        if (isFirstTick || isLastTick) {
-            let reachableUnclaimed = 0;
-            let totalIdleCarriers = 0;
-            for (const u of ownStarIndices) {
-                totalIdleCarriers += idleCarriersAt.get(u)?.length ?? 0;
-            }
-            if (isFirstTick) {
-                const sds = this.container.starDataService;
-                for (let t = 0; t < S; t++) {
-                    if (
-                        stars[t].ownedByPlayerId ||
-                        sds.isDeadStar(stars[t]) ||
-                        (committedTargets.get(t) ?? 0) > 0
-                    ) {
-                        continue;
-                    }
+            try {
+                // 3. Targeted cycle infrastructure & Warp Gate spending FIRST (skipping
+                //    doomed stars) right when cycle payouts arrive (`isFirstTick` for
+                //    Science/Industry/WarpGates, `isLastTick` for Economy compounding),
+                //    while reserving carrier cash for immediate reachable neutral claims.
+                if (isFirstTick || isLastTick) {
+                    let reachableUnclaimed = 0;
+                    let totalIdleCarriers = 0;
                     for (const u of ownStarIndices) {
-                        if (claimGraph.ticks[u * S + t] <= maxAttackTicks) {
-                            reachableUnclaimed++;
-                            break;
+                        totalIdleCarriers += idleCarriersAt.get(u)?.length ?? 0;
+                    }
+                    if (isFirstTick) {
+                        const sds = this.container.starDataService;
+                        for (let t = 0; t < S; t++) {
+                            if (
+                                stars[t].ownedByPlayerId ||
+                                sds.isDeadStar(stars[t]) ||
+                                this.activeContestedStars?.has(t) ||
+                                (committedTargets.get(t) ?? 0) > 0
+                            ) {
+                                continue;
+                            }
+                            for (const u of ownStarIndices) {
+                                if (
+                                    claimGraph.ticks[u * S + t] <=
+                                    maxAttackTicks
+                                ) {
+                                    reachableUnclaimed++;
+                                    break;
+                                }
+                            }
                         }
                     }
+                    const claimReserve =
+                        Math.min(
+                            6,
+                            Math.max(0, reachableUnclaimed - totalIdleCarriers),
+                        ) * this._carrierCost(game);
+
+                    this._spendCycleCredits(
+                        game,
+                        player,
+                        ownStarIndices,
+                        doomedStars,
+                        hostileBorder,
+                        decision,
+                        normSplit,
+                        claimReserve,
+                        isFirstTick,
+                        isLastTick,
+                    );
+                }
+
+                // Policy-driven Economy hold:
+                // - On tick % prodTicks === 0 (just after payout, 1 tick before isFirstTick),
+                //   hold the non-carrier-cash share `(1 - normSplit[4])` for 1 tick.
+                // - During ticks 1..18, hold the exact `ecoTargetHold` recorded on
+                //   `isFirstTick` from `normSplit[2]` so `normSplit[4]` (`carrierCash`)
+                //   is 100% liquid for carrier surges whenever the policy wants them!
+                const upgradeReserve =
+                    game.state.tick % prodTicks === 0
+                        ? Math.floor(
+                              (player.credits ?? 0) *
+                                  Math.min(
+                                      0.95,
+                                      Math.max(0, 1.0 - normSplit[4]),
+                                  ),
+                          )
+                        : Math.min(
+                              player.credits ?? 0,
+                              this.cycleEcoHold.get(player) ??
+                                  Math.floor(
+                                      (player.credits ?? 0) * normSplit[2],
+                                  ),
+                          );
+                const claimCarrierReserve =
+                    game.state.tick <= prodTicks ? 0 : upgradeReserve;
+
+                // 4. Claim neutral stars (Cycle 0 uses $0 reserve for fast initial
+                //    land-grab; later cycles respect the policy's `cycleEcoHold`).
+                ownCarrierCount = await this._executeClaims(
+                    game,
+                    player,
+                    ownStarIndices,
+                    doomedStars,
+                    lockedShips,
+                    garrisonTarget,
+                    committedTargets,
+                    claimGraph,
+                    distMatrix,
+                    hsDist,
+                    decision,
+                    idleCarriersAt,
+                    ownCarrierCount,
+                    claimCarrierReserve,
+                    maxAttackTicks,
+                );
+
+                // 5. Hybrid Invasions: Multi-Star Synchronized Time-on-Target (ToT)
+                //    strikes + Single-Armada Multi-Hop Warp-Gate strikes.
+                ownCarrierCount = await this._executeCoordinatedInvasions(
+                    game,
+                    player,
+                    ownStarIndices,
+                    doomedStars,
+                    lockedShips,
+                    garrisonTarget,
+                    committedTargets,
+                    ownGraph,
+                    distMatrix,
+                    hsDist,
+                    enemyRangeByPid,
+                    decision,
+                    believedIndustry,
+                    starVisibility,
+                    idleCarriersAt,
+                    ownCarrierCount,
+                    upgradeReserve,
+                    maxAttackTicks,
+                );
+
+                // 6. Proactive front-line staging & Warp-Gate logistics (with Economy
+                //    credit reserve, returning-ferry tracking, and collectAll sweeps).
+                ownCarrierCount = await this._executeLogistics(
+                    game,
+                    player,
+                    ownStarIndices,
+                    doomedStars,
+                    lockedShips,
+                    garrisonTarget,
+                    hostileBorder,
+                    nearbyEnemyShipsAt,
+                    committedTargets,
+                    activeLogisticsRoutes,
+                    busyLogisticsStars,
+                    ownGraph,
+                    distMatrix,
+                    hsDist,
+                    enemyRangeByPid,
+                    decision,
+                    idleCarriersAt,
+                    ownCarrierCount,
+                    upgradeReserve,
+                );
+            } finally {
+                if (heldCash > 0) {
+                    player.credits = (player.credits ?? 0) + heldCash;
                 }
             }
-            const claimReserve =
-                Math.min(6, Math.max(0, reachableUnclaimed - totalIdleCarriers)) *
-                this._carrierCost(game);
-
-            this._spendCycleCredits(
-                game,
-                player,
-                ownStarIndices,
-                doomedStars,
-                hostileBorder,
-                decision,
-                normSplit,
-                claimReserve,
-                isFirstTick,
-                isLastTick,
-            );
+        } finally {
+            this.activeOptions = prevOptions;
+            this.activeBlockedEdges = prevBlocked;
+            this.activeContestedStars = prevContested;
         }
-
-        // Policy-driven Economy hold:
-        // - On tick % prodTicks === 0 (just after payout, 1 tick before isFirstTick),
-        //   hold the non-carrier-cash share `(1 - normSplit[4])` for 1 tick.
-        // - During ticks 1..18, hold the exact `ecoTargetHold` recorded on
-        //   `isFirstTick` from `normSplit[2]` so `normSplit[4]` (`carrierCash`)
-        //   is 100% liquid for carrier surges whenever the policy wants them!
-        const upgradeReserve =
-            game.state.tick % prodTicks === 0
-                ? Math.floor(
-                      (player.credits ?? 0) *
-                          Math.min(0.95, Math.max(0, 1.0 - normSplit[4])),
-                  )
-                : Math.min(
-                      player.credits ?? 0,
-                      this.cycleEcoHold.get(player) ??
-                          Math.floor((player.credits ?? 0) * normSplit[2]),
-                  );
-        const claimCarrierReserve =
-            game.state.tick <= prodTicks ? 0 : upgradeReserve;
-
-        // 4. Claim neutral stars (Cycle 0 uses $0 reserve for fast initial
-        //    land-grab; later cycles respect the policy's `cycleEcoHold`).
-        ownCarrierCount = await this._executeClaims(
-            game,
-            player,
-            ownStarIndices,
-            doomedStars,
-            lockedShips,
-            garrisonTarget,
-            committedTargets,
-            claimGraph,
-            distMatrix,
-            hsDist,
-            decision,
-            idleCarriersAt,
-            ownCarrierCount,
-            claimCarrierReserve,
-            maxAttackTicks,
-        );
-
-        // 5. Hybrid Invasions: Multi-Star Synchronized Time-on-Target (ToT)
-        //    strikes + Single-Armada Multi-Hop Warp-Gate strikes.
-        ownCarrierCount = await this._executeCoordinatedInvasions(
-            game,
-            player,
-            ownStarIndices,
-            doomedStars,
-            lockedShips,
-            garrisonTarget,
-            committedTargets,
-            ownGraph,
-            distMatrix,
-            hsDist,
-            enemyRangeByPid,
-            decision,
-            believedIndustry,
-            starVisibility,
-            idleCarriersAt,
-            ownCarrierCount,
-            upgradeReserve,
-            maxAttackTicks,
-        );
-
-        // 6. Proactive front-line staging & Warp-Gate logistics (with Economy
-        //    credit reserve, returning-ferry tracking, and collectAll sweeps).
-        ownCarrierCount = await this._executeLogistics(
-            game,
-            player,
-            ownStarIndices,
-            doomedStars,
-            lockedShips,
-            garrisonTarget,
-            hostileBorder,
-            nearbyEnemyShipsAt,
-            committedTargets,
-            activeLogisticsRoutes,
-            busyLogisticsStars,
-            ownGraph,
-            distMatrix,
-            hsDist,
-            enemyRangeByPid,
-            decision,
-            idleCarriersAt,
-            ownCarrierCount,
-            upgradeReserve,
-        );
     }
 
     private _availableShipsAt(
@@ -769,10 +1051,17 @@ export class TacticalExecutor {
         starIndexById: Map<string, number>,
     ): IncomingWave[] {
         const pid = player._id.toString();
+        const dip = this.activeOptions?.diplomacy;
         const grouped = new Map<string, IncomingWave>();
         for (const c of game.galaxy.carriers) {
             if (c.orbiting != null || !c.waypoints?.length) continue;
-            if (!this._isEnemy(game, player, c.ownedByPlayerId)) continue;
+            if (c.isGift) continue;
+
+            const ownerId = c.ownedByPlayerId;
+            if (!ownerId) continue;
+            const ownerStr = ownerId.toString();
+            if (ownerStr === pid) continue;
+
             const wp = c.waypoints[0];
             const destIdx = starIndexById.get(wp.destination.toString());
             if (destIdx === undefined) continue;
@@ -785,6 +1074,30 @@ export class TacticalExecutor {
                     c,
                     wp,
                 ) || 1;
+
+            if (dip) {
+                if (dip.isAllied(ownerStr)) {
+                    continue;
+                }
+                if (dip.isProtected(ownerStr)) {
+                    this.activeOptions?.onAlert?.({
+                        kind: "surprise_attack",
+                        starIndex: destIdx,
+                        starId: destStar._id.toString(),
+                        starName: destStar.name,
+                        attackerPlayerId: ownerStr,
+                        ships: c.ships ?? 1,
+                        ticksUntil: eta,
+                        carrierIds: [c._id.toString()],
+                        message: `Surprise neutral carrier (${c.ships ?? "?"} ships) from player ${ownerStr} inbound to ${destStar.name} (ETA ${eta}t)! Staging defense without counter-invading.`,
+                    });
+                } else if (!dip.isHostile(ownerStr)) {
+                    continue;
+                }
+            } else if (!this._isEnemy(game, player, ownerId)) {
+                continue;
+            }
+
             const key = `${destIdx}:${eta}`;
             let wave = grouped.get(key);
             if (!wave) {
@@ -798,7 +1111,9 @@ export class TacticalExecutor {
             }
             wave.carriers.push(c);
         }
-        return [...grouped.values()].sort((a, b) => a.ticksUntil - b.ticksUntil);
+        return [...grouped.values()].sort(
+            (a, b) => a.ticksUntil - b.ticksUntil,
+        );
     }
 
     private _shipsNeededToHold(
@@ -814,7 +1129,8 @@ export class TacticalExecutor {
         const orbitingFriendly = game.galaxy.carriers.filter(
             (c) =>
                 c.orbiting?.toString() === defStar._id.toString() &&
-                c.ownedByPlayerId?.toString() === pid,
+                c.ownedByPlayerId?.toString() === pid &&
+                !(this.activeOptions && c.isGift),
         );
         const techs =
             this.container.technologyService.getStarEffectiveTechnologyLevels(
@@ -881,7 +1197,8 @@ export class TacticalExecutor {
         const orbitingFriendly = game.galaxy.carriers.filter(
             (c) =>
                 c.orbiting?.toString() === defStar._id.toString() &&
-                c.ownedByPlayerId?.toString() === pid,
+                c.ownedByPlayerId?.toString() === pid &&
+                !(this.activeOptions && c.isGift),
         );
         const techs =
             this.container.technologyService.getStarEffectiveTechnologyLevels(
@@ -923,7 +1240,8 @@ export class TacticalExecutor {
             const dGroupIdx = groups.findIndex((g) => g.isDefender);
             if (dGroupIdx < 0) return false;
             const dGroup = groups[dGroupIdx];
-            defBefore = resById.get(dGroup.id)?.shipsBefore ?? dGroup.originalShips;
+            defBefore =
+                resById.get(dGroup.id)?.shipsBefore ?? dGroup.originalShips;
             if (defBefore <= 1) return false;
 
             let bestAStrike = 1;
@@ -1008,6 +1326,7 @@ export class TacticalExecutor {
         ownGraph: { ticks: Float32Array; nextHop: Int16Array },
         idleCarriersAt: Map<number, Carrier[]>,
         ownCarrierCount: number,
+        reserveCredits = 0,
     ): Promise<number> {
         const S = game.galaxy.stars.length;
         const star = game.galaxy.stars[doomedIdx];
@@ -1061,7 +1380,7 @@ export class TacticalExecutor {
             waypoints,
             idleCarriersAt,
             ownCarrierCount,
-            0,
+            reserveCredits,
         );
         return res.ownCarrierCount;
     }
@@ -1301,6 +1620,9 @@ export class TacticalExecutor {
         candidates: number[],
         weights: (idx: number) => number,
     ) {
+        const respectIgnore = Boolean(
+            this.activeOptions?.respectIgnoreBulkUpgrade,
+        );
         let remaining = Math.min(budget, player.credits ?? 0);
         while (remaining > 0) {
             let bestIdx = -1;
@@ -1308,13 +1630,16 @@ export class TacticalExecutor {
             let bestCost = Infinity;
 
             for (const idx of candidates) {
+                const starCand = game.galaxy.stars[idx];
+                if (
+                    respectIgnore &&
+                    (starCand.ignoreBulkUpgrade as any)?.[type]
+                ) {
+                    continue;
+                }
                 const w = weights(idx);
                 if (w <= 0) continue;
-                const cost = this._upgradeCost(
-                    game,
-                    game.galaxy.stars[idx],
-                    type,
-                );
+                const cost = this._upgradeCost(game, starCand, type);
                 if (cost == null || cost <= 0 || cost > remaining) continue;
                 const score = w / cost;
                 if (score > bestScore) {
@@ -1537,6 +1862,7 @@ export class TacticalExecutor {
         const candidates: { target: number; score: number }[] = [];
         for (let t = 0; t < S; t++) {
             if (stars[t].ownedByPlayerId || sds.isDeadStar(stars[t])) continue;
+            if (this.activeContestedStars?.has(t)) continue;
             if ((committedTargets.get(t) ?? 0) > 0) continue;
             const desire = decision.attackDesire?.[t] ?? 1.0;
             if (desire <= 0) continue;
@@ -1604,7 +1930,10 @@ export class TacticalExecutor {
                 idleCarriersAt.get(bestSrc),
                 lockedShips[bestSrc],
             );
-            const send = Math.min(surplus, Math.min(3, Math.max(1, wps.length)));
+            const send = Math.min(
+                surplus,
+                Math.min(3, Math.max(1, wps.length)),
+            );
             const res = await this._launchShips(
                 game,
                 player,
@@ -1673,6 +2002,7 @@ export class TacticalExecutor {
             if (
                 !stars[i].ownedByPlayerId &&
                 !c.starDataService.isDeadStar(stars[i]) &&
+                !this.activeContestedStars?.has(i) &&
                 !(committedTargets.get(i) ?? 0)
             ) {
                 freeIndices.push(i);
@@ -1683,7 +2013,8 @@ export class TacticalExecutor {
         const explorers = game.galaxy.carriers.filter(
             (car) =>
                 car.ownedByPlayerId?.toString() === pid &&
-                car.specialistId === SPEC_EXPLORER,
+                car.specialistId === SPEC_EXPLORER &&
+                !this._isCarrierPinned(car),
         );
 
         for (const car of explorers) {
@@ -1696,6 +2027,7 @@ export class TacticalExecutor {
             let bestD = Infinity;
             for (const t of freeIndices) {
                 if ((committedTargets.get(t) ?? 0) > 0) continue;
+                if (this.activeBlockedEdges?.has(`${fromIdx}->${t}`)) continue;
                 const d = distMatrix[fromIdx * S + t];
                 if (d <= farDist && d < bestD) {
                     bestD = d;
@@ -1750,6 +2082,7 @@ export class TacticalExecutor {
             let closestOwn = -1;
             for (const u of ownStarIndices) {
                 if (doomedStars.has(u)) continue;
+                if (this.activeBlockedEdges?.has(`${u}->${t}`)) continue;
                 const d = distMatrix[u * S + t];
                 if (d < minOwnD) {
                     minOwnD = d;
@@ -1873,7 +2206,9 @@ export class TacticalExecutor {
         const orbitingEnemy = game.galaxy.carriers.filter(
             (c) =>
                 c.orbiting?.toString() === starId &&
-                this._isEnemy(game, player, c.ownedByPlayerId),
+                (this.activeOptions?.diplomacy
+                    ? !this._isAllied(game, player, c.ownedByPlayerId)
+                    : this._isEnemy(game, player, c.ownedByPlayerId)),
         );
         const shipsOnCarriers = orbitingEnemy.reduce(
             (s, c) => s + (c.ships ?? 0),
@@ -1941,8 +2276,7 @@ export class TacticalExecutor {
         enemyRangeByPid: Map<string, number>,
         decision: AdmiralDecision,
         believedIndustry:
-            | ((starIndex: number) => number | undefined)
-            | undefined,
+            ((starIndex: number) => number | undefined) | undefined,
         starVisibility: Uint8Array | null | undefined,
         idleCarriersAt: Map<number, Carrier[]>,
         ownCarrierCount: number,
@@ -1971,6 +2305,7 @@ export class TacticalExecutor {
             let minEta = Infinity;
             for (const u of ownStarIndices) {
                 if (doomedStars.has(u)) continue;
+                if (this.activeBlockedEdges?.has(`${u}->${t}`)) continue;
                 if (distMatrix[u * S + t] <= hsDist) {
                     const hopEta = this._hopTicks(
                         game,
@@ -2037,7 +2372,10 @@ export class TacticalExecutor {
                     let otherEnemyShips = 0;
                     for (let e = 0; e < S; e++) {
                         const eOwner = stars[e].ownedByPlayerId;
-                        if (e === target || !this._isEnemy(game, player, eOwner)) {
+                        if (
+                            e === target ||
+                            !this._isEnemy(game, player, eOwner)
+                        ) {
                             continue;
                         }
                         const eRange =
@@ -2361,7 +2699,10 @@ export class TacticalExecutor {
         dstIdx: number,
         nextHop: Int16Array,
         canSweepStar: (idx: number) => boolean,
-    ): { waypoints: CarrierWaypointBase<DBObjectId>[]; sweptIndices: number[] } {
+    ): {
+        waypoints: CarrierWaypointBase<DBObjectId>[];
+        sweptIndices: number[];
+    } {
         const stars = game.galaxy.stars;
         const S = stars.length;
         const path: number[] = [srcIdx];
@@ -2475,10 +2816,7 @@ export class TacticalExecutor {
                         }
                     }
                 }
-                want = Math.max(
-                    want,
-                    20 + strikeShips * 0.65 + 25 * maxDesire,
-                );
+                want = Math.max(want, 20 + strikeShips * 0.65 + 25 * maxDesire);
             } else if (anyEnemy && Number.isFinite(minEnemyDist[u])) {
                 // Advance perimeter hub: no 1-hop safe own neighbor sits closer to the enemy.
                 let hasCloserOwnNeighbor = false;
@@ -2506,7 +2844,8 @@ export class TacticalExecutor {
         if (!sinks.length) return ownCarrierCount;
 
         // Sources: safe interior own stars (not front sinks) with surplus.
-        const sources: { src: number; surplus: number; hasIdle: boolean }[] = [];
+        const sources: { src: number; surplus: number; hasIdle: boolean }[] =
+            [];
         for (const u of ownStarIndices) {
             if (doomedStars.has(u) || demand[u] > 0 || isFrontSink[u]) continue;
             const reserve = Math.max(lockedShips[u], garrisonTarget[u]);
@@ -2519,10 +2858,7 @@ export class TacticalExecutor {
             if (!hasIdle) {
                 if (busyLogisticsStars.has(u)) continue;
                 const prodCycle = this._starShipsPerCycle(game, stars[u]);
-                const minBuyStockpile = Math.max(
-                    8,
-                    Math.ceil(prodCycle * 0.7),
-                );
+                const minBuyStockpile = Math.max(8, Math.ceil(prodCycle * 0.7));
                 if (surplus < minBuyStockpile) continue;
             } else if (surplus < 4) {
                 continue;
@@ -2556,7 +2892,8 @@ export class TacticalExecutor {
             if (bestSink < 0) continue;
 
             const hop = ownGraph.nextHop[src * S + bestSink];
-            if (hop < 0 || activeLogisticsRoutes.has(`${src}->${hop}`)) continue;
+            if (hop < 0 || activeLogisticsRoutes.has(`${src}->${hop}`))
+                continue;
 
             const { waypoints, sweptIndices } = this._buildLogisticsWaypoints(
                 game,
@@ -2579,7 +2916,10 @@ export class TacticalExecutor {
             );
             if (res.launched) {
                 ownCarrierCount = res.ownCarrierCount;
-                demand[bestSink] = Math.max(0, demand[bestSink] - res.shipsSent);
+                demand[bestSink] = Math.max(
+                    0,
+                    demand[bestSink] - res.shipsSent,
+                );
                 activeLogisticsRoutes.add(`${src}->${hop}`);
                 activeLogisticsRoutes.add(`${hop}->${src}`);
                 busyLogisticsStars.add(src);
