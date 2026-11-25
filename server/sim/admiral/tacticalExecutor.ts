@@ -85,6 +85,7 @@ export interface TacticalAlertEvent {
     starId: string;
     starName: string;
     attackerPlayerId?: string;
+    attackerAlias?: string;
     ships: number;
     ticksUntil?: number;
     carrierIds?: string[];
@@ -1079,16 +1080,23 @@ export class TacticalExecutor {
                     continue;
                 }
                 if (dip.isProtected(ownerStr)) {
+                    const attackerAlias = game.galaxy.players.find(
+                        (p) => p._id.toString() === ownerStr,
+                    )?.alias;
+                    const attackerLabel = attackerAlias
+                        ? `'${attackerAlias}'`
+                        : `player ${ownerStr}`;
                     this.activeOptions?.onAlert?.({
                         kind: "surprise_attack",
                         starIndex: destIdx,
                         starId: destStar._id.toString(),
                         starName: destStar.name,
                         attackerPlayerId: ownerStr,
+                        attackerAlias,
                         ships: c.ships ?? 1,
                         ticksUntil: eta,
                         carrierIds: [c._id.toString()],
-                        message: `Surprise neutral carrier (${c.ships ?? "?"} ships) from player ${ownerStr} inbound to ${destStar.name} (ETA ${eta}t)! Staging defense without counter-invading.`,
+                        message: `Surprise neutral carrier (${c.ships ?? "?"} ships) from ${attackerLabel} inbound to ${destStar.name} (ETA ${eta}t)! Staging defense without counter-invading.`,
                     });
                 } else if (!dip.isHostile(ownerStr)) {
                     continue;

@@ -37,13 +37,38 @@ function parseArgs(argv: string[]) {
     return out;
 }
 
+function formatLiveAction(a: LiveAction): string {
+    switch (a.type) {
+        case "SetResearchNow":
+            return `SetResearchNow ${a.preference}${a.reason ? ` (${a.reason})` : ""}`;
+        case "SetResearchQueue":
+            return `SetResearchQueue [${a.queue.join(", ")}]`;
+        case "HireStarSpecialist":
+            return `HireStarSpecialist id=${a.specialistId} @ ${a.starName ?? a.starId}`;
+        case "UpgradeStar":
+            return `UpgradeStar ${a.starName ?? a.starId} (${a.infrastructure}${a.expectedCost != null ? `, ${a.expectedCost}cr` : ""})`;
+        case "BuildWarpGate":
+            return `BuildWarpGate ${a.starName ?? a.starId}${a.expectedCost != null ? ` (${a.expectedCost}cr)` : ""}`;
+        case "BuildCarrier":
+            return `BuildCarrier @ ${a.starName ?? a.starId} (${a.ships} ships)`;
+        case "TransferShips":
+            return `TransferShips carrier=${a.carrierId} @ ${a.starId} (carrier=${a.carrierShips}, star=${a.starShips})`;
+        case "HireCarrierSpecialist":
+            return `HireCarrierSpecialist id=${a.specialistId} on carrier=${a.carrierId}`;
+        case "SaveWaypoints": {
+            const hops = a.waypoints.map((w) => w.destination).join(" -> ");
+            return `SaveWaypoints carrier=${a.carrierId} [${hops || "CLEAR"}]${a.reason ? ` (${a.reason})` : ""}`;
+        }
+    }
+}
+
 async function promptApproval(
     actions: LiveAction[],
     tick: number,
 ): Promise<boolean> {
     console.log(`\n[Tick ${tick}] Proposed ${actions.length} LiveAction(s):`);
     actions.forEach((a, idx) => {
-        console.log(`  ${idx + 1}. ${JSON.stringify(a)}`);
+        console.log(`  ${idx + 1}. ${formatLiveAction(a)}`);
     });
     const rl = readline.createInterface({
         input: process.stdin,
@@ -132,6 +157,20 @@ async function main() {
                 `[${alert.severity.toUpperCase()}][t${alert.tick}][${alert.code}] ${alert.message}`,
             );
         },
+        onCycleReport: args.once
+            ? undefined
+            : (summary) => {
+                  const hdr = `[Tick ${summary.tick}][${summary.mode}] Planned=${summary.plannedActions.length} Dispatched=${summary.dispatchedCount}`;
+                  console.log(hdr);
+                  if (
+                      summary.mode === "advisor" ||
+                      summary.plannedActions.length > 0
+                  ) {
+                      for (const a of summary.plannedActions) {
+                          console.log(`  - ${formatLiveAction(a)}`);
+                      }
+                  }
+              },
     };
 
     const daemon = new LiveAdmiralDaemon(cfg);
@@ -151,10 +190,10 @@ async function main() {
     if (args.once) {
         const report = await daemon.runOnce("cli_once");
         console.log(
-            `[Tick ${report.tick}] Mode=${report.mode} Planned=${report.plannedActions.length} Dispatched=${report.dispatchedCount}`,
+            `[Tick ${report.tick}][${report.mode}] Planned=${report.plannedActions.length} Dispatched=${report.dispatchedCount}`,
         );
         for (const a of report.plannedActions) {
-            console.log(`  - ${JSON.stringify(a)}`);
+            console.log(`  - ${formatLiveAction(a)}`);
         }
         daemon.stop();
         return;

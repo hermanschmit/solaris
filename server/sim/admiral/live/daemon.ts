@@ -81,6 +81,7 @@ export class LiveAdmiralDaemon {
     }[] = [];
     private monthlyBannedStarSpecs: number[] = [];
     private monthlyBannedCarrierSpecs: number[] = [];
+    private playerAliasById = new Map<string, string>();
 
     constructor(config: LiveDaemonConfig) {
         this.config = config;
@@ -101,6 +102,21 @@ export class LiveAdmiralDaemon {
 
     getPlayerId(): string | null {
         return this.myPlayerId;
+    }
+
+    private updatePlayerAliases(galaxy: any) {
+        for (const p of galaxy?.galaxy?.players ?? []) {
+            if (p?._id != null && p?.alias) {
+                this.playerAliasById.set(String(p._id), String(p.alias));
+            }
+        }
+    }
+
+    private formatPlayerLabel(playerId?: string | null): string {
+        if (!playerId) return "unknown player";
+        const idStr = String(playerId);
+        const alias = this.playerAliasById.get(idStr);
+        return alias ? `'${alias}'` : `player ${idStr}`;
     }
 
     private emitAlert(alert: LiveAlert) {
@@ -140,6 +156,7 @@ export class LiveAdmiralDaemon {
         }
 
         const galaxy = await this.client.getGalaxy(this.config.gameId);
+        this.updatePlayerAliases(galaxy);
         const players: any[] = galaxy?.galaxy?.players ?? [];
         const meIdx = players.findIndex(
             (p) => p.hasPerspective === true || p.userId != null,
@@ -209,7 +226,7 @@ export class LiveAdmiralDaemon {
                     tick: this.persisted?.lastProcessedTick ?? 0,
                     severity: "info",
                     code: "CREDITS_RECEIVED",
-                    message: `Received ${payload?.data?.credits ?? 0} credits from player ${payload?.data?.fromPlayerId}.`,
+                    message: `Received ${payload?.data?.credits ?? 0} credits from ${this.formatPlayerLabel(payload?.data?.fromPlayerId)}.`,
                     details: payload?.data,
                 });
             },
@@ -219,7 +236,7 @@ export class LiveAdmiralDaemon {
                     tick: this.persisted?.lastProcessedTick ?? 0,
                     severity: "info",
                     code: "CREDITS_RECEIVED",
-                    message: `Received ${payload?.data?.creditsSpecialists ?? 0} specialist token(s) from player ${payload?.data?.fromPlayerId}.`,
+                    message: `Received ${payload?.data?.creditsSpecialists ?? 0} specialist token(s) from ${this.formatPlayerLabel(payload?.data?.fromPlayerId)}.`,
                     details: payload?.data,
                 });
             },
@@ -582,6 +599,7 @@ export class LiveAdmiralDaemon {
                     .catch(() => ({ notes: undefined })),
             ]);
 
+        this.updatePlayerAliases(galaxy);
         const tick = Number(galaxy.state.tick ?? 0);
         const cycleAlerts: LiveAlert[] = [];
         const recordAlert = (a: LiveAlert) => {
@@ -672,7 +690,7 @@ export class LiveAdmiralDaemon {
             this.persisted.lastProcessedTick = tick;
             this.persisted.seatMemory = serializeSeatMemory(this.seatMemory!);
             this.store.save(this.persisted);
-            return {
+            const pausedReport: CycleExecutionReport = {
                 tick,
                 mode: effectiveMode,
                 trigger,
@@ -683,6 +701,8 @@ export class LiveAdmiralDaemon {
                 alerts: cycleAlerts,
                 diplomacy,
             };
+            this.config.onCycleReport?.(pausedReport);
+            return pausedReport;
         }
 
         // 5. Detect received technologies & compute ResearchCoordinator masks.
@@ -923,7 +943,7 @@ export class LiveAdmiralDaemon {
             };
         }
 
-        return {
+        const finalReport: CycleExecutionReport = {
             tick,
             mode: effectiveMode,
             trigger,
@@ -934,6 +954,8 @@ export class LiveAdmiralDaemon {
             alerts: cycleAlerts,
             diplomacy,
         };
+        this.config.onCycleReport?.(finalReport);
+        return finalReport;
     }
 
     private async _selectBestPlanViaLookahead(params: {

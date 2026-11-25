@@ -297,10 +297,41 @@ export function coordinateResearch(params: {
     }
 
     // 1. Update / detect Manual GUI Research Pin!
-    if (
-        human.lastAiResearch.now != null &&
-        curNow !== human.lastAiResearch.now &&
-        !receivedMap.has(curNow)
+    // Ignore natural or Experimentation completions where `lastAiResearch.now`
+    // leveled up and Solaris automatically shifted `researchQueue[0]` into `researchingNow`.
+    const prevAiNow = human.lastAiResearch.now;
+    const prevAiNowKnownLvl =
+        prevAiNow != null ? human.lastKnownTechLevels[prevAiNow] : undefined;
+    const curPrevAiNowLvl =
+        prevAiNow != null
+            ? Number(me.research?.[prevAiNow]?.level ?? 1)
+            : undefined;
+    const prevAiNowLeveledUp =
+        prevAiNowKnownLvl != null &&
+        curPrevAiNowLvl != null &&
+        curPrevAiNowLvl > prevAiNowKnownLvl;
+    const expectedNextQueue = [
+        ...(human.lastAiResearch.queue ?? []),
+        ...(human.lastAiResearch.next ? [human.lastAiResearch.next] : []),
+    ];
+    const isNaturalQueueAdvance =
+        prevAiNow != null &&
+        curNow !== prevAiNow &&
+        prevAiNowLeveledUp &&
+        (expectedNextQueue.includes(curNow) || expectedNextQueue.length === 0);
+
+    if (isNaturalQueueAdvance) {
+        // Sync baseline so subsequent read-only/advisor ticks don't misclassify
+        // this natural queue advancement as a manual GUI click.
+        human.lastAiResearch.now = curNow;
+        human.lastAiResearch.queue = curQueue;
+        human.lastAiResearch.next = curQueue[0] ?? curNow;
+        human.lastAiResearch.tick = tick;
+    } else if (
+        prevAiNow != null &&
+        curNow !== prevAiNow &&
+        !receivedMap.has(curNow) &&
+        !receivedMap.has(prevAiNow)
     ) {
         const curLvl = Number(me.research?.[curNow]?.level ?? 1);
         if (human.humanResearchPin?.tech !== curNow) {

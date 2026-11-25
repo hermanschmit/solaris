@@ -205,6 +205,15 @@ export interface PersistedGameState {
     human: HumanState;
 }
 
+export interface CycleSummary {
+    tick: number;
+    mode: OperatingMode;
+    trigger: string;
+    plannedActions: LiveAction[];
+    dispatchedCount: number;
+    abortedOnConflict: boolean;
+}
+
 export interface LiveDaemonConfig {
     apiUrl: string;
     gameId: string;
@@ -231,4 +240,5 @@ export interface LiveDaemonConfig {
     enableSockets?: boolean;
     approvalHandler?: (actions: LiveAction[], tick: number) => Promise<boolean>;
     onAlert?: (alert: LiveAlert) => void;
+    onCycleReport?: (summary: CycleSummary) => void;
 }
