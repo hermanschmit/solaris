@@ -572,14 +572,14 @@ export class TacticalExecutor {
                 game,
                 player.research.hyperspace.level,
             );
-            const ownGraph = this._shortestPathsFromOwn(
+            let ownGraph = this._shortestPathsFromOwn(
                 game,
                 player,
                 distMatrix,
                 hsDist,
                 false,
             );
-            const claimGraph = this._shortestPathsFromOwn(
+            let claimGraph = this._shortestPathsFromOwn(
                 game,
                 player,
                 distMatrix,
@@ -917,7 +917,7 @@ export class TacticalExecutor {
                             Math.max(0, reachableUnclaimed - totalIdleCarriers),
                         ) * this._carrierCost(game);
 
-                    this._spendCycleCredits(
+                    const builtWarpGates = this._spendCycleCredits(
                         game,
                         player,
                         ownStarIndices,
@@ -928,7 +928,34 @@ export class TacticalExecutor {
                         claimReserve,
                         isFirstTick,
                         isLastTick,
+                        ownGraph,
+                        distMatrix,
+                        hsDist,
+                        starIndexById,
                     );
+                    if (builtWarpGates > 0) {
+                        ownGraph = this._shortestPathsFromOwn(
+                            game,
+                            player,
+                            distMatrix,
+                            hsDist,
+                            false,
+                        );
+                        claimGraph = this._shortestPathsFromOwn(
+                            game,
+                            player,
+                            distMatrix,
+                            hsDist,
+                            true,
+                        );
+                        await this._rerouteCarriersAfterWarpGate(
+                            game,
+                            player,
+                            starIndexById,
+                            distMatrix,
+                            ownGraph,
+                        );
+                    }
                 }
 
                 // Policy-driven Economy hold:
@@ -1664,6 +1691,271 @@ export class TacticalExecutor {
         }
     }
 
+    private _edgeWarpTicksSaved(
+        game: Game,
+        distMatrix: Float64Array,
+        S: number,
+        hsDist: number,
+        u: number,
+        v: number,
+    ): number {
+        const stars = game.galaxy.stars;
+        if (
+            this.container.starDataService.isStarPairWormHole(
+                stars[u],
+                stars[v],
+            )
+        ) {
+            return 0;
+        }
+        const d = distMatrix[u * S + v];
+        if (d > hsDist) return 0;
+        const baseSpeed = game.settings.specialGalaxy.carrierSpeed;
+        const warpMult = game.constants.distances.warpSpeedMultiplier || 3;
+        const tNormal = Math.max(1, Math.ceil(d / baseSpeed));
+        const tWarp = Math.max(1, Math.ceil(d / (baseSpeed * warpMult)));
+        return Math.max(0, tNormal - tWarp);
+    }
+
+    private _computeWarpGateTraffic(
+        game: Game,
+        player: Player,
+        safeOwn: number[],
+        hostileBorder: Uint8Array,
+        ownGraph: { ticks: Float32Array; nextHop: Int16Array },
+        distMatrix: Float64Array,
+        hsDist: number,
+        starIndexById: Map<string, number>,
+    ): {
+        starTraffic: Float64Array;
+        edgeTraffic: Map<string, number>;
+    } {
+        const stars = game.galaxy.stars;
+        const S = stars.length;
+        const pid = player._id.toString();
+        const starTraffic = new Float64Array(S);
+        const edgeTraffic = new Map<string, number>();
+
+        const addEdgeTraffic = (u: number, v: number, weight: number) => {
+            if (weight <= 0 || u === v) return;
+            const saved = this._edgeWarpTicksSaved(
+                game,
+                distMatrix,
+                S,
+                hsDist,
+                u,
+                v,
+            );
+            if (saved <= 0) return;
+            const val = weight * saved;
+            starTraffic[u] += val;
+            starTraffic[v] += val;
+            const key = u < v ? `${u}-${v}` : `${v}-${u}`;
+            edgeTraffic.set(key, (edgeTraffic.get(key) ?? 0) + val);
+        };
+
+        // 1. Current active carrier waypoints weighted by ship count.
+        for (const c of game.galaxy.carriers) {
+            if (c.ownedByPlayerId?.toString() !== pid) continue;
+            if (!c.waypoints.length) continue;
+            const ships = Math.max(1, c.ships ?? 1);
+            for (const wp of c.waypoints) {
+                const u = starIndexById.get(wp.source.toString());
+                const v = starIndexById.get(wp.destination.toString());
+                if (u !== undefined && v !== undefined) {
+                    addEdgeTraffic(u, v, ships);
+                }
+            }
+        }
+
+        // 2. Projected interior -> front shortest-path ship flow per cycle.
+        const frontSinks: number[] = [];
+        for (const u of safeOwn) {
+            if (hostileBorder[u]) frontSinks.push(u);
+        }
+        if (frontSinks.length === 0 && safeOwn.length >= 2) {
+            const scored = safeOwn
+                .map((u) => {
+                    let minE = Infinity;
+                    for (let t = 0; t < S; t++) {
+                        if (
+                            !this._isEnemy(
+                                game,
+                                player,
+                                stars[t].ownedByPlayerId,
+                            )
+                        ) {
+                            continue;
+                        }
+                        const d = distMatrix[u * S + t];
+                        if (d < minE) minE = d;
+                    }
+                    return { u, minE };
+                })
+                .filter((x) => Number.isFinite(x.minE))
+                .sort((a, b) => a.minE - b.minE);
+            const k = Math.max(1, Math.round(safeOwn.length * 0.25));
+            for (let idx = 0; idx < k && idx < scored.length; idx++) {
+                frontSinks.push(scored[idx].u);
+            }
+        }
+
+        const frontSet = new Set(frontSinks);
+        for (const u of safeOwn) {
+            if (frontSet.has(u)) continue;
+            const prod = this._starShipsPerCycle(game, stars[u]);
+            if (prod <= 0) continue;
+            let bestF = -1;
+            let bestT = Infinity;
+            for (const f of frontSinks) {
+                const t = ownGraph.ticks[u * S + f];
+                if (t < bestT) {
+                    bestT = t;
+                    bestF = f;
+                }
+            }
+            if (bestF < 0 || !Number.isFinite(bestT)) continue;
+            let cur = u;
+            let guard = 0;
+            while (cur !== bestF && guard++ < 14) {
+                const nxt = ownGraph.nextHop[cur * S + bestF];
+                if (nxt < 0) break;
+                addEdgeTraffic(cur, nxt, prod);
+                cur = nxt;
+            }
+        }
+
+        return { starTraffic, edgeTraffic };
+    }
+
+    private async _rerouteCarriersAfterWarpGate(
+        game: Game,
+        player: Player,
+        starIndexById: Map<string, number>,
+        distMatrix: Float64Array,
+        ownGraph: { ticks: Float32Array; nextHop: Int16Array },
+    ): Promise<number> {
+        const stars = game.galaxy.stars;
+        const S = stars.length;
+        const pid = player._id.toString();
+        let rerouted = 0;
+
+        for (const c of game.galaxy.carriers) {
+            if (c.ownedByPlayerId?.toString() !== pid) continue;
+            if (this._isCarrierPinned(c) || c.isGift || c.waypointsLooped) {
+                continue;
+            }
+            if (c.waypoints.length < 2) continue;
+            if (c.waypoints.some((w) => (w.delayTicks ?? 0) > 0)) continue;
+
+            const startIdx = c.orbiting == null ? 1 : 0;
+            if (c.waypoints.length - startIdx < 2) continue;
+
+            const anchorId =
+                startIdx === 1
+                    ? c.waypoints[0].destination.toString()
+                    : c.orbiting!.toString();
+            const anchorIdx = starIndexById.get(anchorId);
+            if (anchorIdx === undefined) continue;
+
+            // Find the first `dropAll` (or final own-star return leg) reachable via
+            // pure transit (`action === "nothing"`) so we never drop `collectAll` stops.
+            let targetWpIdx = -1;
+            for (let wi = startIdx; wi < c.waypoints.length; wi++) {
+                const act = c.waypoints[wi].action;
+                if (act === "dropAll") {
+                    targetWpIdx = wi;
+                    break;
+                }
+                if (act !== "nothing") {
+                    break;
+                }
+                if (wi === c.waypoints.length - 1) {
+                    targetWpIdx = wi;
+                }
+            }
+            if (targetWpIdx < startIdx + 1) continue;
+
+            const targetStarIdx = starIndexById.get(
+                c.waypoints[targetWpIdx].destination.toString(),
+            );
+            if (
+                targetStarIdx === undefined ||
+                stars[targetStarIdx].ownedByPlayerId?.toString() !== pid
+            ) {
+                continue;
+            }
+
+            // Compute current tick cost across `startIdx .. targetWpIdx`.
+            let oldTicks = 0;
+            let validOld = true;
+            for (let wi = startIdx; wi <= targetWpIdx; wi++) {
+                const u = starIndexById.get(c.waypoints[wi].source.toString());
+                const v = starIndexById.get(
+                    c.waypoints[wi].destination.toString(),
+                );
+                if (u === undefined || v === undefined) {
+                    validOld = false;
+                    break;
+                }
+                oldTicks += this._hopTicks(game, player, distMatrix, S, u, v);
+            }
+            if (!validOld) continue;
+
+            const newTicks = ownGraph.ticks[anchorIdx * S + targetStarIdx];
+            if (!Number.isFinite(newTicks) || newTicks >= oldTicks) continue;
+
+            const targetWp = c.waypoints[targetWpIdx];
+            const finalAction: "dropAll" | "nothing" =
+                targetWp.action === "dropAll" ? "dropAll" : "nothing";
+            const rebuiltSegment = this._buildPathWaypoints(
+                game,
+                anchorIdx,
+                targetStarIdx,
+                ownGraph.nextHop,
+                finalAction,
+                false,
+                0,
+            );
+            if (!rebuiltSegment.length) continue;
+
+            const newWaypoints: CarrierWaypointBase<DBObjectId>[] = [
+                ...c.waypoints.slice(0, startIdx).map((w) => ({
+                    source: w.source,
+                    destination: w.destination,
+                    action: w.action,
+                    actionShips: w.actionShips,
+                    delayTicks: w.delayTicks,
+                })),
+                ...rebuiltSegment,
+                ...c.waypoints.slice(targetWpIdx + 1).map((w) => ({
+                    source: w.source,
+                    destination: w.destination,
+                    action: w.action,
+                    actionShips: w.actionShips,
+                    delayTicks: w.delayTicks,
+                })),
+            ];
+            if (newWaypoints.length > 30) continue;
+
+            try {
+                await this.container.saveWaypointsService.saveWaypointsForCarrier(
+                    game,
+                    player,
+                    c,
+                    newWaypoints,
+                    false,
+                    false,
+                );
+                rerouted++;
+            } catch (e: any) {
+                if (!(e instanceof ValidationError)) throw e;
+            }
+        }
+
+        return rerouted;
+    }
+
     private _spendCycleCredits(
         game: Game,
         player: Player,
@@ -1675,10 +1967,17 @@ export class TacticalExecutor {
         claimReserve: number,
         isFirstTick: boolean,
         isLastTick: boolean,
-    ) {
+        ownGraph: { ticks: Float32Array; nextHop: Int16Array },
+        distMatrix: Float64Array,
+        hsDist: number,
+        starIndexById: Map<string, number>,
+    ): number {
         const safeOwn = ownStarIndices.filter((i) => !doomedStars.has(i));
-        if (!safeOwn.length) return;
+        if (!safeOwn.length) return 0;
         const stars = game.galaxy.stars;
+        const S = stars.length;
+        const pid = player._id.toString();
+        let builtWarpGates = 0;
 
         if (isFirstTick) {
             const totalCredits = player.credits ?? 0;
@@ -1688,7 +1987,7 @@ export class TacticalExecutor {
             );
             const maxFirstSpend = Math.max(0, totalCredits - claimReserve);
             const firstShare = normSplit[0] + normSplit[1] + normSplit[3];
-            if (maxFirstSpend <= 0 || firstShare <= 0) return;
+            if (maxFirstSpend <= 0 || firstShare <= 0) return 0;
 
             let sciBudget = Math.floor(totalCredits * normSplit[0]);
             let indBudget = Math.floor(totalCredits * normSplit[1]);
@@ -1737,32 +2036,142 @@ export class TacticalExecutor {
                 },
             );
 
-            // Warp Gates: connect high-industry hubs and frontier staging stars.
+            // Warp Gates: weight by actual carrier waypoint + interior->front ship
+            // traffic on >=2-tick edges, with a lower threshold & 3x boost for stars
+            // within hyperspace range of an existing own or allied Warp Gate.
             let wgRem = Math.min(
                 wgBudget,
                 Math.max(0, (player.credits ?? 0) - claimReserve),
             );
-            while (wgRem > 0) {
-                let bestIdx = -1;
-                let bestScore = 0;
-                let bestCost = Infinity;
-                for (const i of safeOwn) {
-                    const cost = this._warpGateCost(game, stars[i]);
-                    if (cost == null || cost <= 0 || cost > wgRem) continue;
-                    const w =
-                        (decision.warpGatePriority?.[i] ?? 1.0) *
-                        (1 + 0.3 * (stars[i].infrastructure?.industry ?? 0));
-                    const score = w / cost;
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestIdx = i;
-                        bestCost = cost;
-                    }
+            if (wgRem > 0 && safeOwn.length >= 2) {
+                const { starTraffic, edgeTraffic } =
+                    this._computeWarpGateTraffic(
+                        game,
+                        player,
+                        safeOwn,
+                        hostileBorder,
+                        ownGraph,
+                        distMatrix,
+                        hsDist,
+                        starIndexById,
+                    );
+                const traversable: number[] = [];
+                for (let j = 0; j < S; j++) {
+                    const owner = stars[j].ownedByPlayerId;
+                    if (!owner) continue;
+                    const ok = this.activeOptions?.diplomacy
+                        ? this._isAllied(game, player, owner)
+                        : owner.toString() === pid ||
+                          !this._isEnemy(game, player, owner);
+                    if (ok) traversable.push(j);
                 }
-                if (bestIdx < 0 || bestCost > (player.credits ?? 0)) break;
-                stars[bestIdx].warpGate = true;
-                player.credits -= bestCost;
-                wgRem -= bestCost;
+
+                while (wgRem > 0) {
+                    // Check if we already have an orphaned own Warp Gate that can be paired.
+                    let hasUnpairedOrphan = false;
+                    for (const gIdx of safeOwn) {
+                        if (!stars[gIdx].warpGate) continue;
+                        let hasGatedNbr = false;
+                        let hasUngatedPair = false;
+                        for (const j of traversable) {
+                            if (j === gIdx) continue;
+                            if (
+                                this._edgeWarpTicksSaved(
+                                    game,
+                                    distMatrix,
+                                    S,
+                                    hsDist,
+                                    gIdx,
+                                    j,
+                                ) <= 0
+                            ) {
+                                continue;
+                            }
+                            if (stars[j].warpGate) hasGatedNbr = true;
+                            else if (
+                                stars[j].ownedByPlayerId?.toString() === pid
+                            )
+                                hasUngatedPair = true;
+                        }
+                        if (!hasGatedNbr && hasUngatedPair) {
+                            hasUnpairedOrphan = true;
+                            break;
+                        }
+                    }
+
+                    let bestIdx = -1;
+                    let bestScore = 0;
+                    let bestCost = Infinity;
+                    for (const i of safeOwn) {
+                        const cost = this._warpGateCost(game, stars[i]);
+                        if (cost == null || cost <= 0 || cost > wgRem) continue;
+
+                        let hasGatedNeighbor = false;
+                        let hasPairableNeighbor = false;
+                        let connectedTraffic = 0;
+                        for (const j of traversable) {
+                            if (j === i) continue;
+                            if (
+                                this._edgeWarpTicksSaved(
+                                    game,
+                                    distMatrix,
+                                    S,
+                                    hsDist,
+                                    i,
+                                    j,
+                                ) <= 0
+                            ) {
+                                continue;
+                            }
+                            hasPairableNeighbor = true;
+                            if (stars[j].warpGate) {
+                                hasGatedNeighbor = true;
+                                const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+                                connectedTraffic += edgeTraffic.get(key) ?? 0;
+                            }
+                        }
+                        if (!hasPairableNeighbor) continue;
+
+                        const ind = stars[i].infrastructure?.industry ?? 0;
+                        const traf = starTraffic[i];
+                        const prior = decision.warpGatePriority?.[i] ?? 1.0;
+
+                        let w = 0;
+                        if (hasGatedNeighbor) {
+                            // Lower threshold & 3x boost: pays off immediately!
+                            if (traf <= 0 && ind < 2) continue;
+                            w =
+                                prior *
+                                3.0 *
+                                (1 +
+                                    0.15 * connectedTraffic +
+                                    0.08 * traf +
+                                    0.2 * ind);
+                        } else {
+                            // Higher threshold to seed an isolated ("first") Warp Gate.
+                            if (traf < 12 && !(traf >= 4 && ind >= 4)) continue;
+                            const orphanPenalty = hasUnpairedOrphan
+                                ? 0.35
+                                : 1.0;
+                            w =
+                                prior *
+                                orphanPenalty *
+                                (1 + 0.08 * traf + 0.2 * ind);
+                        }
+
+                        const score = w / cost;
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestIdx = i;
+                            bestCost = cost;
+                        }
+                    }
+                    if (bestIdx < 0 || bestCost > (player.credits ?? 0)) break;
+                    stars[bestIdx].warpGate = true;
+                    player.credits -= bestCost;
+                    wgRem -= bestCost;
+                    builtWarpGates++;
+                }
             }
 
             // Roll 60% of unspent Warp-Gate budget into Industry now and leave
@@ -1818,6 +2227,8 @@ export class TacticalExecutor {
             );
             this.cycleEcoHold.set(player, 0);
         }
+
+        return builtWarpGates;
     }
 
     private _starStrategicValue(star: Star): number {
