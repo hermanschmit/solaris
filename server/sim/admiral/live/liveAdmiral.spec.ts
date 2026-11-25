@@ -507,10 +507,14 @@ describe("Live Diplomatic Admiral stack", () => {
                 },
             );
 
-            // 1. Surprise attack alert fired for `SneakNeutral`, yet ZERO counter-attacks on p1 (`stars[1]`)!
-            expect(
-                execAlerts.some((a) => a.kind === "surprise_attack"),
-            ).toBeTrue();
+            // 1. Surprise attack alert fired for `SneakNeutral` with alias (not raw ObjectId), yet ZERO counter-attacks on p1 (`stars[1]`)!
+            const surpriseAlert = execAlerts.find(
+                (a) => a.kind === "surprise_attack",
+            );
+            expect(surpriseAlert).toBeDefined();
+            expect(surpriseAlert?.attackerAlias).toBe(p1.alias);
+            expect(surpriseAlert?.message).toContain(`'${p1.alias}'`);
+            expect(surpriseAlert?.message).not.toContain(p1._id.toString());
 
             const myCarriers = game.galaxy.carriers.filter(
                 (c) => c.ownedByPlayerId?.toString() === p0._id.toString(),
@@ -645,6 +649,49 @@ describe("Live Diplomatic Admiral stack", () => {
                 tick: 5,
             };
 
+            // Case A2: `hyperspace` levels up naturally (or via Experimentation) and Solaris
+            // shifts `researchQueue[0]` (`terraforming`) into `researchingNow` -> must NOT
+            // trigger a false-positive `HUMAN_RESEARCH_PIN` (even across consecutive ticks)!
+            me.research.hyperspace.level += 1;
+            me.researchingNow = "terraforming";
+            me.researchQueue = coord1.desiredQueue.slice(1) as any;
+            const pinAlertsBefore = alerts.filter(
+                (a) => a.code === "HUMAN_RESEARCH_PIN",
+            ).length;
+            const coordNat = coordinateResearch({
+                engine,
+                game,
+                me,
+                technologies: techs,
+                human,
+                maskPlan,
+                receivedTechs: [],
+                resLogits: logits,
+                isCycleStart: false,
+                onAlert: (a) => alerts.push(a),
+            });
+            expect(coordNat.humanPinned).toBeFalse();
+            expect(
+                alerts.filter((a) => a.code === "HUMAN_RESEARCH_PIN").length,
+            ).toBe(pinAlertsBefore);
+            // Follow-up tick without dispatching (e.g., advisor mode) must also stay unpinned:
+            const coordNatNext = coordinateResearch({
+                engine,
+                game,
+                me,
+                technologies: techs,
+                human,
+                maskPlan,
+                receivedTechs: [],
+                resLogits: logits,
+                isCycleStart: false,
+                onAlert: (a) => alerts.push(a),
+            });
+            expect(coordNatNext.humanPinned).toBeFalse();
+            expect(
+                alerts.filter((a) => a.code === "HUMAN_RESEARCH_PIN").length,
+            ).toBe(pinAlertsBefore);
+
             // Case B: Human manually changes `researchingNow` to `banking` in GUI!
             me.researchingNow = "banking";
             me.researchQueue = ["terraforming"];
@@ -658,9 +705,13 @@ describe("Live Diplomatic Admiral stack", () => {
                 receivedTechs: [],
                 resLogits: logits,
                 isCycleStart: true,
+                onAlert: (a) => alerts.push(a),
             });
             expect(coord2.humanPinned).toBeTrue();
             expect(coord2.desiredNow).toBe("banking");
+            expect(
+                alerts.filter((a) => a.code === "HUMAN_RESEARCH_PIN").length,
+            ).toBe(pinAlertsBefore + 1);
             expect(
                 coord2.actions.some((a) => a.type === "SetResearchNow"),
             ).toBeFalse();
