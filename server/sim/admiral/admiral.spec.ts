@@ -420,6 +420,183 @@ describe("Admiral stack", () => {
             expect(evacB).toBeUndefined();
             expect(doomed.ships).toBe(15);
         });
+
+        it("builds traffic-weighted paired Warp Gates and reroutes eligible in-flight carriers immediately", async () => {
+            const env = new AdmiralEnv();
+            await env.reset({ admiralSeats: [0], seed: 25, fog: false });
+            const game = env.game;
+            const p0 = game.galaxy.players[0];
+            const p1 = game.galaxy.players[1];
+            const ly = game.constants?.distances?.lightYear || 50;
+
+            game.state.tick = 1; // isFirstTick
+            p0.research.hyperspace.level = 2; // hsDist = 3 * 50 = 150
+            p0.research.terraforming.level = 1;
+            game.galaxy.carriers = [];
+
+            const ownStars = game.galaxy.stars.filter(
+                (s) => s.ownedByPlayerId?.toString() === p0._id.toString(),
+            );
+            expect(ownStars.length).toBeGreaterThanOrEqual(5);
+            const [s0, s1, s2, s3, s4] = ownStars;
+
+            // Move any extra own stars and enemy stars far away so geometry is clean.
+            for (const s of game.galaxy.stars) {
+                s.warpGate = false;
+                s.wormHoleToStarId = null;
+                s.ships = 5;
+                s.shipsActual = 5;
+                s.infrastructure = { economy: 1, industry: 1, science: 1 };
+                s.naturalResources = { economy: 25, industry: 25, science: 25 };
+                if (s !== s0 && s !== s1 && s !== s2 && s !== s3 && s !== s4) {
+                    s.location =
+                        s.ownedByPlayerId?.toString() === p0._id.toString()
+                            ? { x: 5000, y: 5000 }
+                            : { x: -5000, y: -5000 };
+                }
+            }
+            const enemyStar = game.galaxy.stars.find(
+                (s) => s.ownedByPlayerId?.toString() === p1._id.toString(),
+            )!;
+            enemyStar.location = { x: 4.5 * ly, y: 0 };
+
+            // s0 (already gated) <-> s1 is 2.4 LY (120u -> 8t normal vs 3t warped, 5t saved).
+            // s2 is a 2-hop ungated detour (s0->s2->s1 = 10t).
+            // s4 is isolated far away with high industry & cheap gate cost (old greedy heuristic would pick s4!).
+            s0.location = { x: 0, y: 0 };
+            s0.warpGate = true;
+            s1.location = { x: 2.4 * ly, y: 0 };
+            s1.infrastructure.industry = 4;
+            s1.naturalResources = { economy: 40, industry: 40, science: 40 };
+            s2.location = { x: 1.2 * ly, y: 0.8 * ly };
+            s2.naturalResources = { economy: 10, industry: 10, science: 10 };
+            s3.location = { x: -0.3 * ly, y: 0 }; // 1-tick hop from s0 -> 0 warp savings!
+            s4.location = { x: 40 * ly, y: 40 * ly };
+            s4.infrastructure.industry = 20;
+            s4.naturalResources = { economy: 50, industry: 50, science: 50 };
+
+            // Fund exactly enough for 1 Warp Gate at s1 (not 2) so the choice is forced.
+            const wgCostS1 = (env.tacticalExecutor as any)._warpGateCost(
+                game,
+                s1,
+            ) as number;
+            expect(wgCostS1).toBeGreaterThan(0);
+            p0.credits = wgCostS1 + 10;
+
+            // In-flight carrier headed s3 -> s0 -> s2 -> s1 (dropAll):
+            // once s1 builds a Warp Gate, waypoints[1..] should reroute directly s0 -> s1!
+            const inFlightCar: any = {
+                _id: new mongoose.Types.ObjectId(),
+                ownedByPlayerId: p0._id,
+                name: "InFlightTransit",
+                orbiting: null,
+                isGift: false,
+                ships: 35,
+                specialistId: null,
+                specialistExpireTick: null,
+                specialist: null,
+                location: { x: -0.15 * ly, y: 0 },
+                locationNext: { x: 0, y: 0 },
+                waypoints: [
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        source: s3._id,
+                        destination: s0._id,
+                        action: "nothing",
+                        actionShips: 0,
+                        delayTicks: 0,
+                    },
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        source: s0._id,
+                        destination: s2._id,
+                        action: "nothing",
+                        actionShips: 0,
+                        delayTicks: 0,
+                    },
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        source: s2._id,
+                        destination: s1._id,
+                        action: "dropAll",
+                        actionShips: 0,
+                        delayTicks: 0,
+                    },
+                ],
+                waypointsLooped: false,
+            };
+
+            // Delayed ToT carrier must NOT be rerouted.
+            const delayedCar: any = {
+                _id: new mongoose.Types.ObjectId(),
+                ownedByPlayerId: p0._id,
+                name: "DelayedToT",
+                orbiting: s3._id,
+                isGift: false,
+                ships: 15,
+                specialistId: null,
+                specialistExpireTick: null,
+                specialist: null,
+                location: { ...s3.location },
+                locationNext: { ...s3.location },
+                waypoints: [
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        source: s3._id,
+                        destination: s0._id,
+                        action: "nothing",
+                        actionShips: 0,
+                        delayTicks: 2,
+                    },
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        source: s0._id,
+                        destination: s2._id,
+                        action: "nothing",
+                        actionShips: 0,
+                        delayTicks: 0,
+                    },
+                    {
+                        _id: new mongoose.Types.ObjectId(),
+                        source: s2._id,
+                        destination: s1._id,
+                        action: "dropAll",
+                        actionShips: 0,
+                        delayTicks: 0,
+                    },
+                ],
+                waypointsLooped: false,
+            };
+            game.galaxy.carriers = [inFlightCar, delayedCar];
+
+            await env.tacticalExecutor.executeTick(game, p0, {
+                budgetSplit: [0, 0, 0, 1, 0],
+                attackDesire: new Array(game.galaxy.stars.length).fill(0),
+            });
+
+            // 1. Paired high-traffic star s1 got the Warp Gate; isolated s4 did NOT.
+            expect(s1.warpGate).toBeTrue();
+            expect(s4.warpGate).toBeFalse();
+
+            // 2. In-flight carrier kept locked hop[0] (s3 -> s0) and rerouted tail directly s0 -> s1 (dropAll)!
+            expect(inFlightCar.waypoints.length).toBe(2);
+            expect(inFlightCar.waypoints[0].destination.toString()).toBe(
+                s0._id.toString(),
+            );
+            expect(inFlightCar.waypoints[1].source.toString()).toBe(
+                s0._id.toString(),
+            );
+            expect(inFlightCar.waypoints[1].destination.toString()).toBe(
+                s1._id.toString(),
+            );
+            expect(inFlightCar.waypoints[1].action).toBe("dropAll");
+
+            // 3. Delayed ToT carrier was left untouched.
+            expect(delayedCar.waypoints.length).toBe(3);
+            expect(delayedCar.waypoints[1].destination.toString()).toBe(
+                s2._id.toString(),
+            );
+        });
     });
 
     describe("AdmiralEnv cross-play, fog, recording & lookahead", () => {
@@ -447,9 +624,9 @@ describe("Admiral stack", () => {
                                 truthFrame: true,
                             });
                             expect(obs.frame.owner.length).toBe(200);
-                            expect(obs.ownFacts.upgradeCosts.industry.length).toBe(
-                                200,
-                            );
+                            expect(
+                                obs.ownFacts.upgradeCosts.industry.length,
+                            ).toBe(200);
                             expect(obs.truthFrame).toBeDefined();
                             expect(obs.truthFacts?.playerCredits.length).toBe(
                                 10,
@@ -458,7 +635,9 @@ describe("Admiral stack", () => {
                                 budgetSplit: [0.25, 0.35, 0.25, 0.05, 0.1],
                             });
                         } else {
-                            const obs = await env.observe(seat, { frame: true });
+                            const obs = await env.observe(seat, {
+                                frame: true,
+                            });
                             expect(obs.frame).toBeDefined();
                             await env.act(seat, { explore: true });
                         }
