@@ -75,6 +75,23 @@ describe("Live Diplomatic Admiral stack", () => {
                 "RogueNine",
                 "Player Two",
             ]);
+
+            // Optional `# === END AI ===`: omitting the closing marker parses cleanly through EOF,
+            // and `specialist_reserve` is supported.
+            const noEnd = [
+                "Personal reminder above",
+                "# === AI ===",
+                "mode: autonomous",
+                "cash_reserve: 120",
+                "specialist_reserve: 4",
+            ].join("\n");
+            const parsedNoEnd = parseNotesDirectives(noEnd);
+            expect(parsedNoEnd.ok).toBeTrue();
+            expect(parsedNoEnd.hasBlock).toBeTrue();
+            expect(parsedNoEnd.warnings.length).toBe(0);
+            expect(parsedNoEnd.directives.mode).toBe("autonomous");
+            expect(parsedNoEnd.directives.cashReserve).toBe(120);
+            expect(parsedNoEnd.directives.specialistReserve).toBe(4);
         });
     });
 
@@ -921,6 +938,176 @@ describe("Live Diplomatic Admiral stack", () => {
             if (firstUpgIdx >= 0 && firstWpIdx >= 0) {
                 expect(firstUpgIdx).toBeLessThan(firstWpIdx);
             }
+        });
+
+        it("guards scanning specialists (#8), enforces specialist_reserve with battle-swing dips (#7), and attaches human-readable action names (#1, #5)", async () => {
+            const { engine, executor } = createShadowEngine();
+            engine.seed(58);
+            const game = await engine.createGame(
+                engine.loadSettings("standard"),
+            );
+            game.state.tick = 10;
+            const me = game.galaxy.players[0];
+            const foe = game.galaxy.players[1];
+            const ly = game.constants?.distances?.lightYear || 50;
+            me.credits = 500;
+            me.creditsSpecialists = 3;
+            me.research.scanning.level = 1;
+            me.research.weapons.level = 1;
+            foe.research.weapons.level = 1;
+            game.galaxy.carriers = [];
+
+            const ownStars = game.galaxy.stars.filter(
+                (s) => s.ownedByPlayerId?.toString() === me._id.toString(),
+            );
+            const interiorStar = ownStars[0];
+            const frontStar = ownStars[1];
+            const foeStar = game.galaxy.stars.find(
+                (s) => s.ownedByPlayerId?.toString() === foe._id.toString(),
+            )!;
+            const interiorIdx = game.galaxy.stars.indexOf(interiorStar);
+            const foeIdx = game.galaxy.stars.indexOf(foeStar);
+
+            for (const s of game.galaxy.stars) {
+                s.specialistId = null;
+                s.ships = 1;
+                s.shipsActual = 1;
+                if (s !== interiorStar && s !== frontStar && s !== foeStar) {
+                    s.location = { x: -8000, y: -8000 };
+                }
+            }
+            interiorStar.location = { x: 0, y: 0 };
+            frontStar.location = { x: 10 * ly, y: 0 };
+            foeStar.location = { x: 12.2 * ly, y: 0 };
+
+            const viewAllVisible = {
+                stars: new Uint8Array(game.galaxy.stars.length).fill(1),
+                carriers: new Set<any>(),
+                carrierShips: new Set<any>(),
+            } as any;
+            const dipPolicy = buildDiplomaticPolicy({
+                myPlayerId: me._id.toString(),
+                players: game.galaxy.players,
+                diplomaticStatuses: [
+                    {
+                        playerIdFrom: me._id.toString(),
+                        playerIdTo: foe._id.toString(),
+                        statusFrom: "enemies",
+                        statusTo: "enemies",
+                        actualStatus: "enemies",
+                    } as any,
+                ],
+                attackList: [],
+                neutralBorderPosture: "defend",
+                tick: 10,
+            });
+            const mem = new SeatMemory(game.galaxy.stars.length);
+            mem.update(engine, game, me);
+
+            // Case 1 (#8): Orbital Array (id=1, pure +scanning) on interiorStar reveals 0 hidden stars -> skipped!
+            const planScanSkip = await recordShadowTickActions({
+                engine,
+                executor,
+                shadowGame: game,
+                mySeatIndex: 0,
+                seatMemory: mem,
+                view: viewAllVisible,
+                decision: {
+                    hire: [{ star: interiorIdx, specialist: 1 }],
+                    attackDesire: new Array(game.galaxy.stars.length).fill(0),
+                },
+                researchActions: [],
+                diplomacy: dipPolicy,
+                pinnedCarrierIds: new Set(),
+                cashReserveCredits: 100,
+                scheduledActionCredits: 0,
+                specialistReserveTokens: 0,
+            });
+            expect(
+                planScanSkip.actions.some(
+                    (a) => a.type === "HireStarSpecialist",
+                ),
+            ).toBeFalse();
+
+            // Case 2 (#7): specialistReserveTokens=3 blocks routine Space Dock (id=2, cost 2),
+            // YET allows emergency defensive Orbital Cannon (id=4, +1 defenderBonus, cost 2)
+            // when an inbound foe carrier (28 ships vs 12 defending ships, weapons 1 vs 1:
+            // loses at w2 vs w1 since 12*2=24 < 28, wins with Orbital Cannon at w3 vs w1 since 12*3=36 >= 28!).
+            frontStar.ships = 12;
+            frontStar.shipsActual = 12;
+            const speed = game.settings.specialGalaxy.carrierSpeed;
+            game.galaxy.carriers = [
+                {
+                    _id: new mongoose.Types.ObjectId(),
+                    ownedByPlayerId: foe._id,
+                    name: "FoeRaider",
+                    orbiting: null,
+                    isGift: false,
+                    ships: 28,
+                    specialistId: null,
+                    specialistExpireTick: null,
+                    specialist: null,
+                    location: { x: 10 * ly + speed * 1.5, y: 0 },
+                    locationNext: { x: 10 * ly + speed * 0.5, y: 0 },
+                    waypoints: [
+                        {
+                            _id: new mongoose.Types.ObjectId(),
+                            source: foeStar._id,
+                            destination: frontStar._id,
+                            action: "nothing",
+                            actionShips: 0,
+                            delayTicks: 0,
+                        },
+                    ],
+                    waypointsLooped: false,
+                } as any,
+            ];
+            viewAllVisible.stars[foeIdx] = 1;
+            viewAllVisible.carriers.add(game.galaxy.carriers[0]);
+            viewAllVisible.carrierShips.add(game.galaxy.carriers[0]);
+            mem.update(engine, game, me);
+
+            const planReserve = await recordShadowTickActions({
+                engine,
+                executor,
+                shadowGame: game,
+                mySeatIndex: 0,
+                seatMemory: mem,
+                view: viewAllVisible,
+                decision: {
+                    hire: [{ star: interiorIdx, specialist: 2 }],
+                    attackDesire: new Array(game.galaxy.stars.length).fill(0),
+                },
+                researchActions: [],
+                diplomacy: dipPolicy,
+                pinnedCarrierIds: new Set(),
+                cashReserveCredits: 100,
+                scheduledActionCredits: 0,
+                specialistReserveTokens: 3,
+                allowEmergencySpecialistDip: true,
+            });
+
+            expect(
+                planReserve.actions.some(
+                    (a) =>
+                        a.type === "HireStarSpecialist" &&
+                        a.starId === interiorStar._id.toString(),
+                ),
+            ).toBeFalse();
+
+            const defHire = planReserve.actions.find(
+                (a) =>
+                    a.type === "HireStarSpecialist" &&
+                    a.starId === frontStar._id.toString(),
+            ) as any;
+            expect(defHire).toBeDefined();
+            expect(defHire.specialistName).toBeTruthy();
+            expect(defHire.starName).toBe(frontStar.name);
+            expect(
+                planReserve.alerts.some(
+                    (a) => a.code === "EMERGENCY_SPECIALIST_DIP",
+                ),
+            ).toBeTrue();
         });
     });
 

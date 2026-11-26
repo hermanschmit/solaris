@@ -80,6 +80,8 @@ export async function recordShadowTickActions(params: {
     cashReserveCredits: number;
     scheduledActionCredits: number;
     allowEmergencyDefenseReserveDip?: boolean;
+    specialistReserveTokens?: number;
+    allowEmergencySpecialistDip?: boolean;
     bannedStarSpecialists?: ReadonlySet<number>;
 }): Promise<ShadowPlanOutput> {
     const {
@@ -98,6 +100,11 @@ export async function recordShadowTickActions(params: {
     const alerts: LiveAlert[] = [];
 
     const emitAlert = (a: LiveAlert) => alerts.push(a);
+
+    const starNameById = new Map<string, string>();
+    for (const s of shadowGame.galaxy.stars) {
+        starNameById.set(s._id.toString(), s.name);
+    }
 
     // Hard-disable autonomous diplomacy & mask `attackDesire` on ALLIED / PROTECTED stars.
     const safeDecision: AdmiralDecision = structuredClone(
@@ -153,6 +160,7 @@ export async function recordShadowTickActions(params: {
             industry: number;
             science: number;
             warpGate: boolean;
+            specialistId: number | null;
             ships: number;
             name: string;
         }
@@ -164,6 +172,8 @@ export async function recordShadowTickActions(params: {
             industry: Number(s.infrastructure?.industry ?? 0),
             science: Number(s.infrastructure?.science ?? 0),
             warpGate: Boolean(s.warpGate),
+            specialistId:
+                s.specialistId != null ? Number(s.specialistId) : null,
             ships: Math.floor(s.shipsActual ?? s.ships ?? 0),
             name: s.name,
         });
@@ -190,8 +200,13 @@ export async function recordShadowTickActions(params: {
         });
     }
 
-    // Stage 2a: Star Specialist hires (validated against bans & specialist budget).
+    // Stage 2a: Star Specialist hires (validated against bans, visibility value & specialist reserve).
     const starHireActions: LiveAction[] = [];
+    const hiredStarIds = new Set<string>();
+    const specReserve = Math.max(
+        0,
+        Math.floor(params.specialistReserveTokens ?? 0),
+    );
     for (const { star, specialist } of safeDecision.hire ?? []) {
         const target = shadowGame.galaxy.stars[star];
         if (!target || target.ownedByPlayerId?.toString() !== myId) continue;
@@ -204,21 +219,70 @@ export async function recordShadowTickActions(params: {
         ) {
             continue;
         }
-        // If specialist currency is `credits`, guard `cashReserveCredits + scheduledActionCredits`!
+        const specObj =
+            engine.container.specialistService.getByIdStar(specialist);
+        if (!specObj) continue;
+
+        // Logical guard (#8): skip pure `+scanning` star specialists (e.g., Orbital Array)
+        // unless the boosted scanning range actually reveals >= 1 currently hidden non-own star.
+        const locMods = (specObj.modifiers?.local ?? {}) as Record<
+            string,
+            number
+        >;
+        const spMods = (specObj.modifiers?.special ?? {}) as Record<
+            string,
+            any
+        >;
+        const scanBonus = Number(locMods.scanning ?? 0);
+        const hasNonScanBenefit =
+            Object.entries(locMods).some(
+                ([k, v]) => k !== "scanning" && Number(v ?? 0) > 0,
+            ) ||
+            Object.values(spMods).some(
+                (v) =>
+                    (typeof v === "number" && v > 0) ||
+                    (typeof v === "boolean" && v),
+            );
+        if (scanBonus > 0 && !hasNonScanBenefit) {
+            const curScanLvl = Number(player.research?.scanning?.level ?? 1);
+            const boostedDist =
+                engine.container.distanceService.getScanningDistance(
+                    shadowGame,
+                    curScanLvl + scanBonus,
+                );
+            let revealsNewStar = false;
+            for (let j = 0; j < S; j++) {
+                if (view.stars[j] !== 0) continue; // Already visible!
+                const other = shadowGame.galaxy.stars[j];
+                if (other.ownedByPlayerId?.toString() === myId) continue;
+                const d = Math.hypot(
+                    other.location.x - target.location.x,
+                    other.location.y - target.location.y,
+                );
+                if (d <= boostedDist) {
+                    revealsNewStar = true;
+                    break;
+                }
+            }
+            if (!revealsNewStar) continue;
+        }
+
+        // Guard specialist reserve (`specialistReserveTokens` for tokens, `cashReserve` for credits).
         const specCurrency =
             shadowGame.settings.specialGalaxy.specialistsCurrency;
-        if (specCurrency === "credits") {
-            const specObj =
-                engine.container.specialistService.getByIdStar(specialist);
-            const cost = specObj
-                ? engine.container.specialistService.getSpecialistActualCost(
-                      shadowGame,
-                      specObj,
-                  ).credits
-                : Infinity;
+        const specCost =
+            engine.container.specialistService.getSpecialistActualCost(
+                shadowGame,
+                specObj,
+            )[specCurrency];
+        if (specCurrency === "creditsSpecialists") {
+            if ((player.creditsSpecialists ?? 0) - specCost < specReserve) {
+                continue;
+            }
+        } else if (specCurrency === "credits") {
             const minKeep =
                 params.cashReserveCredits + params.scheduledActionCredits;
-            if ((player.credits ?? 0) - cost < minKeep) continue;
+            if ((player.credits ?? 0) - specCost < minKeep) continue;
         }
         try {
             await engine.container.specialistHireService.hireStarSpecialist(
@@ -228,11 +292,13 @@ export async function recordShadowTickActions(params: {
                 specialist,
                 engine.container.statisticsService,
             );
+            hiredStarIds.add(target._id.toString());
             starHireActions.push({
                 type: "HireStarSpecialist",
                 starId: target._id.toString(),
                 starName: target.name,
                 specialistId: specialist,
+                specialistName: specObj.name,
             });
         } catch (e: any) {
             if (!(e instanceof ValidationError)) throw e;
@@ -254,6 +320,8 @@ export async function recordShadowTickActions(params: {
         scheduledActionCredits: params.scheduledActionCredits,
         allowEmergencyDefenseReserveDip:
             params.allowEmergencyDefenseReserveDip ?? true,
+        specialistReserveTokens: specReserve,
+        allowEmergencySpecialistDip: params.allowEmergencySpecialistDip ?? true,
         onAlert: (ev) => {
             if (ev.kind === "surprise_attack") {
                 emitAlert({
@@ -270,6 +338,15 @@ export async function recordShadowTickActions(params: {
                     tick,
                     severity: "warn",
                     code: "EMERGENCY_RESERVE_DIP",
+                    message: ev.message,
+                    details: ev,
+                });
+            } else if (ev.kind === "emergency_specialist_dip") {
+                emitAlert({
+                    timestamp: new Date().toISOString(),
+                    tick,
+                    severity: "warn",
+                    code: "EMERGENCY_SPECIALIST_DIP",
                     message: ev.message,
                     details: ev,
                 });
@@ -293,13 +370,30 @@ export async function recordShadowTickActions(params: {
         restoreFog();
     }
 
-    // Stage 2b: Diff infrastructure upgrades & warp gates on own stars.
+    // Stage 2b: Diff infrastructure upgrades, warp gates, and emergency star specialists.
     const infraActions: LiveAction[] = [];
     const infraOrder: InfrastructureType[] = ["science", "industry", "economy"];
     for (const s of shadowGame.galaxy.stars) {
         const sid = s._id.toString();
         const before = beforeStars.get(sid);
         if (!before) continue;
+        const afterStarSpec =
+            s.specialistId != null ? Number(s.specialistId) : null;
+        if (
+            afterStarSpec != null &&
+            afterStarSpec !== before.specialistId &&
+            !hiredStarIds.has(sid)
+        ) {
+            const specObj =
+                engine.container.specialistService.getByIdStar(afterStarSpec);
+            starHireActions.push({
+                type: "HireStarSpecialist",
+                starId: sid,
+                starName: s.name,
+                specialistId: afterStarSpec,
+                specialistName: specObj?.name,
+            });
+        }
         for (const infType of infraOrder) {
             const afterVal = Number(s.infrastructure?.[infType] ?? 0);
             const delta = afterVal - before[infType];
@@ -387,7 +481,9 @@ export async function recordShadowTickActions(params: {
             unloadTransfers.push({
                 type: "TransferShips",
                 carrierId: cid,
+                carrierName: c.name,
                 starId,
+                starName: starBefore.name,
                 carrierShips: afterShips,
                 starShips: runningStarShips,
             });
@@ -417,7 +513,9 @@ export async function recordShadowTickActions(params: {
             loadTransfers.push({
                 type: "TransferShips",
                 carrierId: cid,
+                carrierName: c.name,
                 starId,
+                starName: starBefore.name,
                 carrierShips: afterShips,
                 starShips: runningStarShips,
             });
@@ -434,21 +532,30 @@ export async function recordShadowTickActions(params: {
         const afterSpec =
             c.specialistId != null ? Number(c.specialistId) : null;
         if (afterSpec != null && afterSpec !== (before?.specialistId ?? null)) {
+            const specObj =
+                engine.container.specialistService.getByIdCarrier(afterSpec);
             carrierHireActions.push({
                 type: "HireCarrierSpecialist",
                 carrierId: cid,
+                carrierName: c.name,
                 specialistId: afterSpec,
+                specialistName: specObj?.name,
             });
         }
 
         const wps = normalizeWaypoints(c.waypoints);
+        const destNames = wps.map(
+            (w) => starNameById.get(w.destination) ?? w.destination,
+        );
         const afterHash = hashWaypoints(wps);
         if (!before) {
             if (wps.length > 0) {
                 saveWaypointActions.push({
                     type: "SaveWaypoints",
                     carrierId: cid,
+                    carrierName: c.name,
                     waypoints: wps,
+                    destinationNames: destNames,
                     looped: Boolean(c.waypointsLooped),
                     isDefense: wps[0]?.action === "dropAll",
                 });
@@ -457,7 +564,9 @@ export async function recordShadowTickActions(params: {
             saveWaypointActions.push({
                 type: "SaveWaypoints",
                 carrierId: cid,
+                carrierName: c.name,
                 waypoints: wps,
+                destinationNames: destNames,
                 looped: Boolean(c.waypointsLooped),
                 isDefense: wps[0]?.action === "dropAll",
             });
