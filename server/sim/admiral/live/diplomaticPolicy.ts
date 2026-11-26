@@ -119,7 +119,7 @@ export function buildDiplomaticPolicy(params: {
                     tick: params.tick,
                     severity: "warn",
                     code: "ALLY_IN_ATTACK_IGNORED",
-                    message: `Ignored private 'attack' override for formal ally '${alias}' (${pid}). Break alliance in the GUI first if you intend war.`,
+                    message: `Ignored private 'attack' override for formal ally '${alias}'. Break alliance in the GUI first if you intend war.`,
                     details: { playerId: pid, alias },
                 });
             }
@@ -252,7 +252,9 @@ export function buildPeaceCancellationActions(params: {
                 actions.push({
                     type: "SaveWaypoints",
                     carrierId: cid,
+                    carrierName: c.name,
                     waypoints: [],
+                    destinationNames: [],
                     looped: false,
                     reason: "peace_cancel_orbiting",
                     isDefense: true,
@@ -302,7 +304,11 @@ export function buildPeaceCancellationActions(params: {
                 actions.push({
                     type: "SaveWaypoints",
                     carrierId: cid,
+                    carrierName: c.name,
                     waypoints: [keptWp0],
+                    destinationNames: [
+                        firstChk.star?.name ?? wp0.destination.toString(),
+                    ],
                     looped: false,
                     reason: "peace_truncate_inflight",
                     isDefense: true,
@@ -359,7 +365,11 @@ export function buildPeaceCancellationActions(params: {
             actions.push({
                 type: "SaveWaypoints",
                 carrierId: cid,
+                carrierName: c.name,
                 waypoints: truncated,
+                destinationNames: truncated.map(
+                    (w) => starById.get(w.destination)?.name ?? w.destination,
+                ),
                 looped: false,
                 reason: "peace_truncate_queued_hops",
                 isDefense: true,

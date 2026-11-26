@@ -192,8 +192,9 @@ async function main() {
     process.on("SIGTERM", shutdown);
 
     const info = await daemon.initialize();
+    const gameLabel = info.gameName ? `'${info.gameName}'` : `game ${gameId}`;
     console.log(
-        `Initialized LiveAdmiralDaemon as '${info.alias}' (${info.playerId}) on game ${gameId} at tick ${info.tick} [mode=${mode}, rps=${cfg.maxRequestsPerSecond}, reserve=${cfg.cashReserveCredits}cr].`,
+        `Initialized LiveAdmiralDaemon as '${info.alias}' on ${gameLabel} at tick ${info.tick} [mode=${mode}, rps=${cfg.maxRequestsPerSecond}, reserve=${cfg.cashReserveCredits}cr, specReserve=${cfg.specialistReserveTokens}].`,
     );
 
     if (args.once) {

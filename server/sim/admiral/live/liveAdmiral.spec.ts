@@ -166,9 +166,12 @@ describe("Live Diplomatic Admiral stack", () => {
 
             expect(policy.getTier("p1")).toBe("ALLIED");
             expect(policy.isHostile("p1")).toBeFalse();
-            expect(
-                alerts.some((a) => a.code === "ALLY_IN_ATTACK_IGNORED"),
-            ).toBeTrue();
+            const allyAlert = alerts.find(
+                (a) => a.code === "ALLY_IN_ATTACK_IGNORED",
+            );
+            expect(allyAlert).toBeDefined();
+            expect(allyAlert!.message).toContain("'AllyOne'");
+            expect(allyAlert!.message).not.toContain("(p1)");
 
             // Pending alliance offer (`statusTo === "allies"`, `actualStatus === "neutral"`)
             expect(policy.getTier("p2")).toBe("PROTECTED");
@@ -283,14 +286,18 @@ describe("Live Diplomatic Admiral stack", () => {
                 (a) => a.type === "SaveWaypoints" && a.carrierId === "c_orbit",
             ) as any;
             expect(orbitAct).toBeDefined();
+            expect(orbitAct.carrierName).toBe("Alpha I");
             expect(orbitAct.waypoints).toEqual([]);
+            expect(orbitAct.destinationNames).toEqual([]);
 
             const flightAct = actions.find(
                 (a) => a.type === "SaveWaypoints" && a.carrierId === "c_flight",
             ) as any;
             expect(flightAct).toBeDefined();
+            expect(flightAct.carrierName).toBe("Alpha II");
             expect(flightAct.waypoints.length).toBe(1);
             expect(flightAct.waypoints[0].destination).toBe("s1");
+            expect(flightAct.destinationNames).toEqual(["BetaCap"]);
 
             const urgent = alerts.find((a) => a.code === "UNRECALLABLE_FLEET");
             expect(urgent).toBeDefined();

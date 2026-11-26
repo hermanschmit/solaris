@@ -140,6 +140,7 @@ export class LiveAdmiralDaemon {
     async initialize(): Promise<{
         playerId: string;
         alias: string;
+        gameName?: string;
         tick: number;
     }> {
         await this.client.login();
@@ -262,6 +263,9 @@ export class LiveAdmiralDaemon {
         return {
             playerId,
             alias: me.alias,
+            gameName: galaxy?.settings?.general?.name
+                ? String(galaxy.settings.general.name)
+                : undefined,
             tick: Number(galaxy.state.tick ?? 0),
         };
     }
