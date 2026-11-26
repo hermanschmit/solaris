@@ -1,5 +1,6 @@
 import { DiplomaticStatus } from "@solaris/common";
 import { TacticalDiplomacyHooks } from "../tacticalExecutor";
+import { parseAttackTargetSpec } from "./notesParser";
 import {
     DiplomaticTier,
     LiveAction,
@@ -16,6 +17,7 @@ export interface DiplomaticPlayerEntry {
     actualStatus: "allies" | "neutral" | "enemies";
     tier: DiplomaticTier;
     covertAttack: boolean;
+    attackStartTick: number | null;
 }
 
 export interface DiplomaticPolicy {
@@ -27,13 +29,14 @@ export interface DiplomaticPolicy {
     isAllied: (playerId: string) => boolean;
     isProtected: (playerId: string) => boolean;
     isHostile: (playerId: string) => boolean;
+    getAttackStartTick: (playerId: string) => number | null;
     toExecutorHooks: () => TacticalDiplomacyHooks;
 }
 
 /**
  * Resolves the 3-tier diplomatic posture (`ALLIED` / `PROTECTED` / `HOSTILE`)
  * from Solaris GUI diplomacy (`GET /api/game/:gameId/diplomacy`) plus optional
- * private `attack:` overrides:
+ * private `attack:` overrides (including scheduled `PlayerAlias@<tick>`):
  *
  * - `ALLIED`: `actualStatus === "allies"` — ALWAYS wins; listing a formal ally
  *   in `attack:` is ignored with an explicit warning alert.
@@ -59,10 +62,22 @@ export function buildDiplomaticPolicy(params: {
     }
 
     const me = params.players.find((p) => p._id.toString() === myId);
-    const attackTargetsRaw = (params.attackList ?? [])
-        .map((s) => s.trim())
-        .filter(Boolean);
-    const attackLower = new Set(attackTargetsRaw.map((s) => s.toLowerCase()));
+    const attackScheduleByKey = new Map<string, number | null>();
+    for (const raw of params.attackList ?? []) {
+        const spec = parseAttackTargetSpec(raw);
+        if (!spec) continue;
+        const key = spec.target.toLowerCase();
+        if (!attackScheduleByKey.has(key)) {
+            attackScheduleByKey.set(key, spec.startTick);
+        } else {
+            const prev = attackScheduleByKey.get(key)!;
+            if (prev === null || spec.startTick === null) {
+                attackScheduleByKey.set(key, null);
+            } else {
+                attackScheduleByKey.set(key, Math.min(prev, spec.startTick));
+            }
+        }
+    }
 
     const entries = new Map<string, DiplomaticPlayerEntry>();
     const tiersBySeatIndex: DiplomaticTier[] = [];
@@ -80,6 +95,7 @@ export function buildDiplomaticPolicy(params: {
                 actualStatus: "allies",
                 tier: "ALLIED",
                 covertAttack: false,
+                attackStartTick: null,
             });
             tiersBySeatIndex.push("ALLIED");
             continue;
@@ -104,12 +120,26 @@ export function buildDiplomaticPolicy(params: {
                   ? "allies"
                   : "neutral");
 
-        const matchedInAttack =
-            attackLower.has(pid.toLowerCase()) ||
-            attackLower.has(alias.trim().toLowerCase());
+        const pidKey = pid.toLowerCase();
+        const aliasKey = alias.trim().toLowerCase();
+        const matchedByPid = attackScheduleByKey.has(pidKey);
+        const matchedByAlias = attackScheduleByKey.has(aliasKey);
+        const matchedInAttack = matchedByPid || matchedByAlias;
+        let scheduledStartTick: number | null = null;
+        if (matchedByPid && matchedByAlias) {
+            const t1 = attackScheduleByKey.get(pidKey)!;
+            const t2 = attackScheduleByKey.get(aliasKey)!;
+            scheduledStartTick =
+                t1 === null || t2 === null ? null : Math.min(t1, t2);
+        } else if (matchedByPid) {
+            scheduledStartTick = attackScheduleByKey.get(pidKey)!;
+        } else if (matchedByAlias) {
+            scheduledStartTick = attackScheduleByKey.get(aliasKey)!;
+        }
 
         let tier: DiplomaticTier;
         let covertAttack = false;
+        let attackStartTick: number | null = null;
 
         if (actualStatus === "allies") {
             tier = "ALLIED";
@@ -119,7 +149,7 @@ export function buildDiplomaticPolicy(params: {
                     tick: params.tick,
                     severity: "warn",
                     code: "ALLY_IN_ATTACK_IGNORED",
-                    message: `Ignored private 'attack' override for formal ally '${alias}' (${pid}). Break alliance in the GUI first if you intend war.`,
+                    message: `Ignored private 'attack' override for formal ally '${alias}'. Break alliance in the GUI first if you intend war.`,
                     details: { playerId: pid, alias },
                 });
             }
@@ -131,6 +161,7 @@ export function buildDiplomaticPolicy(params: {
         } else if (matchedInAttack) {
             tier = "HOSTILE";
             covertAttack = true;
+            attackStartTick = scheduledStartTick;
         } else {
             tier = "PROTECTED";
         }
@@ -143,6 +174,7 @@ export function buildDiplomaticPolicy(params: {
             actualStatus,
             tier,
             covertAttack,
+            attackStartTick,
         });
         tiersBySeatIndex.push(tier);
     }
@@ -155,6 +187,8 @@ export function buildDiplomaticPolicy(params: {
     const isAllied = (playerId: string) => getTier(playerId) === "ALLIED";
     const isProtected = (playerId: string) => getTier(playerId) === "PROTECTED";
     const isHostile = (playerId: string) => getTier(playerId) === "HOSTILE";
+    const getAttackStartTick = (playerId: string): number | null =>
+        entries.get(playerId)?.attackStartTick ?? null;
 
     return {
         myPlayerId: myId,
@@ -165,10 +199,12 @@ export function buildDiplomaticPolicy(params: {
         isAllied,
         isProtected,
         isHostile,
+        getAttackStartTick,
         toExecutorHooks: () => ({
             isHostile,
             isAllied,
             isProtected,
+            getAttackStartTick,
             neutralBorderPosture,
             alliedBorderPosture: "open",
             allowAlliedStarTransit: false,

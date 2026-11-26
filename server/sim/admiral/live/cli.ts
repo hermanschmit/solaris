@@ -103,7 +103,7 @@ async function main() {
                 "  --cash-reserve <n>          Protected credit reserve for manual GUI trades (default: 100)",
                 "  --specialist-reserve <n>    Protected specialist tokens for human/battle-swing use (default: 0)",
                 "  --neutral-border <m>        defend | open (default: defend)",
-                "  --attack <list>             Comma-separated covert neutral target aliases/IDs",
+                "  --attack <list>             Comma-separated covert targets (e.g. 'Alias' or 'Alias@120')",
                 "  --expect-tech <list>        Comma-separated incoming promised techs to skip researching",
                 "  --rps <n>                   Max requests/second (default: 3; use 2 for Two-Hybrid Docker)",
                 "  --grace-ticks <n>           Idle grace ticks for human-created carriers (default: 2)",

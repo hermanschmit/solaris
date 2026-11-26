@@ -1300,4 +1300,227 @@ describe("Live Diplomatic Admiral stack", () => {
             }
         }, 30_000);
     });
+
+    describe("Scheduled Assaults (attack: [Target@tick])", () => {
+        it("parses Target@tick in Notes, rejects invalid @tick syntax, and enforces Invariant 1 for allies", () => {
+            const good = parseNotesDirectives(
+                "# === AI ===\nattack: [EnemyNow, Beta@120]\n# === END AI ===",
+            );
+            expect(good.ok).toBeTrue();
+            expect(good.directives.attack).toEqual(["EnemyNow", "Beta@120"]);
+
+            const bad = parseNotesDirectives(
+                "# === AI ===\nattack: [Beta@abc]\n# === END AI ===",
+                good.directives,
+            );
+            expect(bad.ok).toBeFalse();
+            expect(bad.fallbackUsed).toBeTrue();
+            expect(bad.directives.attack).toEqual(["EnemyNow", "Beta@120"]);
+            expect(
+                bad.warnings.some((w) => w.includes("Invalid attack target")),
+            ).toBeTrue();
+
+            const alerts: LiveAlert[] = [];
+            const policy = buildDiplomaticPolicy({
+                myPlayerId: "p0",
+                players: [
+                    { _id: "p0", alias: "Alpha" },
+                    { _id: "p1", alias: "AllyOne" },
+                    { _id: "p2", alias: "Beta" },
+                ],
+                diplomaticStatuses: [
+                    {
+                        playerIdFrom: "p0",
+                        playerIdTo: "p1",
+                        playerFromAlias: "Alpha",
+                        playerToAlias: "AllyOne",
+                        statusFrom: "allies",
+                        statusTo: "allies",
+                        actualStatus: "allies",
+                    },
+                    {
+                        playerIdFrom: "p0",
+                        playerIdTo: "p2",
+                        playerFromAlias: "Alpha",
+                        playerToAlias: "Beta",
+                        statusFrom: "neutral",
+                        statusTo: "neutral",
+                        actualStatus: "neutral",
+                    },
+                ],
+                attackList: ["AllyOne@120", "Beta@120"],
+                tick: 100,
+                onAlert: (a) => alerts.push(a),
+            });
+
+            expect(policy.getTier("p1")).toBe("ALLIED");
+            expect(policy.getAttackStartTick("p1")).toBeNull();
+            expect(
+                alerts.some((a) => a.code === "ALLY_IN_ATTACK_IGNORED"),
+            ).toBeTrue();
+
+            expect(policy.getTier("p2")).toBe("HOSTILE");
+            expect(policy.getAttackStartTick("p2")).toBe(120);
+        });
+
+        it("stages interior ships to the border before attackStartTick without launching, then launches on time for landing >= attackStartTick", async () => {
+            const { engine, executor } = createShadowEngine();
+            engine.seed(77);
+            const game = await engine.createGame(
+                engine.loadSettings("standard"),
+            );
+            const p0 = game.galaxy.players[0];
+            const p1 = game.galaxy.players[1];
+
+            p0.credits = 500;
+            p0.research.hyperspace.level = 1; // hsDist = 2.5 LY
+            p0.research.weapons.level = 3;
+            game.galaxy.carriers = [];
+
+            const ly = game.constants.distances.lightYear;
+            const stars = game.galaxy.stars;
+            for (const s of stars) {
+                s.ownedByPlayerId = null;
+                s.ships = 0;
+                s.shipsActual = 0;
+                s.location = { x: 9000, y: 9000 };
+                s.infrastructure = { economy: 0, industry: 0, science: 0 };
+            }
+
+            // Interior (0 LY) -> Border (2.0 LY) -> Beta (3.0 LY):
+            // - Interior is 3.0 LY > hsDist (2.5 LY) from Beta, so it is a true interior source.
+            // - Border -> Beta is 1.0 LY (10 ticks at standard speed).
+            const interior = stars[0];
+            const border = stars[1];
+            const betaStar = stars[2];
+
+            interior.ownedByPlayerId = p0._id;
+            interior.ships = 80;
+            interior.shipsActual = 80;
+            interior.location = { x: 0, y: 0 };
+
+            border.ownedByPlayerId = p0._id;
+            border.ships = 20;
+            border.shipsActual = 20;
+            border.location = { x: 2.0 * ly, y: 0 };
+
+            betaStar.ownedByPlayerId = p1._id;
+            betaStar.ships = 10;
+            betaStar.shipsActual = 10;
+            betaStar.location = { x: 3.0 * ly, y: 0 };
+
+            const policy = buildDiplomaticPolicy({
+                myPlayerId: p0._id.toString(),
+                players: game.galaxy.players.map((p) => ({
+                    _id: p._id.toString(),
+                    alias: p.alias,
+                })),
+                diplomaticStatuses: [
+                    {
+                        playerIdFrom: p0._id.toString(),
+                        playerIdTo: p1._id.toString(),
+                        playerFromAlias: p0.alias,
+                        playerToAlias: p1.alias,
+                        statusFrom: "neutral",
+                        statusTo: "neutral",
+                        actualStatus: "neutral",
+                    },
+                ],
+                attackList: [`${p1.alias}@120`],
+                tick: 100,
+            });
+
+            // Phase 1a (tick 100): Interior stages ships to Border; zero premature attacks.
+            game.state.tick = 100;
+            await executor.executeTick(
+                game,
+                p0,
+                {
+                    attackDesire: stars.map(() => 1.0),
+                    attackMargin: 1.5,
+                    budgetSplit: [0, 0, 0, 0, 1],
+                },
+                undefined,
+                undefined,
+                { diplomacy: policy.toExecutorHooks() },
+            );
+
+            const betaId = betaStar._id.toString();
+            const borderId = border._id.toString();
+            const prematureAttacks1 = game.galaxy.carriers.filter((c) =>
+                (c.waypoints ?? []).some(
+                    (w) => w.destination.toString() === betaId,
+                ),
+            );
+            expect(prematureAttacks1.length).toBe(0);
+
+            const stagingCarriers = game.galaxy.carriers.filter((c) =>
+                (c.waypoints ?? []).some(
+                    (w) => w.destination.toString() === borderId,
+                ),
+            );
+            expect(stagingCarriers.length).toBeGreaterThanOrEqual(1);
+
+            const borderDist =
+                engine.container.distanceService.getDistanceBetweenLocations(
+                    border.location,
+                    betaStar.location,
+                );
+            const borderEta = Math.max(
+                1,
+                Math.ceil(
+                    borderDist / game.settings.specialGalaxy.carrierSpeed,
+                ),
+            );
+
+            // Phase 1b: 1 tick BEFORE launch window — even with 80 ships on Border,
+            // launching now would arrive at tick 119 < 120, so it must stay deferred!
+            border.ships = 80;
+            border.shipsActual = 80;
+            p0.credits = 500;
+            game.state.tick = 120 - borderEta - 1;
+            await executor.executeTick(
+                game,
+                p0,
+                {
+                    attackDesire: stars.map(() => 1.0),
+                    attackMargin: 1.5,
+                    budgetSplit: [0, 0, 0, 0, 1],
+                },
+                undefined,
+                undefined,
+                { diplomacy: policy.toExecutorHooks() },
+            );
+
+            const prematureAttacks2 = game.galaxy.carriers.filter((c) =>
+                (c.waypoints ?? []).some(
+                    (w) => w.destination.toString() === betaId,
+                ),
+            );
+            expect(prematureAttacks2.length).toBe(0);
+
+            // Phase 2: exact launch tick (120 - borderEta) -> arrives at tick 120!
+            p0.credits = 500;
+            game.state.tick = 120 - borderEta;
+            await executor.executeTick(
+                game,
+                p0,
+                {
+                    attackDesire: stars.map(() => 1.0),
+                    attackMargin: 1.5,
+                    budgetSplit: [0, 0, 0, 0, 1],
+                },
+                undefined,
+                undefined,
+                { diplomacy: policy.toExecutorHooks() },
+            );
+
+            const launchedAttacks = game.galaxy.carriers.filter((c) =>
+                (c.waypoints ?? []).some(
+                    (w) => w.destination.toString() === betaId,
+                ),
+            );
+            expect(launchedAttacks.length).toBeGreaterThanOrEqual(1);
+        });
+    });
 });
