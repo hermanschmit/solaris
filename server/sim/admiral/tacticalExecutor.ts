@@ -2315,7 +2315,28 @@ export class TacticalExecutor {
     ): Promise<number> {
         const stars = game.galaxy.stars;
         const S = stars.length;
+        const pid = player._id.toString();
         const sds = this.container.starDataService;
+
+        // Precompute other players' owned stars for frontier contestation distance (#3).
+        const otherOwned: number[] = [];
+        for (let i = 0; i < S; i++) {
+            const owner = stars[i].ownedByPlayerId;
+            if (owner && owner.toString() !== pid) {
+                otherOwned.push(i);
+            }
+        }
+
+        // Precompute which unclaimed stars are already 1-hop reachable from own stars (#6).
+        const withinOwnHs = new Uint8Array(S);
+        for (let t = 0; t < S; t++) {
+            for (const u of ownStarIndices) {
+                if (distMatrix[u * S + t] <= hsDist) {
+                    withinOwnHs[t] = 1;
+                    break;
+                }
+            }
+        }
 
         const candidates: { target: number; score: number }[] = [];
         for (let t = 0; t < S; t++) {
@@ -2326,17 +2347,54 @@ export class TacticalExecutor {
             if (desire <= 0) continue;
 
             let bestEta = Infinity;
+            let myMinDist = Infinity;
             for (const u of ownStarIndices) {
                 if (claimGraph.ticks[u * S + t] < bestEta) {
                     bestEta = claimGraph.ticks[u * S + t];
                 }
+                const d = distMatrix[u * S + t];
+                if (d < myMinDist) myMinDist = d;
             }
             if (bestEta > maxAttackTicks) continue;
+
+            let otherMinDist = Infinity;
+            for (const o of otherOwned) {
+                const d = distMatrix[o * S + t];
+                if (d < otherMinDist) otherMinDist = d;
+            }
+
+            // #3: Frontier-first contestation multiplier — stake out contested border
+            // stars near neighbors ahead of safe backline stars nobody else can reach.
+            let frontierMult = 1.0;
+            if (Number.isFinite(otherMinDist) && myMinDist > 0) {
+                const ratio = otherMinDist / myMinDist;
+                if (ratio <= 1.15) frontierMult = 2.4;
+                else if (ratio <= 1.5) frontierMult = 1.75;
+                else if (ratio >= 2.2) frontierMult = 0.72;
+            }
+
+            // #4: Star-quality weighting — prioritize Binary Stars and high natural-resource
+            // stars (stacking with `_starStrategicValue`'s base special-star multipliers).
+            const nr = stars[t].naturalResources ?? {
+                economy: 0,
+                industry: 0,
+                science: 0,
+            };
+            const nrSum =
+                (nr.economy || 0) + (nr.industry || 0) + (nr.science || 0);
+            let qualityMult = 1.0;
+            if (stars[t].isBinaryStar) qualityMult *= 1.45;
+            if (nrSum >= 90) qualityMult *= 1.3;
+            else if (nrSum >= 70) qualityMult *= 1.12;
+
             candidates.push({
                 target: t,
                 score:
-                    (this._starStrategicValue(stars[t]) * desire) /
-                    Math.max(1, bestEta),
+                    (this._starStrategicValue(stars[t]) *
+                        desire *
+                        frontierMult *
+                        qualityMult) /
+                    Math.pow(Math.max(1, bestEta), 0.8),
             });
         }
         candidates.sort((a, b) => b.score - a.score);
@@ -2382,7 +2440,22 @@ export class TacticalExecutor {
             );
             if (!wps.length) continue;
 
-            // Send a small scouting detachment (1 ship, or hop-count for multi-hop chains).
+            // #6: Multi-ship branching expansion carriers — count unclaimed stars
+            // reachable from `target` that aren't already within our existing empire's
+            // hyperspace range so `target` can immediately split a 2nd carrier on arrival.
+            let unclaimedBeyond = 0;
+            for (let k = 0; k < S; k++) {
+                if (k === target || withinOwnHs[k]) continue;
+                if (stars[k].ownedByPlayerId || sds.isDeadStar(stars[k])) {
+                    continue;
+                }
+                if (distMatrix[target * S + k] <= hsDist) {
+                    unclaimedBeyond++;
+                }
+            }
+            const branchShips =
+                unclaimedBeyond >= 2 ? Math.min(3, unclaimedBeyond) : 1;
+
             const surplus = this._availableShipsAt(
                 stars[bestSrc],
                 idleCarriersAt.get(bestSrc),
@@ -2390,7 +2463,7 @@ export class TacticalExecutor {
             );
             const send = Math.min(
                 surplus,
-                Math.min(3, Math.max(1, wps.length)),
+                Math.min(4, Math.max(wps.length, branchShips)),
             );
             const res = await this._launchShips(
                 game,
