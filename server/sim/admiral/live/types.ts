@@ -9,6 +9,7 @@ export type NeutralBorderPosture = "defend" | "open";
 export interface NotesDirectives {
     mode?: OperatingMode;
     cashReserve?: number;
+    specialistReserve?: number;
     attack: string[];
     expectTech: string[];
     neutralBorder?: NeutralBorderPosture;
@@ -54,6 +55,7 @@ export type LiveAction =
           starId: string;
           starName?: string;
           specialistId: number;
+          specialistName?: string;
       }
     | {
           type: "UpgradeStar";
@@ -78,19 +80,25 @@ export type LiveAction =
     | {
           type: "TransferShips";
           carrierId: string;
+          carrierName?: string;
           starId: string;
+          starName?: string;
           carrierShips: number;
           starShips: number;
       }
     | {
           type: "HireCarrierSpecialist";
           carrierId: string;
+          carrierName?: string;
           specialistId: number;
+          specialistName?: string;
       }
     | {
           type: "SaveWaypoints";
           carrierId: string;
+          carrierName?: string;
           waypoints: WaypointSpec[];
+          destinationNames?: string[];
           looped: boolean;
           reason?: string;
           isDefense?: boolean;
@@ -109,6 +117,7 @@ export type LiveAlertCode =
     | "TICK_DEADLINE_GUARD"
     | "AUTH_EXPIRED"
     | "EMERGENCY_RESERVE_DIP"
+    | "EMERGENCY_SPECIALIST_DIP"
     | "CREDITS_RECEIVED"
     | "CHAT_MESSAGE_NOTIFICATION";
 
@@ -222,6 +231,8 @@ export interface LiveDaemonConfig {
     cookie?: string;
     mode: OperatingMode;
     cashReserveCredits: number;
+    specialistReserveTokens?: number;
+    allowEmergencySpecialistDip?: boolean;
     neutralBorderPosture: NeutralBorderPosture;
     attackOverrides?: string[];
     expectTech?: string[];

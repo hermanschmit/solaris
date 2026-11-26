@@ -116,7 +116,7 @@ export function parseNotesDirectives(
         };
     }
 
-    let endIdx = -1;
+    let endIdx = lines.length;
     for (let i = startIdx + 1; i < lines.length; i++) {
         if (END_MARKER.test(lines[i].trim())) {
             endIdx = i;
@@ -125,21 +125,6 @@ export function parseNotesDirectives(
     }
 
     const warnings: string[] = [];
-    if (endIdx < 0) {
-        warnings.push(
-            "Found '# === AI ===' without closing '# === END AI ===' in Notes; keeping previous directives.",
-        );
-        return {
-            ok: false,
-            hasBlock: true,
-            directives: lastValid
-                ? structuredClone(lastValid)
-                : defaultNotesDirectives(),
-            warnings,
-            fallbackUsed: true,
-        };
-    }
-
     const parsed: NotesDirectives = defaultNotesDirectives();
     let fatalError = false;
 
@@ -182,6 +167,19 @@ export function parseNotesDirectives(
                     fatalError = true;
                 } else {
                     parsed.cashReserve = Math.floor(n);
+                }
+                break;
+            }
+            case "specialist_reserve":
+            case "specialistreserve": {
+                const n = Number(unquote(rawVal));
+                if (!Number.isFinite(n) || n < 0) {
+                    warnings.push(
+                        `Invalid specialist_reserve '${rawVal}' in AI Notes (expected non-negative number).`,
+                    );
+                    fatalError = true;
+                } else {
+                    parsed.specialistReserve = Math.floor(n);
                 }
                 break;
             }

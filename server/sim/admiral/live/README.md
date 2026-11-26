@@ -46,10 +46,11 @@ Everything works through standard Solaris GUI controls (Diplomacy, Trade, Resear
 # === AI ===
 mode: autonomous        # paused | advisor | approval | autonomous
 cash_reserve: 150       # credits Admiral must keep unspent for manual tech/credit trades
+specialist_reserve: 3   # specialist tokens reserved for human or battle-swing emergency dips
 attack: [PlayerAliasX]  # covertly treat listed neutral player(s) as HOSTILE without declareEnemy
 expect_tech: [weapons]  # promised by an ally in chat; skip researching locally
 neutral_border: defend  # defend (deterrence garrison) | open (unfortified)
-# === END AI ===
+# === END AI ===        # optional: if omitted, parses through the end of Notes
 ```
 
 ---

@@ -634,6 +634,10 @@ export class LiveAdmiralDaemon {
             directives.mode ?? this.config.mode;
         const cashReserve =
             directives.cashReserve ?? this.config.cashReserveCredits;
+        const specialistReserve =
+            directives.specialistReserve ??
+            this.config.specialistReserveTokens ??
+            0;
         const neutralBorder =
             directives.neutralBorder ?? this.config.neutralBorderPosture;
         const attackList = notesRes.hasBlock
@@ -841,6 +845,9 @@ export class LiveAdmiralDaemon {
             scheduledActionCredits: scheduledReserve,
             allowEmergencyDefenseReserveDip:
                 this.config.allowEmergencyDefenseReserveDip,
+            specialistReserveTokens: specialistReserve,
+            allowEmergencySpecialistDip:
+                this.config.allowEmergencySpecialistDip ?? true,
             bannedStarSpecialists: new Set(allBannedStarSpecs),
         });
         for (const a of recorded.alerts) {

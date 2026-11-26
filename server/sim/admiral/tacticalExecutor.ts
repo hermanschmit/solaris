@@ -80,12 +80,17 @@ interface IncomingWave {
 }
 
 export interface TacticalAlertEvent {
-    kind: "surprise_attack" | "emergency_reserve_dip";
+    kind:
+        | "surprise_attack"
+        | "emergency_reserve_dip"
+        | "emergency_specialist_dip";
     starIndex: number;
     starId: string;
     starName: string;
     attackerPlayerId?: string;
     attackerAlias?: string;
+    specialistId?: number;
+    specialistName?: string;
     ships: number;
     ticksUntil?: number;
     carrierIds?: string[];
@@ -109,6 +114,8 @@ export interface TacticalExecutionOptions {
     cashReserveCredits?: number;
     scheduledActionCredits?: number;
     allowEmergencyDefenseReserveDip?: boolean;
+    specialistReserveTokens?: number;
+    allowEmergencySpecialistDip?: boolean;
     onAlert?: (alert: TacticalAlertEvent) => void;
 }
 
@@ -696,7 +703,7 @@ export class TacticalExecutor {
             for (const wave of incomingWaves) {
                 const defIdx = wave.starIndex;
                 const defStar = wave.star;
-                const neededExtra = this._shipsNeededToHold(
+                let neededExtra = this._shipsNeededToHold(
                     game,
                     player,
                     defStar,
@@ -744,6 +751,26 @@ export class TacticalExecutor {
                             helpers.push({ src: u, eta, avail: free });
                             totalReachable += free;
                         }
+                    }
+                }
+
+                if (
+                    totalReachable < neededExtra * triageThreshold &&
+                    options != null &&
+                    options.allowEmergencySpecialistDip !== false
+                ) {
+                    const swungNeeded =
+                        await this._tryDefensiveStarSpecialistSwing(
+                            game,
+                            player,
+                            defStar,
+                            defIdx,
+                            wave,
+                            committedTargets.get(defIdx) ?? 0,
+                            totalReachable,
+                        );
+                    if (swungNeeded != null) {
+                        neededExtra = swungNeeded;
                     }
                 }
 
@@ -865,6 +892,19 @@ export class TacticalExecutor {
                         }
                     }
                 }
+            }
+
+            if (
+                options != null &&
+                options.allowEmergencySpecialistDip !== false
+            ) {
+                await this._tryOffensiveCarrierSpecialistSwing(
+                    game,
+                    player,
+                    starIndexById,
+                    distMatrix,
+                    hsDist,
+                );
             }
 
             // Shield `protectedCash` (`cashReserveCredits + scheduledActionCredits`)
@@ -2590,6 +2630,7 @@ export class TacticalExecutor {
         game: Game,
         player: Player,
         specId: number,
+        allowReserveDip = false,
     ): boolean {
         if (game.settings.specialGalaxy.specialistCost === "none") return false;
         if (
@@ -2607,7 +2648,343 @@ export class TacticalExecutor {
             game,
             spec,
         )[currency];
-        return ((player as any)[currency] ?? 0) >= cost;
+        const balance = (player as any)[currency] ?? 0;
+        if (balance < cost) return false;
+        if (!allowReserveDip) {
+            if (currency === "creditsSpecialists") {
+                const reserve = Math.max(
+                    0,
+                    Math.floor(
+                        this.activeOptions?.specialistReserveTokens ?? 0,
+                    ),
+                );
+                if (balance - cost < reserve) return false;
+            } else if (currency === "credits") {
+                const reserve = Math.max(
+                    0,
+                    Math.floor(
+                        (this.activeOptions?.cashReserveCredits ?? 0) +
+                            (this.activeOptions?.scheduledActionCredits ?? 0),
+                    ),
+                );
+                if (balance - cost < reserve) return false;
+            }
+        }
+        return true;
+    }
+
+    private async _tryDefensiveStarSpecialistSwing(
+        game: Game,
+        player: Player,
+        defStar: Star,
+        defIdx: number,
+        wave: IncomingWave,
+        committedDefShips: number,
+        totalReachable: number,
+    ): Promise<number | null> {
+        if (game.settings.specialGalaxy.specialistCost === "none") return null;
+        if (defStar.specialistId != null) return null;
+
+        const currency = game.settings.specialGalaxy.specialistsCurrency;
+        const balance = (player as any)[currency] ?? 0;
+        const reserve =
+            currency === "creditsSpecialists"
+                ? Math.max(
+                      0,
+                      Math.floor(
+                          this.activeOptions?.specialistReserveTokens ?? 0,
+                      ),
+                  )
+                : Math.max(
+                      0,
+                      Math.floor(
+                          (this.activeOptions?.cashReserveCredits ?? 0) +
+                              (this.activeOptions?.scheduledActionCredits ?? 0),
+                      ),
+                  );
+
+        const candidates = this.container.specialistService
+            .listStar(game)
+            .filter((spec) => {
+                if (
+                    this.container.specialistBanService.isStarSpecialistBanned(
+                        game,
+                        spec.id,
+                    )
+                ) {
+                    return false;
+                }
+                const loc = (spec.modifiers?.local ?? {}) as any;
+                const sp = (spec.modifiers?.special ?? {}) as any;
+                const hasDefCombat =
+                    (loc.weapons ?? 0) > 0 ||
+                    (loc.defenderBonus ?? 0) > 0 ||
+                    (sp.defenderBonus ?? 0) > 0 ||
+                    (sp.weapons ?? 0) > 0 ||
+                    (sp.deductEnemyWeapons ?? 0) > 0;
+                if (!hasDefCombat) return false;
+                const cost =
+                    this.container.specialistService.getSpecialistActualCost(
+                        game,
+                        spec,
+                    )[currency];
+                return cost > 0 && balance >= cost;
+            })
+            .map((spec) => ({
+                spec,
+                cost: this.container.specialistService.getSpecialistActualCost(
+                    game,
+                    spec,
+                )[currency],
+            }))
+            .sort((a, b) => a.cost - b.cost);
+
+        for (const { spec, cost } of candidates) {
+            const prevSpecId = defStar.specialistId;
+            defStar.specialistId = spec.id;
+            const newNeeded = this._shipsNeededToHold(
+                game,
+                player,
+                defStar,
+                defIdx,
+                wave.ticksUntil,
+                wave.carriers,
+                committedDefShips,
+            );
+            defStar.specialistId = prevSpecId;
+
+            if (newNeeded <= totalReachable) {
+                try {
+                    await this.container.specialistHireService.hireStarSpecialist(
+                        game,
+                        player,
+                        defStar._id,
+                        spec.id,
+                        this.container.statisticsService,
+                    );
+                    const dipped = balance - cost < reserve;
+                    if (dipped) {
+                        this.activeOptions?.onAlert?.({
+                            kind: "emergency_specialist_dip",
+                            starIndex: defIdx,
+                            starId: defStar._id.toString(),
+                            starName: defStar.name,
+                            specialistId: spec.id,
+                            specialistName: spec.name,
+                            ships: defStar.ships ?? 0,
+                            ticksUntil: wave.ticksUntil,
+                            message: `Emergency specialist dip: hired '${spec.name}' on ${defStar.name} (cost ${cost} ${currency === "creditsSpecialists" ? "token(s)" : "cr"}) to swing defense against inbound wave (ETA ${wave.ticksUntil}t).`,
+                        });
+                    }
+                    return newNeeded;
+                } catch (e: any) {
+                    if (!(e instanceof ValidationError)) throw e;
+                }
+            }
+        }
+        return null;
+    }
+
+    private async _tryOffensiveCarrierSpecialistSwing(
+        game: Game,
+        player: Player,
+        starIndexById: Map<string, number>,
+        distMatrix: Float64Array,
+        hsDist: number,
+    ): Promise<void> {
+        if (game.settings.specialGalaxy.specialistCost === "none") return;
+        const stars = game.galaxy.stars;
+        const S = stars.length;
+        const pid = player._id.toString();
+        const currency = game.settings.specialGalaxy.specialistsCurrency;
+        const reserve =
+            currency === "creditsSpecialists"
+                ? Math.max(
+                      0,
+                      Math.floor(
+                          this.activeOptions?.specialistReserveTokens ?? 0,
+                      ),
+                  )
+                : Math.max(
+                      0,
+                      Math.floor(
+                          (this.activeOptions?.cashReserveCredits ?? 0) +
+                              (this.activeOptions?.scheduledActionCredits ?? 0),
+                      ),
+                  );
+
+        const combatSpecs = this.container.specialistService
+            .listCarrier(game)
+            .filter((spec) => {
+                if (
+                    this.container.specialistBanService.isCarrierSpecialistBanned(
+                        game,
+                        spec.id,
+                    )
+                ) {
+                    return false;
+                }
+                const loc = (spec.modifiers?.local ?? {}) as any;
+                const sp = (spec.modifiers?.special ?? {}) as any;
+                return (
+                    (loc.weapons ?? 0) > 0 ||
+                    (sp.weapons ?? 0) > 0 ||
+                    (sp.deductEnemyWeapons ?? 0) > 0 ||
+                    (sp.starCaptureRewardMultiplier ?? 0) > 1
+                );
+            })
+            .map((spec) => ({
+                spec,
+                cost: this.container.specialistService.getSpecialistActualCost(
+                    game,
+                    spec,
+                )[currency],
+            }))
+            .filter((x) => x.cost > 0)
+            .sort((a, b) => a.cost - b.cost);
+
+        if (!combatSpecs.length) return;
+
+        for (const c of game.galaxy.carriers) {
+            if (c.ownedByPlayerId?.toString() !== pid) continue;
+            if (
+                !c.orbiting ||
+                c.specialistId != null ||
+                c.isGift ||
+                this._isCarrierPinned(c)
+            ) {
+                continue;
+            }
+            if (!c.waypoints.length) continue;
+
+            const orbStar =
+                stars[starIndexById.get(c.orbiting.toString()) ?? -1];
+            if (!orbStar || orbStar.ownedByPlayerId?.toString() !== pid) {
+                continue;
+            }
+            const dstIdx = starIndexById.get(
+                c.waypoints[0].destination.toString(),
+            );
+            if (dstIdx === undefined) continue;
+            const dstStar = stars[dstIdx];
+            if (
+                !dstStar.ownedByPlayerId ||
+                !this._isEnemy(game, player, dstStar.ownedByPlayerId)
+            ) {
+                continue;
+            }
+
+            // Simulate current outcome at `dstStar` (including any visible enemy
+            // reinforcement carriers arriving at `dstStar` within our ETA).
+            const eta =
+                this.container.waypointService.calculateWaypointTicksEta(
+                    game,
+                    c,
+                    c.waypoints[0],
+                ) || 1;
+            const arriving = [c];
+            for (const oc of game.galaxy.carriers) {
+                if (oc === c || !oc.waypoints.length) continue;
+                if (
+                    oc.waypoints[0].destination.toString() !==
+                    dstStar._id.toString()
+                ) {
+                    continue;
+                }
+                const oEta =
+                    this.container.waypointService.calculateWaypointTicksEta(
+                        game,
+                        oc,
+                        oc.waypoints[0],
+                    ) || 1;
+                if (oEta <= eta) arriving.push(oc);
+            }
+
+            const myWins = (res: any): boolean => {
+                const defGroup =
+                    this.container.combatService.getDefenderDetailed(res);
+                const myGroup = (res.groups ?? []).find((g: any) =>
+                    (g.players ?? []).some(
+                        (p: any) => p._id?.toString() === pid,
+                    ),
+                );
+                return (
+                    (myGroup?.shipsAfter ?? 0) > 0 &&
+                    (defGroup?.shipsAfter ?? 0) <= 0
+                );
+            };
+
+            const baseRes = this.container.combatService.computeStar(
+                game,
+                dstStar,
+                arriving,
+            );
+            if (!baseRes || myWins(baseRes)) continue; // Already winning!
+
+            const balance = (player as any)[currency] ?? 0;
+            const orbIdx = starIndexById.get(c.orbiting.toString())!;
+            const hopDist = distMatrix[orbIdx * S + dstIdx];
+
+            for (const { spec, cost } of combatSpecs) {
+                if (balance < cost) continue;
+                // Check hyperspace range if specialist reduces carrier hyperspace (e.g., Lieutenant -1 HS).
+                const hsMod = Number(
+                    (spec.modifiers?.local as any)?.hyperspace ?? 0,
+                );
+                if (hsMod < 0) {
+                    const effHsLvl = Math.max(
+                        1,
+                        (player.research.hyperspace.level ?? 1) + hsMod,
+                    );
+                    const effHsDist =
+                        this.container.distanceService.getHyperspaceDistance(
+                            game,
+                            effHsLvl,
+                        );
+                    if (hopDist > effHsDist && hopDist <= hsDist) continue;
+                }
+
+                const prevSpec = c.specialistId;
+                c.specialistId = spec.id;
+                const testRes = this.container.combatService.computeStar(
+                    game,
+                    dstStar,
+                    arriving,
+                );
+                c.specialistId = prevSpec;
+                if (!testRes || !myWins(testRes)) continue;
+
+                if (true) {
+                    try {
+                        await this.container.specialistHireService.hireCarrierSpecialist(
+                            game,
+                            player,
+                            c._id,
+                            spec.id,
+                            this.container.statisticsService,
+                        );
+                        const dipped = balance - cost < reserve;
+                        if (dipped) {
+                            this.activeOptions?.onAlert?.({
+                                kind: "emergency_specialist_dip",
+                                starIndex: dstIdx,
+                                starId: dstStar._id.toString(),
+                                starName: dstStar.name,
+                                specialistId: spec.id,
+                                specialistName: spec.name,
+                                ships: c.ships ?? 0,
+                                ticksUntil: eta,
+                                carrierIds: [c._id.toString()],
+                                message: `Emergency specialist dip: hired '${spec.name}' on carrier '${c.name}' (cost ${cost} ${currency === "creditsSpecialists" ? "token(s)" : "cr"}) to swing attack on ${dstStar.name}.`,
+                            });
+                        }
+                        break;
+                    } catch (e: any) {
+                        if (!(e instanceof ValidationError)) throw e;
+                    }
+                }
+            }
+        }
     }
 
     private _requiredShipsForTarget(

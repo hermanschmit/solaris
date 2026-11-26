@@ -44,7 +44,7 @@ function formatLiveAction(a: LiveAction): string {
         case "SetResearchQueue":
             return `SetResearchQueue [${a.queue.join(", ")}]`;
         case "HireStarSpecialist":
-            return `HireStarSpecialist id=${a.specialistId} @ ${a.starName ?? a.starId}`;
+            return `HireStarSpecialist ${a.specialistName ? `'${a.specialistName}'` : `id=${a.specialistId}`} @ ${a.starName ?? a.starId}`;
         case "UpgradeStar":
             return `UpgradeStar ${a.starName ?? a.starId} (${a.infrastructure}${a.expectedCost != null ? `, ${a.expectedCost}cr` : ""})`;
         case "BuildWarpGate":
@@ -52,12 +52,17 @@ function formatLiveAction(a: LiveAction): string {
         case "BuildCarrier":
             return `BuildCarrier @ ${a.starName ?? a.starId} (${a.ships} ships)`;
         case "TransferShips":
-            return `TransferShips carrier=${a.carrierId} @ ${a.starId} (carrier=${a.carrierShips}, star=${a.starShips})`;
+            return `TransferShips ${a.carrierName ? `'${a.carrierName}'` : `carrier=${a.carrierId}`} @ ${a.starName ?? a.starId} (carrier=${a.carrierShips}, star=${a.starShips})`;
         case "HireCarrierSpecialist":
-            return `HireCarrierSpecialist id=${a.specialistId} on carrier=${a.carrierId}`;
+            return `HireCarrierSpecialist ${a.specialistName ? `'${a.specialistName}'` : `id=${a.specialistId}`} on ${a.carrierName ? `'${a.carrierName}'` : `carrier=${a.carrierId}`}`;
         case "SaveWaypoints": {
-            const hops = a.waypoints.map((w) => w.destination).join(" -> ");
-            return `SaveWaypoints carrier=${a.carrierId} [${hops || "CLEAR"}]${a.reason ? ` (${a.reason})` : ""}`;
+            const hops = (
+                a.destinationNames &&
+                a.destinationNames.length === a.waypoints.length
+                    ? a.destinationNames
+                    : a.waypoints.map((w) => w.destination)
+            ).join(" -> ");
+            return `SaveWaypoints ${a.carrierName ? `'${a.carrierName}'` : `carrier=${a.carrierId}`} [${hops || "CLEAR"}]${a.reason ? ` (${a.reason})` : ""}`;
         }
     }
 }
@@ -90,19 +95,20 @@ async function main() {
                 "Usage: npx tsx sim/admiral/live/cli.ts --game <gameId> [options]",
                 "",
                 "Options:",
-                "  --game <id>             Solaris game ID (required)",
-                "  --api <url>             API base URL (default: $SOLARIS_API or https://api.solaris.games)",
-                "  --mode <mode>           paused | advisor | approval | autonomous (default: advisor)",
-                "  --checkpoint <path>     AdmiralNet checkpoint (.pt); uses iter-0 priors if omitted",
-                "  --state <path>          SQLite (.db) or JSON (.json) persistence file",
-                "  --cash-reserve <n>      Protected credit reserve for manual GUI trades (default: 100)",
-                "  --neutral-border <m>    defend | open (default: defend)",
-                "  --attack <list>         Comma-separated covert neutral target aliases/IDs",
-                "  --expect-tech <list>    Comma-separated incoming promised techs to skip researching",
-                "  --rps <n>               Max requests/second (default: 3; use 2 for Two-Hybrid Docker)",
-                "  --grace-ticks <n>       Idle grace ticks for human-created carriers (default: 2)",
-                "  --search                Enable 1-cycle fog-legal lookahead at cycle start",
-                "  --once                  Run a single synchronization/planning pass and exit",
+                "  --game <id>                 Solaris game ID (required)",
+                "  --api <url>                 API base URL (default: $SOLARIS_API or https://api.solaris.games)",
+                "  --mode <mode>               paused | advisor | approval | autonomous (default: advisor)",
+                "  --checkpoint <path>         AdmiralNet checkpoint (.pt); uses iter-0 priors if omitted",
+                "  --state <path>              SQLite (.db) or JSON (.json) persistence file",
+                "  --cash-reserve <n>          Protected credit reserve for manual GUI trades (default: 100)",
+                "  --specialist-reserve <n>    Protected specialist tokens for human/battle-swing use (default: 0)",
+                "  --neutral-border <m>        defend | open (default: defend)",
+                "  --attack <list>             Comma-separated covert neutral target aliases/IDs",
+                "  --expect-tech <list>        Comma-separated incoming promised techs to skip researching",
+                "  --rps <n>                   Max requests/second (default: 3; use 2 for Two-Hybrid Docker)",
+                "  --grace-ticks <n>           Idle grace ticks for human-created carriers (default: 2)",
+                "  --search                    Enable 1-cycle fog-legal lookahead at cycle start",
+                "  --once                      Run a single synchronization/planning pass and exit",
             ].join("\n"),
         );
         process.exit(args.help ? 0 : 1);
@@ -125,6 +131,9 @@ async function main() {
         cookie: process.env.SOLARIS_COOKIE,
         mode,
         cashReserveCredits: Number(args["cash-reserve"] ?? 100),
+        specialistReserveTokens: Number(args["specialist-reserve"] ?? 0),
+        allowEmergencySpecialistDip:
+            args["no-emergency-specialist-dip"] !== true,
         neutralBorderPosture: String(
             args["neutral-border"] ?? "defend",
         ) as NeutralBorderPosture,
