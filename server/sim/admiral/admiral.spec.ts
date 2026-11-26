@@ -597,6 +597,92 @@ describe("Admiral stack", () => {
                 s2._id.toString(),
             );
         });
+
+        it("prioritizes contested frontier Binary Stars over safe backline stars (#3, #4) and loads multi-ship branching carriers (#6)", async () => {
+            const env = new AdmiralEnv();
+            await env.reset({ admiralSeats: [0], seed: 29, fog: false });
+            const game = env.game;
+            const p0 = game.galaxy.players[0];
+            const p1 = game.galaxy.players[1];
+            const ly = game.constants?.distances?.lightYear || 50;
+
+            game.state.tick = 2; // Cycle 0 (carrierReserve = 0)
+            p0.research.hyperspace.level = 1; // hsDist = 125u (2.5 LY)
+            p0.credits = 25; // Exactly enough for 1 claim carrier!
+            game.galaxy.carriers = [];
+
+            const ownStars = game.galaxy.stars.filter(
+                (s) => s.ownedByPlayerId?.toString() === p0._id.toString(),
+            );
+            const home = ownStars[0];
+            const enemyStar = game.galaxy.stars.find(
+                (s) => s.ownedByPlayerId?.toString() === p1._id.toString(),
+            )!;
+            const unowned = game.galaxy.stars.filter(
+                (s) =>
+                    !s.ownedByPlayerId &&
+                    !env.engine.container.starDataService.isDeadStar(s),
+            );
+            const [backlineStar, frontierBinary, branchA, branchB] = unowned;
+
+            for (const s of game.galaxy.stars) {
+                s.isBinaryStar = false;
+                s.wormHoleToStarId = null;
+                s.warpGate = false;
+                s.naturalResources = { economy: 20, industry: 20, science: 20 };
+                s.ships = 0;
+                s.shipsActual = 0;
+                if (
+                    s !== home &&
+                    s !== enemyStar &&
+                    s !== backlineStar &&
+                    s !== frontierBinary &&
+                    s !== branchA &&
+                    s !== branchB
+                ) {
+                    s.location =
+                        s.ownedByPlayerId?.toString() === p0._id.toString()
+                            ? { x: -6000, y: -6000 }
+                            : { x: 6000, y: 6000 };
+                }
+            }
+
+            // Home at (0, 0) with 10 ships.
+            // Safe backlineStar at (-0.8 LY, 0) -> closer (3t), far from enemy!
+            // Contested frontierBinary at (+2.0 LY, 0) -> further (7t), Binary Star, right next to enemyStar at (+3.8 LY, 0),
+            // and acts as a branching hub reaching branchA (+3.5 LY, +1.0 LY) and branchB (+3.5 LY, -1.0 LY) beyond home's hsDist!
+            home.location = { x: 0, y: 0 };
+            home.ships = 10;
+            home.shipsActual = 10;
+            backlineStar.location = { x: -0.8 * ly, y: 0 };
+            frontierBinary.location = { x: 2.0 * ly, y: 0 };
+            frontierBinary.isBinaryStar = true;
+            frontierBinary.naturalResources = {
+                economy: 35,
+                industry: 35,
+                science: 35,
+            };
+            enemyStar.location = { x: 3.8 * ly, y: 0 };
+            branchA.location = { x: 3.2 * ly, y: 1.0 * ly };
+            branchB.location = { x: 3.2 * ly, y: -1.0 * ly };
+
+            await env.tacticalExecutor.executeTick(game, p0, {
+                autoCarrierSpecialist: false,
+            });
+
+            const launched = game.galaxy.carriers.filter(
+                (c) =>
+                    c.ownedByPlayerId?.toString() === p0._id.toString() &&
+                    c.waypoints.length > 0,
+            );
+            expect(launched.length).toBe(1);
+            // #3 & #4: Claimed contested frontier Binary Star instead of closer backlineStar!
+            expect(launched[0].waypoints[0].destination.toString()).toBe(
+                frontierBinary._id.toString(),
+            );
+            // #6: Loaded >= 2 ships (branching hub reaching branchA & branchB) instead of 1!
+            expect(launched[0].ships).toBeGreaterThanOrEqual(2);
+        });
     });
 
     describe("AdmiralEnv cross-play, fog, recording & lookahead", () => {
