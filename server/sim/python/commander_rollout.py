@@ -81,37 +81,87 @@ def observe(env, agent, seat, truth_frame=False):
     return obs
 
 
+def _load_admiral_runtime():
+    """Lazily import Admiral's Python runtime when Admiral opponents are seated."""
+    admiral_py = str(Path(__file__).resolve().parent.parent / "admiral" / "python")
+    if admiral_py not in sys.path:
+        sys.path.insert(0, admiral_py)
+    from admiral_agent import AdmiralAgent
+    from admiral_env import AdmiralEnv
+    from admiral_rollout import load_admiral_model
+
+    return AdmiralEnv, AdmiralAgent, load_admiral_model
+
+
+def is_admiral_checkpoint(path):
+    """Return True if `path` is an AdmiralNet checkpoint rather than a Commander checkpoint."""
+    if not path:
+        return False
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    return isinstance(saved, dict) and str(saved.get("arch", "")).startswith("admiral")
+
+
 def play(seed, seats=presets.SEATS, belief=None, checkpoint=None, max_ticks=3000, agents=None,
-         opponents=None, record=None, ai_configs=None):
+         opponents=None, record=None, ai_configs=None, admiral_opponents=None):
     """Play a game with the commander being trained in `agents` (or
     `seats` random seats), sampling its decisions, and record them.
     `opponents` maps other seats to frozen commander checkpoints, which
-    play their most likely decisions under fog; the built-in AI plays the
-    rest, tuned per seat by `ai_configs` ({seat: AiConfig overrides}, see
-    personas.py). With `record`, the game is also saved there for
-    belief-model training."""
+    play their most likely decisions under fog; `admiral_opponents` maps
+    other seats to frozen AdmiralNet checkpoints (played via AdmiralEnv +
+    TacticalExecutor); the built-in AI plays the rest, tuned per seat by
+    `ai_configs` ({seat: AiConfig overrides}, see personas.py). With
+    `record`, the game is also saved there for belief-model training."""
     torch.set_num_threads(1)
     rng = np.random.default_rng(seed)
     opponents = opponents or {}
+    admiral_opponents = admiral_opponents or {}
     if agents is None:
         agents = sorted(int(s) for s in rng.choice(presets.PLAYERS, seats, replace=False))
-    played = sorted(list(agents) + list(opponents))
-    with SolarisEnv() as env:
-        result = env.reset(agents=played, settings=presets.NAME, seed=seed,
-                           max_ticks=max_ticks, fog=True, record=record,
-                           ai_configs=presets.builtin_configs(played, ai_configs),
-                           cycle_only=cm.HOLD_ORDERS)
+    commander_seats = sorted(list(agents) + list(opponents))
+    admiral_seats = sorted(list(admiral_opponents))
+    all_played = sorted(commander_seats + admiral_seats)
+
+    if admiral_seats:
+        AdmiralEnv, AdmiralAgent, load_admiral_model = _load_admiral_runtime()
+        env_ctx = AdmiralEnv()
+    else:
+        env_ctx = SolarisEnv()
+
+    with env_ctx as env:
+        if admiral_seats:
+            result = env.reset(admiral_seats=admiral_seats,
+                               commander_seats=commander_seats,
+                               settings=presets.NAME, seed=seed,
+                               max_ticks=max_ticks, fog=True, record=record,
+                               ai_configs=presets.builtin_configs(all_played, ai_configs),
+                               cycle_only=cm.HOLD_ORDERS)
+        else:
+            result = env.reset(agents=commander_seats, settings=presets.NAME, seed=seed,
+                               max_ticks=max_ticks, fog=True, record=record,
+                               ai_configs=presets.builtin_configs(all_played, ai_configs),
+                               cycle_only=cm.HOLD_ORDERS)
         static = bd.Static(env.header())
         model = build_model(len(static.techs), belief, checkpoint)
         agent = cm.CommanderAgent(model, static, sample=True)
         frozen = {path: cm.CommanderAgent(build_model(len(static.techs), None, path), static)
                   for path in set(opponents.values())}
+        admirals = (
+            {path: AdmiralAgent(load_admiral_model(len(static.techs), path), static, sample=False)
+             for path in set(admiral_opponents.values())}
+            if admiral_seats else {}
+        )
         torch.manual_seed(seed)
 
         steps = []
         last_cycle = {}
         while not result["done"]:
             for seat in result["seats"]:
+                if seat in admiral_opponents:
+                    adm = admirals[admiral_opponents[seat]]
+                    obs = env.observe_admiral(seat)
+                    decision, _ = adm.decide(obs, seat, record_step=False)
+                    env.act_admiral(seat, decision)
+                    continue
                 if seat in opponents:
                     member = frozen[opponents[seat]]
                     obs = observe(env, member, seat)
@@ -216,20 +266,47 @@ def play_eval(seed, seats=presets.SEATS, checkpoint=None, max_ticks=3000, sample
         for s, (name, config) in pa.assign(rng, [s for s in others if s not in rivals],
                                            personas).items():
             ai_configs[s], names[s] = config, name
-    played = sorted(agents + rivals) if checkpoint else []
-    with SolarisEnv() as env:
-        result = env.reset(agents=played, settings=presets.NAME, seed=seed,
-                           max_ticks=max_ticks, fog=True,
-                           ai_configs=presets.builtin_configs(played, ai_configs),
-                           cycle_only=cm.HOLD_ORDERS)
+    rival_is_admiral = bool(opponent and is_admiral_checkpoint(opponent))
+    commander_seats = sorted(agents + ([] if rival_is_admiral else rivals)) if checkpoint else []
+    admiral_seats = sorted(rivals) if (checkpoint and rival_is_admiral) else []
+    all_played = sorted(commander_seats + admiral_seats)
+
+    if admiral_seats:
+        AdmiralEnv, AdmiralAgent, load_admiral_model = _load_admiral_runtime()
+        env_ctx = AdmiralEnv()
+    else:
+        env_ctx = SolarisEnv()
+
+    with env_ctx as env:
+        if admiral_seats:
+            result = env.reset(admiral_seats=admiral_seats,
+                               commander_seats=commander_seats,
+                               settings=presets.NAME, seed=seed,
+                               max_ticks=max_ticks, fog=True,
+                               ai_configs=presets.builtin_configs(all_played, ai_configs),
+                               cycle_only=cm.HOLD_ORDERS)
+        else:
+            result = env.reset(agents=commander_seats, settings=presets.NAME, seed=seed,
+                               max_ticks=max_ticks, fog=True,
+                               ai_configs=presets.builtin_configs(all_played, ai_configs),
+                               cycle_only=cm.HOLD_ORDERS)
         if checkpoint:
             static = bd.Static(env.header())
             agent = cm.CommanderAgent(build_model(len(static.techs), None, checkpoint), static,
                                       sample=sample)
-            rival = (cm.CommanderAgent(build_model(len(static.techs), None, opponent), static)
-                     if opponent else None)
+            if rival_is_admiral:
+                rival = AdmiralAgent(load_admiral_model(len(static.techs), opponent), static,
+                                     sample=False)
+            elif opponent:
+                rival = cm.CommanderAgent(build_model(len(static.techs), None, opponent), static)
+            else:
+                rival = None
         while not result["done"]:
             for seat in result["seats"]:
+                if rival_is_admiral and seat in rivals:
+                    obs = env.observe_admiral(seat)
+                    env.act_admiral(seat, rival.decide(obs, seat, record_step=False)[0])
+                    continue
                 who = rival if seat in rivals else agent
                 obs = observe(env, who, seat)
                 env.act(seat, who.decide(obs, seat)[0])
