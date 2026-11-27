@@ -101,6 +101,7 @@ export interface TacticalDiplomacyHooks {
     isHostile: (playerId: string) => boolean;
     isAllied: (playerId: string) => boolean;
     isProtected: (playerId: string) => boolean;
+    getAttackStartTick?: (playerId: string) => number | null;
     neutralBorderPosture?: "defend" | "open";
     alliedBorderPosture?: "open" | "watch";
     allowAlliedStarTransit?: boolean;
@@ -3222,7 +3223,22 @@ export class TacticalExecutor {
 
         targets.sort((a, b) => b.score - a.score);
 
+        const curTick = Number(game.state.tick ?? 0);
+
         for (const { target, effMargin, launchers } of targets) {
+            const targetOwnerId = stars[target].ownedByPlayerId?.toString();
+            const scheduledStartTick =
+                targetOwnerId &&
+                this.activeOptions?.diplomacy?.getAttackStartTick
+                    ? this.activeOptions.diplomacy.getAttackStartTick(
+                          targetOwnerId,
+                      )
+                    : null;
+            const minTicksUntilLanding =
+                scheduledStartTick != null && scheduledStartTick > curTick
+                    ? scheduledStartTick - curTick
+                    : 0;
+
             const availLaunchers: {
                 src: number;
                 eta: number;
@@ -3282,6 +3298,7 @@ export class TacticalExecutor {
             let syncTick = 0;
             let neededAtSync = 0;
             let useSiegeBreaker = false;
+            let deferredForSchedule = false;
 
             const canSiege =
                 decision.autoCarrierSpecialist !== false &&
@@ -3343,6 +3360,16 @@ export class TacticalExecutor {
                 }
 
                 if (cumShips >= req) {
+                    if (
+                        minTicksUntilLanding > 0 &&
+                        tSync < minTicksUntilLanding
+                    ) {
+                        // Border launchers already hold enough ships, but launching now
+                        // would land before `scheduledStartTick` — hold them on the star
+                        // until `curTick + tSync >= scheduledStartTick` for surprise & liquidity.
+                        deferredForSchedule = true;
+                        break;
+                    }
                     chosenK = k;
                     syncTick = tSync;
                     neededAtSync = Math.max(
@@ -3352,6 +3379,10 @@ export class TacticalExecutor {
                     useSiegeBreaker = withSiege;
                     break;
                 }
+            }
+
+            if (deferredForSchedule) {
+                continue;
             }
 
             if (chosenK < 0) {
@@ -3394,7 +3425,12 @@ export class TacticalExecutor {
                         const pTicks = ownGraph.ticks[u * S + b.src];
                         if (!Number.isFinite(pTicks)) continue;
                         const totEta = pTicks + b.eta;
-                        if (totEta > maxAttackTicks || totEta >= bestRearEta) {
+                        if (
+                            totEta > maxAttackTicks ||
+                            totEta >= bestRearEta ||
+                            (minTicksUntilLanding > 0 &&
+                                totEta < minTicksUntilLanding)
+                        ) {
                             continue;
                         }
                         const req = this._requiredShipsForTarget(

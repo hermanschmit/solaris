@@ -17,6 +17,34 @@ const VALID_MODES = new Set<OperatingMode>([
 ]);
 const VALID_TECHS = new Set<string>(RESEARCH_TYPES_NOT_RANDOM);
 
+export interface ParsedAttackTarget {
+    target: string;
+    startTick: number | null;
+}
+
+/**
+ * Parses an `attack:` entry of the form `PlayerAlias` or `PlayerAlias@120`
+ * (absolute target landing tick). Returns `null` if malformed.
+ */
+export function parseAttackTargetSpec(raw: string): ParsedAttackTarget | null {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const atIdx = trimmed.lastIndexOf("@");
+    if (atIdx < 0) {
+        return { target: trimmed, startTick: null };
+    }
+    const target = trimmed.slice(0, atIdx).trim();
+    const tickStr = trimmed.slice(atIdx + 1).trim();
+    if (!target || !/^\d+$/.test(tickStr)) {
+        return null;
+    }
+    const tick = Number(tickStr);
+    if (!Number.isSafeInteger(tick) || tick < 0) {
+        return null;
+    }
+    return { target, startTick: tick };
+}
+
 export const defaultNotesDirectives = (): NotesDirectives => ({
     attack: [],
     expectTech: [],
@@ -187,11 +215,27 @@ export function parseNotesDirectives(
                 const list = parseStringList(rawVal);
                 if (list == null) {
                     warnings.push(
-                        `Invalid attack list '${rawVal}' in AI Notes (expected e.g. '[PlayerAlias]').`,
+                        `Invalid attack list '${rawVal}' in AI Notes (expected e.g. '[PlayerAlias]' or '[PlayerAlias@120]').`,
                     );
                     fatalError = true;
                 } else {
-                    parsed.attack = list;
+                    const normalized: string[] = [];
+                    for (const item of list) {
+                        const spec = parseAttackTargetSpec(item);
+                        if (!spec) {
+                            warnings.push(
+                                `Invalid attack target '${item}' in AI Notes (expected 'PlayerAlias' or 'PlayerAlias@<tick>').`,
+                            );
+                            fatalError = true;
+                        } else {
+                            normalized.push(
+                                spec.startTick != null
+                                    ? `${spec.target}@${spec.startTick}`
+                                    : spec.target,
+                            );
+                        }
+                    }
+                    parsed.attack = normalized;
                 }
                 break;
             }
