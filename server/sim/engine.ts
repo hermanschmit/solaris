@@ -48,21 +48,11 @@ export class SimEngine {
         // The built-in AI sizes each attack by simulating the combat, which
         // is pure arithmetic on a few numbers and is asked the same question
         // many times. Answer it with the same arithmetic on plain numbers
-        // (fastCombat.ts, checked against calculateBasic in the specs), and
-        // remember the answers.
+        // (fastCombat.ts, checked against calculateBasic in the specs).
+        // `defender.ships` is usually fractional, so a string-keyed memo rarely
+        // hits and costs more than the arithmetic itself (#53).
         const combat = this.container.combatService;
-        const calculateBasic = fastCalculateBasic;
-        const answers = new Map<string, any>();
-        combat.calculateBasic = (defender, attacker, toStar, bonus) => {
-            const key = `${defender.ships},${defender.weaponsLevel},${attacker.ships},${attacker.weaponsLevel},${toStar},${bonus}`;
-            let answer = answers.get(key);
-            if (answer === undefined) {
-                if (answers.size > 100_000) answers.clear();
-                answer = calculateBasic(defender, attacker, toStar, bonus);
-                answers.set(key, answer);
-            }
-            return answer;
-        };
+        combat.calculateBasic = fastCalculateBasic;
 
         // Scanning (every fog update, several a tick per seat) builds a k-d
         // tree of all stars each time. Stars only move in orbital games, so
@@ -190,6 +180,18 @@ export class SimEngine {
             Game,
             { index: Map<any, number>; distance: Float64Array }
         >();
+        // Share the O(n^2) numeric distance table across clones of the same
+        // non-orbital galaxy (bounded to avoid unbounded growth across runs).
+        const distanceByGeom = new Map<string, Float64Array>();
+        const geomKey = (game: Game) => {
+            const stars = game.galaxy.stars;
+            const n = stars.length;
+            if (n === 0) return "0";
+            const a = stars[0].location;
+            const b = stars[n - 1].location;
+            const m = stars[n >> 1].location;
+            return `${game._id.toString()}:${n}:${a.x},${a.y}:${m.x},${m.y}:${b.x},${b.y}`;
+        };
         ai._computeStarGraph = (
             starsById,
             game,
@@ -213,14 +215,22 @@ export class SimEngine {
             if (!table) {
                 const stars = game.galaxy.stars;
                 const n = stars.length;
-                const distance = new Float64Array(n * n);
-                for (let i = 0; i < n; i++) {
-                    for (let j = 0; j < n; j++) {
-                        distance[i * n + j] = ai._calculateTravelDistance(
-                            stars[i],
-                            stars[j],
-                        );
+                const key = geomKey(game);
+                let distance = distanceByGeom.get(key);
+                if (!distance || distance.length !== n * n) {
+                    distance = new Float64Array(n * n);
+                    for (let i = 0; i < n; i++) {
+                        for (let j = 0; j < n; j++) {
+                            distance[i * n + j] = ai._calculateTravelDistance(
+                                stars[i],
+                                stars[j],
+                            );
+                        }
                     }
+                    if (distanceByGeom.size >= 64) {
+                        distanceByGeom.clear();
+                    }
+                    distanceByGeom.set(key, distance);
                 }
                 table = {
                     index: new Map(stars.map((s, i) => [s, i])),
@@ -410,28 +420,42 @@ export class SimEngine {
         }
     }
 
+    private _viewAsQueue: Promise<any> = Promise.resolve();
+
     // The JSON a player would get from GET /api/game/:gameId/galaxy, with
     // fog of war applied. Useful for testing the advisor against games where
-    // the full state is known.
+    // the full state is known. Serialized so overlapping async calls do not
+    // clobber `gameService` methods (#54).
     async viewAs(game: Game, userId: DBObjectId): Promise<any> {
-        const c = this.container as any;
-        const service = c.gameGalaxyService;
+        const run = async () => {
+            const c = this.container as any;
+            const service = c.gameGalaxyService;
 
-        const restore = {
-            getGameStateTick: c.gameService.getGameStateTick,
-            getByIdGalaxyLean: c.gameService.getByIdGalaxyLean,
+            const restore = {
+                getGameStateTick: c.gameService.getGameStateTick,
+                getByIdGalaxyLean: c.gameService.getByIdGalaxyLean,
+            };
+
+            c.gameService.getGameStateTick = async () => game.state.tick;
+            c.gameService.getByIdGalaxyLean = async () =>
+                this.fromJSON(this.toJSON(game));
+
+            try {
+                return JSON.parse(
+                    JSON.stringify(
+                        await service.getGalaxy(game._id, userId, null),
+                    ),
+                );
+            } finally {
+                Object.assign(c.gameService, restore);
+            }
         };
 
-        c.gameService.getGameStateTick = async () => game.state.tick;
-        c.gameService.getByIdGalaxyLean = async () =>
-            this.fromJSON(this.toJSON(game));
-
-        try {
-            return JSON.parse(
-                JSON.stringify(await service.getGalaxy(game._id, userId, null)),
-            );
-        } finally {
-            Object.assign(c.gameService, restore);
-        }
+        const result = this._viewAsQueue.then(run, run);
+        this._viewAsQueue = result.then(
+            () => {},
+            () => {},
+        );
+        return result;
     }
 }
