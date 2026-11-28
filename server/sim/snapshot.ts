@@ -6,6 +6,7 @@
 // and their research levels). Each call with a different seed gives one
 // plausible version of the hidden state, so an advisor can average over
 // several of them.
+import mongoose from "mongoose";
 import { Game } from "../services/types/Game";
 import { SimEngine } from "./engine";
 import { Rng, seededRng } from "./random";
@@ -27,9 +28,12 @@ const splitInteger = (total: number, n: number, rng: Rng): number[] => {
 export interface DeterminizeOptions {
     seed?: number;
     // Players other than the viewer are handed to the built-in AI unless
-    // this is false, in which case they keep a placeholder userId and stay
+    // this is false, in which case they keep a unique placeholder userId and stay
     // idle unless something else gives them orders.
     opponentsUseBuiltInAI?: boolean;
+    // Estimate hidden opponent credits, specialist tokens, and research progress
+    // per seed instead of defaulting them to 0 (default: true).
+    estimateHiddenResources?: boolean;
 }
 
 export const determinize = (
@@ -38,11 +42,22 @@ export const determinize = (
     options: DeterminizeOptions = {},
 ): Game => {
     const rng = seededRng(options.seed ?? 1);
+    const estimateHidden = options.estimateHiddenResources !== false;
     const json = JSON.parse(JSON.stringify(snapshot));
     const galaxy = json.galaxy;
 
     const viewer = galaxy.players.find((p: any) => p.userId != null);
     const viewerId = id(viewer?._id);
+
+    // Refresh viewer's wall-clock `lastSeen` and turn-based readiness so
+    // `PlayerAfkService.isAfk` does not mark a saved snapshot's viewer AFK
+    // and defeated on the first simulated tick (#47).
+    if (viewer && !viewer.defeated) {
+        viewer.lastSeen = new Date();
+        viewer.afk = false;
+        viewer.missedTurns = 0;
+        viewer.ready = true;
+    }
 
     // Natural resources of hidden stars: assume the average of the stars we
     // can see.
@@ -67,6 +82,15 @@ export const determinize = (
         star.specialistId ??= null;
         star.specialistExpireTick ??= null;
     }
+
+    const prodTicks = Math.max(
+        1,
+        Number(json.settings?.galaxy?.productionTicks ?? 24),
+    );
+    const curTick = Number(json.state?.tick ?? 0);
+    const cycleFrac = (curTick % prodTicks) / prodTicks;
+    const specCurrency =
+        json.settings?.specialGalaxy?.specialistsCurrency ?? "credits";
 
     for (const player of galaxy.players) {
         const pid = id(player._id);
@@ -127,16 +151,70 @@ export const determinize = (
         });
 
         // Research levels are public; progress and credits are not.
-        for (const tech of Object.keys(player.research ?? {})) {
-            player.research[tech].progress ??= 0;
-        }
+        // Estimate hidden credits & research progress per seed unless disabled (#48).
         player.researchingNow ??= "weapons";
         player.researchQueue ??= ["weapons"];
-        player.credits ??= 0;
-        player.creditsSpecialists ??= 0;
+        for (const tech of Object.keys(player.research ?? {})) {
+            if (player.research[tech].progress == null) {
+                if (estimateHidden && tech === player.researchingNow) {
+                    const lvl = Math.max(
+                        1,
+                        Number(player.research[tech].level ?? 1),
+                    );
+                    const approxCost = lvl * prodTicks;
+                    player.research[tech].progress = Math.floor(
+                        rng() * approxCost,
+                    );
+                } else {
+                    player.research[tech].progress = 0;
+                }
+            }
+        }
+        if (player.credits == null) {
+            if (estimateHidden && !player.defeated) {
+                const totalEco = Math.max(0, Number(stats.totalEconomy ?? 0));
+                const bankingLvl = Math.max(
+                    0,
+                    Number(player.research?.banking?.level ?? 1),
+                );
+                const cycleIncome = totalEco * 10 + bankingLvl * 75;
+                // Sample a realistic fraction of cycle income (higher near cycle end).
+                const frac = 0.15 + 0.7 * (0.5 * cycleFrac + 0.5 * rng());
+                player.credits = Math.round(cycleIncome * frac);
+            } else {
+                player.credits = 0;
+            }
+        }
+        if (player.creditsSpecialists == null) {
+            if (
+                estimateHidden &&
+                !player.defeated &&
+                specCurrency === "creditsSpecialists"
+            ) {
+                const maxTokens = Math.min(
+                    3,
+                    Math.max(0, Math.floor(curTick / (prodTicks * 2))),
+                );
+                player.creditsSpecialists =
+                    maxTokens > 0 ? Math.floor(rng() * (maxTokens + 1)) : 0;
+            } else {
+                player.creditsSpecialists = 0;
+            }
+        }
         player.renownToGive ??= 0;
-        player.userId =
-            options.opponentsUseBuiltInAI === false ? viewer?.userId : null;
+        if (options.opponentsUseBuiltInAI === false) {
+            // Give each idle opponent its own unique placeholder userId so
+            // lookups by userId (e.g. viewAs) never collide with the viewer (#49).
+            player.userId = new mongoose.Types.ObjectId();
+            if (!player.defeated) {
+                player.lastSeen = new Date();
+                player.afk = false;
+                player.missedTurns = 0;
+                player.ready = true;
+            }
+        } else {
+            player.userId = null;
+        }
     }
 
     for (const star of galaxy.stars) {

@@ -189,6 +189,8 @@ export class AgentEnv {
                 if (seat.player.defeated) continue;
 
                 seat.player.lastSeen = new Date();
+                seat.player.missedTurns = 0;
+                seat.player.ready = true;
 
                 if (seat.decision.betray) await this._betray(seat);
                 else if (seat.decision.court) await this._court(seat);
