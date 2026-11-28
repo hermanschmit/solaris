@@ -266,10 +266,35 @@ export class SimEngine {
         };
     }
 
+    // Snapshot of process-global RNG and ObjectId generator state so temporary
+    // rollouts (`lookahead`) can cleanly restore the main game's generator.
+    saveSeedState() {
+        const BsonObjectId = mongoose.mongo.BSON.ObjectId as any;
+        return {
+            random: Math.random,
+            ObjectId: (mongoose.Types as any).ObjectId,
+            bsonGenerate: BsonObjectId.generate,
+            processUnique: BsonObjectId.PROCESS_UNIQUE
+                ? Buffer.from(BsonObjectId.PROCESS_UNIQUE)
+                : BsonObjectId.PROCESS_UNIQUE,
+            index: BsonObjectId.index,
+        };
+    }
+
+    restoreSeedState(state: ReturnType<SimEngine["saveSeedState"]>) {
+        const BsonObjectId = mongoose.mongo.BSON.ObjectId as any;
+        Math.random = state.random;
+        (mongoose.Types as any).ObjectId = state.ObjectId;
+        BsonObjectId.generate = state.bsonGenerate;
+        BsonObjectId.PROCESS_UNIQUE = state.processUnique;
+        BsonObjectId.index = state.index;
+    }
+
     // The server draws all of its randomness (combat ties, research
     // experiments, AI choices, map generation) from Math.random, so seeding
-    // it makes a run reproducible.
-    seed(seed: number) {
+    // it makes a run reproducible. `namespace` (default 0x60) lets lookahead
+    // copies mint ids from a byte range disjoint from the main game's ids.
+    seed(seed: number, namespace = 0x60) {
         Math.random = seededRng(seed);
 
         // Database ids are part of the game: the AI breaks ties and draws
@@ -278,10 +303,11 @@ export class SimEngine {
         // differently each time. Number them from the seed instead, in
         // creation order as before.
         const BsonObjectId = mongoose.mongo.BSON.ObjectId as any;
+        const prefix = ((namespace & 0xff) << 24) >>> 0;
         let count = 0;
         const nextBytes = () => {
             const buffer = Buffer.alloc(12);
-            buffer.writeUInt32BE(0x60000000, 0);
+            buffer.writeUInt32BE(prefix, 0);
             buffer.writeUInt32BE(seed >>> 0, 4);
             buffer.writeUInt32BE(count++, 8);
             return buffer;
@@ -297,12 +323,15 @@ export class SimEngine {
             }
         }
         (mongoose.Types as any).ObjectId = SeededObjectId;
+        // Mongoose schema `_id` defaults call `BsonObjectId.generate()` directly;
+        // patch it so game `_id` and schema-default subdocument ids are also seeded.
+        BsonObjectId.generate = () => nextBytes();
         BsonObjectId.PROCESS_UNIQUE = Buffer.from([
             (seed >>> 24) & 0xff,
             (seed >>> 16) & 0xff,
             (seed >>> 8) & 0xff,
             seed & 0xff,
-            0,
+            namespace & 0xff,
         ]);
         BsonObjectId.index = 0;
     }
@@ -333,6 +362,7 @@ export class SimEngine {
 
         this.container.gameJoinService.assignNonUserPlayersToAI(doc, false);
         this.container.gameJoinService.startGame(doc);
+        (doc as any)._id = new mongoose.Types.ObjectId();
 
         return toLean(doc);
     }
@@ -341,7 +371,11 @@ export class SimEngine {
     // Ids may be strings; they are cast to ObjectIds and schema defaults are
     // filled in.
     fromJSON(json: any): Game {
-        return toLean(new SimGameModel(json));
+        const input =
+            json && json._id == null
+                ? { ...json, _id: new mongoose.Types.ObjectId() }
+                : json;
+        return toLean(new SimGameModel(input));
     }
 
     toJSON(game: Game): any {

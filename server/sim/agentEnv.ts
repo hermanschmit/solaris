@@ -911,12 +911,19 @@ export class AgentEnv {
     ) {
         const seat = this._seat(index);
         const game = this.game;
-        const random = Math.random;
+        const seedState = this.engine.saveSeedState();
         const saved = [...this.seats.values()].map((s) => ({
             seat: s,
             player: s.player,
             decision: s.decision,
             memory: s.memory,
+            hired: s.hired,
+            hiresRefused: s.hiresRefused,
+            courting: s.courting,
+            courtSpent: s.courtSpent,
+            givenUp: new Set(s.givenUp),
+            gifted: s.gifted,
+            alliedTick: s.alliedTick,
         }));
 
         const results: ReturnType<AgentEnv["standings"]>["players"][] = [];
@@ -930,11 +937,24 @@ export class AgentEnv {
                     s.seat.player = byId.get(s.player._id.toString())!;
                     s.seat.memory = s.memory.copy();
                     s.seat.decision = s.decision;
+                    s.seat.hired = s.hired;
+                    s.seat.hiresRefused = s.hiresRefused;
+                    s.seat.courting = s.courting
+                        ? (byId.get(s.courting._id.toString()) ?? null)
+                        : null;
+                    s.seat.courtSpent = s.courtSpent;
+                    s.seat.givenUp = new Set(
+                        [...s.givenUp]
+                            .map((p) => byId.get(p._id.toString()))
+                            .filter((p): p is Player => p != null),
+                    );
+                    s.seat.gifted = s.gifted;
+                    s.seat.alliedTick = s.alliedTick;
                 }
                 seat.decision = { ...seat.decision, orderWeights: plan };
 
                 this.game = copy;
-                this.engine.seed(seed);
+                this.engine.seed(seed, 0x61);
                 const end = Math.min(game.state.tick + ticks, this.maxTicks);
                 while (!copy.state.endDate && copy.state.tick < end) {
                     await this.engine.tick(copy, 1);
@@ -943,11 +963,18 @@ export class AgentEnv {
             }
         } finally {
             this.game = game;
-            Math.random = random;
+            this.engine.restoreSeedState(seedState);
             for (const s of saved) {
                 s.seat.player = s.player;
                 s.seat.decision = s.decision;
                 s.seat.memory = s.memory;
+                s.seat.hired = s.hired;
+                s.seat.hiresRefused = s.hiresRefused;
+                s.seat.courting = s.courting;
+                s.seat.courtSpent = s.courtSpent;
+                s.seat.givenUp = s.givenUp;
+                s.seat.gifted = s.gifted;
+                s.seat.alliedTick = s.alliedTick;
             }
         }
         return results;

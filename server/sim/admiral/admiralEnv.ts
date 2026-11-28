@@ -623,7 +623,7 @@ export class AdmiralEnv extends AgentEnv {
     ) {
         const seat = this._seat(index);
         const origGame = this.game;
-        const origRandom = Math.random;
+        const seedState = this.engine.saveSeedState();
         const origSeats = new Map(this.seats);
         const origAdmiralSet = new Set(this.admiralSeatSet);
         const origAdmiralDecs = new Map(this.admiralDecisions);
@@ -664,6 +664,9 @@ export class AdmiralEnv extends AgentEnv {
                         JSON.parse(JSON.stringify(worldTemplates[wi])),
                     );
                     const copyPlayer = copy.galaxy.players[index];
+                    const byId = new Map(
+                        copy.galaxy.players.map((p) => [p._id.toString(), p]),
+                    );
 
                     // Isolate `this.seats` to ONLY the planning seat during rollout
                     // so every opponent is played by the built-in AI on the determinized state.
@@ -674,9 +677,23 @@ export class AdmiralEnv extends AgentEnv {
                     seat.player = copyPlayer;
                     seat.memory = savedSeatState.memory.copy();
                     seat.decision = {};
+                    seat.hired = savedSeatState.hired;
+                    seat.hiresRefused = savedSeatState.hiresRefused;
+                    seat.courting = savedSeatState.courting
+                        ? (byId.get(savedSeatState.courting._id.toString()) ??
+                          null)
+                        : null;
+                    seat.courtSpent = savedSeatState.courtSpent;
+                    seat.givenUp = new Set(
+                        [...savedSeatState.givenUp]
+                            .map((p) => byId.get(p._id.toString()))
+                            .filter((p): p is Player => p != null),
+                    );
+                    seat.gifted = savedSeatState.gifted;
+                    seat.alliedTick = savedSeatState.alliedTick;
 
                     this.game = copy;
-                    this.engine.seed(seed + wi * 997);
+                    this.engine.seed(seed + wi * 997, 0x61);
 
                     await this.actAdmiral(index, plan);
                     const endTick = Math.min(
@@ -699,7 +716,7 @@ export class AdmiralEnv extends AgentEnv {
             }
         } finally {
             this.game = origGame;
-            Math.random = origRandom;
+            this.engine.restoreSeedState(seedState);
             this.seats = origSeats;
             this.admiralSeatSet = origAdmiralSet;
             this.admiralDecisions = origAdmiralDecs;
