@@ -159,7 +159,8 @@ const _hashUnit = (text: string): number => {
 
 export default class AIService {
     // The cycle of each player's last check-in, for AiConfig.actEveryTicks.
-    _checkInCycle = new Map<string, number>();
+    // Keyed by Game object so cloned rollout copies never share or leak state.
+    _checkInCycle = new WeakMap<Game, Map<string, number>>();
 
     starUpgradeService: StarUpgradeService;
     carrierService: CarrierService;
@@ -363,16 +364,20 @@ export default class AIService {
             const id = player._id.toString();
             const phase = Math.floor(_hashUnit(id) * every);
             if ((game.state.tick + phase) % every !== 0) return;
-            const key = `${game._id.toString()}:${id}`;
+            let perGame = this._checkInCycle.get(game);
+            if (!perGame) {
+                perGame = new Map<string, number>();
+                this._checkInCycle.set(game, perGame);
+            }
             const cycle = Math.floor(
                 game.state.tick / game.settings.galaxy.productionTicks,
             );
-            const last = this._checkInCycle.get(key);
+            const last = perGame.get(id);
             if (last !== undefined && last < cycle) {
                 isFirstTickOfCycle = true;
                 isLastTickOfCycle = true;
             }
-            this._checkInCycle.set(key, cycle);
+            perGame.set(id, cycle);
         }
 
         // Considering the growing complexity of AI logic,
